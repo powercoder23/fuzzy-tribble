@@ -46,8 +46,6 @@ data/*_last_updated.txt
 backtest_*.csv
 banknifty_backtest_trades.csv
 nifty_backtest_trades.csv
-discounted_premiums.csv
-iv_history.csv
 
 # Local media / scratch files
 *.jpeg

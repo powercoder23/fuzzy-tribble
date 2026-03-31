@@ -17,7 +17,7 @@ from discount import DiscountedPremiumScanner
 
 
 DEFAULT_SCAN_TIMES = [
-    "10:01", "11:01", "12:01", "13:01", "14:03", "15:05"
+    "09:50", "10:10", "11:30", "13:30", "15:05", "15:25"
 ]
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday"]
 
