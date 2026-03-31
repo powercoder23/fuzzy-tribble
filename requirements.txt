@@ -1,0 +1,8 @@
+git+https://github.com/dhan-oss/DhanHQ-py.git
+python-dotenv
+schedule
+pandas
+numpy
+scipy
+requests
+pyotp

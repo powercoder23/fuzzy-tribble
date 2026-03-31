@@ -1,0 +1,14 @@
+services:
+  scanner-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discount-scanner-dev
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./data/tokens:/app/data/tokens
+    command: python main.py

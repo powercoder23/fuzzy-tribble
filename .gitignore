@@ -1,0 +1,54 @@
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# IDE / OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Project runtime output
+logs/
+data/tokens/
+data/signals/
+data/*.db
+data/*.sqlite
+data/*.csv
+data/*_last_updated.txt
+
+# Generated reports and exports
+*.log
+backtest_*.csv
+banknifty_backtest_trades.csv
+nifty_backtest_trades.csv
+discounted_premiums.csv
+iv_history.csv
+
+# Local media / scratch files
+*.jpeg
+*.jpg
