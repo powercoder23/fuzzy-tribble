@@ -6,6 +6,9 @@ services:
     container_name: discount-scanner-dev
     env_file:
       - .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
     volumes:
       - .:/app
       - ./data:/app/data

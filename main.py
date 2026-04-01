@@ -6,7 +6,9 @@ Keeps the existing token-management flow and runs configured strategies on sched
 """
 
 import logging
+import os
 import time
+from datetime import datetime
 from pathlib import Path
 
 import schedule
@@ -15,6 +17,13 @@ from config import Config
 from token_manager import TokenManager
 from discount import DiscountedPremiumScanner
 
+
+APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Kolkata")
+
+# Force the process to use the configured timezone instead of the container default.
+os.environ["TZ"] = APP_TIMEZONE
+if hasattr(time, "tzset"):
+    time.tzset()
 
 DEFAULT_SCAN_TIMES = [
     "09:50", "10:10", "11:30", "13:30", "15:05", "15:25"
@@ -108,6 +117,11 @@ class StrategySchedulerApp:
         self.warm_up_token()
         self.setup_schedule()
         logger.info("Strategy scheduler started")
+        logger.info("Scheduler timezone: %s", APP_TIMEZONE)
+        logger.info("Current local time: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        if schedule.jobs:
+            next_run = min(job.next_run for job in schedule.jobs if job.next_run is not None)
+            logger.info("Next scheduled run: %s", next_run.strftime("%Y-%m-%d %H:%M:%S"))
         logger.info("Configured strategies: %s", ", ".join(job["name"] for job in self.strategy_jobs))
 
         while True:

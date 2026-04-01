@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y git
+RUN apt-get update && apt-get install -y git tzdata
 
 
 COPY requirements.txt /app/requirements.txt
