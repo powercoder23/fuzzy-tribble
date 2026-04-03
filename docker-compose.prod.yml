@@ -1,5 +1,5 @@
 services:
-  scanner:
+  scanner-dev:
     build:
       context: .
       dockerfile: Dockerfile
@@ -10,7 +10,8 @@ services:
       TZ: Asia/Kolkata
       APP_TIMEZONE: Asia/Kolkata
     volumes:
+      - .:/app
       - ./data:/app/data
       - ./logs:/app/logs
-    restart: unless-stopped
+      - ./data/tokens:/app/data/tokens
     command: python main.py
