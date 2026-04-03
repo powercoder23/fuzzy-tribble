@@ -8,6 +8,7 @@ Keeps the existing token-management flow and runs configured strategies on sched
 import logging
 import os
 import time
+import argparse
 from datetime import datetime
 from pathlib import Path
 
@@ -112,8 +113,8 @@ class StrategySchedulerApp:
                     getattr(schedule.every(), day).at(run_time).do(job["runner"])
                     logger.info("Scheduled %s on %s at %s", job["name"], day, run_time)
 
-    def run(self):
-        """Start the scheduler loop."""
+    def run(self, run_now=False, exit_after_run=False):
+        """Start the scheduler loop, with optional immediate execution."""
         self.warm_up_token()
         self.setup_schedule()
         logger.info("Strategy scheduler started")
@@ -124,14 +125,34 @@ class StrategySchedulerApp:
             logger.info("Next scheduled run: %s", next_run.strftime("%Y-%m-%d %H:%M:%S"))
         logger.info("Configured strategies: %s", ", ".join(job["name"] for job in self.strategy_jobs))
 
+        if run_now:
+            logger.info("Immediate run requested")
+            self.run_discount_scan()
+            if exit_after_run:
+                logger.info("Exiting after immediate run")
+                return
+
         while True:
             schedule.run_pending()
             time.sleep(30)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Strategy scheduler")
+    parser.add_argument(
+        "--run-now",
+        action="store_true",
+        help="Run the discount scan immediately before entering the scheduler loop",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run the discount scan immediately and exit without waiting for the next schedule",
+    )
+    args = parser.parse_args()
+
     app = StrategySchedulerApp()
-    app.run()
+    app.run(run_now=args.run_now or args.once, exit_after_run=args.once)
 
 
 if __name__ == "__main__":
