@@ -1,7 +1,6 @@
 import os
 import logging
 import math
-import sqlite3
 from pathlib import Path
 
 import pandas as pd
@@ -25,7 +24,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 IV_HISTORY_FILE = Path("iv_history.csv")
-DB_PATH = "iv_history.db"
 EXPIRED_OPTIONS_CACHE_DIR = Path("data/expired_options_cache")
 MIN_IV_SAMPLES = 30
 DEFAULT_FNO_STOCKS = {
@@ -50,86 +48,6 @@ IV_HISTORY_COLUMNS = [
     "atm_call_iv",
     "atm_put_iv",
 ]
-
-
-def init_iv_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS iv_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        security_id TEXT,
-        symbol TEXT,
-        timestamp DATETIME,
-        spot_price REAL,
-        atm_strike REAL,
-        atm_iv REAL,
-        atm_call_iv REAL,
-        atm_put_iv REAL,
-        data_type TEXT,
-        UNIQUE(security_id, timestamp, data_type)
-    )
-    """)
-
-    cursor.execute("""
-    CREATE INDEX IF NOT EXISTS idx_iv_security_time
-    ON iv_history(security_id, timestamp)
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-def migrate_csv_to_sqlite():
-    if os.path.exists("iv_migrated.flag"):
-        return
-
-    if not os.path.exists("iv_history.csv"):
-        return
-
-    df = pd.read_csv("iv_history.csv")
-
-    if df.empty:
-        return
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    for _, row in df.iterrows():
-        timestamp = f"{row['snapshot_date']} {row.get('snapshot_time', '00:00:00')}"
-        security_id = str(row["security_id"])
-        atm_iv = row.get("atm_iv")
-        data_type = "daily"
-
-        if pd.isna(security_id) or pd.isna(timestamp) or pd.isna(atm_iv):
-            continue
-
-        cursor.execute("""
-        INSERT INTO iv_history (
-            security_id, symbol, timestamp,
-            spot_price, atm_strike,
-            atm_iv, atm_call_iv, atm_put_iv,
-            data_type
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(security_id, timestamp, data_type) DO NOTHING
-        """, (
-            security_id,
-            row.get("symbol"),
-            timestamp,
-            row.get("spot_price"),
-            row.get("atm_strike"),
-            atm_iv,
-            row.get("atm_call_iv"),
-            row.get("atm_put_iv"),
-            data_type,
-        ))
-
-    conn.commit()
-    conn.close()
-
-    with open("iv_migrated.flag", "w") as f:
-        f.write("done")
 
 def normalize_expiry_value(value):
     """Convert Dhan expiry payload values into YYYY-MM-DD strings when possible."""
@@ -483,37 +401,37 @@ class DiscountedPremiumScanner:
         Returns:
             list: Historical ATM IV values
         """
+        if not self.iv_history_file.exists():
+            return []
+
         try:
-            conn = sqlite3.connect(DB_PATH)
-            query = """
-            SELECT atm_iv, timestamp
-            FROM iv_history
-            WHERE security_id = ?
-            AND data_type = 'daily'
-            ORDER BY timestamp ASC
-            """
-            df = pd.read_sql(query, conn, params=(str(security_id),))
+            df = pd.read_csv(self.iv_history_file)
         except Exception:
-            logger.exception("Failed to read IV history database: %s", DB_PATH)
-            return []
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-        if df.empty:
+            logger.exception("Failed to read IV history file: %s", self.iv_history_file)
             return []
 
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-        df["atm_iv"] = pd.to_numeric(df["atm_iv"], errors="coerce")
-        df = df.dropna(subset=["timestamp", "atm_iv"])
-        df = df[
-            (df["atm_iv"] >= 1.0) &
-            (df["atm_iv"] <= 200.0)
+        if "snapshot_time" not in df.columns:
+            df["snapshot_time"] = "00:00:00"
+
+        required_cols = {"security_id", "snapshot_date", "snapshot_time", "atm_iv"}
+        if not required_cols.issubset(df.columns):
+            return []
+
+        filtered = df[df["security_id"].astype(str) == str(security_id)].copy()
+        if filtered.empty:
+            return []
+
+        filtered["snapshot_date"] = pd.to_datetime(filtered["snapshot_date"], errors="coerce")
+        filtered["snapshot_time"] = filtered["snapshot_time"].fillna("00:00:00").astype(str)
+        filtered["atm_iv"] = pd.to_numeric(filtered["atm_iv"], errors="coerce")
+        filtered = filtered.dropna(subset=["snapshot_date", "atm_iv"])
+        filtered = filtered[
+            (filtered["atm_iv"] >= 1.0) &
+            (filtered["atm_iv"] <= 200.0)
         ]
-        df = df.sort_values(["timestamp"]).tail(lookback_days)
-        return df["atm_iv"].tolist()
+        filtered = filtered.sort_values(["snapshot_date", "snapshot_time"])
+        filtered = filtered.tail(lookback_days)
+        return filtered["atm_iv"].tolist()
 
     def _expired_options_cache_path(self, security_id, exchange_segment, option_type, strike):
         filename = f"{security_id}_{exchange_segment}_{option_type}_{str(strike).replace('/', '_')}.csv"
@@ -974,7 +892,6 @@ class DiscountedPremiumScanner:
 
         store_intraday = self.store_intraday if store_intraday is None else store_intraday
         snapshot_dt = datetime.now()
-        data_type = "intraday" if store_intraday else "daily"
 
         snapshot = pd.DataFrame([{
             "snapshot_date": snapshot_dt.date().isoformat(),
@@ -987,62 +904,51 @@ class DiscountedPremiumScanner:
             "atm_call_iv": atm_context.get("atm_call_iv"),
             "atm_put_iv": atm_context.get("atm_put_iv"),
         }])
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("""
-            INSERT INTO iv_history (
-                security_id, symbol, timestamp,
-                spot_price, atm_strike,
-                atm_iv, atm_call_iv, atm_put_iv,
-                data_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(security_id, timestamp, data_type) DO NOTHING
-            """, (
-                str(security_id),
-                security_name,
-                f"{snapshot_dt.date().isoformat()} {snapshot_dt.strftime('%H:%M:%S')}",
-                spot_price,
-                atm_context.get("atm_strike"),
-                atm_iv,
-                atm_context.get("atm_call_iv"),
-                atm_context.get("atm_put_iv"),
-                data_type,
-            ))
-            conn.commit()
-        except Exception:
-            logger.exception("Failed to persist IV snapshot to SQLite: %s", DB_PATH)
-        finally:
+
+        if self.iv_history_file.exists():
             try:
-                conn.close()
+                existing = pd.read_csv(self.iv_history_file)
             except Exception:
-                pass
+                logger.exception("Failed to read IV history file for update: %s", self.iv_history_file)
+                existing = pd.DataFrame()
+            combined = pd.concat([existing, snapshot], ignore_index=True)
+        else:
+            combined = snapshot
 
-    def build_premarket_context(self, security_id):
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            query = """
-            SELECT atm_iv, timestamp
-            FROM iv_history
-            WHERE security_id = ?
-            AND data_type = 'intraday'
-            AND DATE(timestamp) = DATE('now')
-            ORDER BY timestamp ASC
-            """
-            df = pd.read_sql(query, conn, params=(str(security_id),))
-            conn.close()
+        if "snapshot_time" not in combined.columns:
+            combined["snapshot_time"] = "00:00:00"
+        if "symbol" not in combined.columns:
+            combined["symbol"] = security_name
 
-            if df.empty or len(df) < 2:
-                return None
+        for column in IV_HISTORY_COLUMNS:
+            if column not in combined.columns:
+                combined[column] = np.nan
 
-            opening_iv = df.iloc[0]["atm_iv"]
-            current_iv = df.iloc[-1]["atm_iv"]
+        combined["security_id"] = combined["security_id"].astype(str)
+        combined["snapshot_date"] = pd.to_datetime(combined["snapshot_date"], errors="coerce").dt.date.astype(str)
+        combined["snapshot_time"] = combined["snapshot_time"].fillna("00:00:00").astype(str)
+        combined["atm_iv"] = pd.to_numeric(combined["atm_iv"], errors="coerce")
+        combined["atm_call_iv"] = pd.to_numeric(combined["atm_call_iv"], errors="coerce")
+        combined["atm_put_iv"] = pd.to_numeric(combined["atm_put_iv"], errors="coerce")
+        combined["spot_price"] = pd.to_numeric(combined["spot_price"], errors="coerce")
+        combined["atm_strike"] = pd.to_numeric(combined["atm_strike"], errors="coerce")
 
-            return {
-                "iv_change": current_iv - opening_iv
-            }
-        except Exception:
-            return None
+        combined = combined[
+            combined["snapshot_date"].notna() &
+            combined["security_id"].notna() &
+            combined["atm_iv"].notna() &
+            (combined["atm_iv"] >= 1.0) &
+            (combined["atm_iv"] <= 200.0)
+        ]
+
+        dedupe_subset = ["snapshot_date", "security_id"]
+        if store_intraday:
+            dedupe_subset = ["snapshot_date", "snapshot_time", "security_id"]
+
+        combined = combined[IV_HISTORY_COLUMNS]
+        combined = combined.drop_duplicates(subset=dedupe_subset, keep="last")
+        combined = combined.sort_values(["security_id", "snapshot_date", "snapshot_time"])
+        combined.to_csv(self.iv_history_file, index=False)
     
     # ==================== 3. DISCOUNTED PREMIUM DETECTION ====================
 
@@ -1161,8 +1067,7 @@ class DiscountedPremiumScanner:
                           expected_move=None, dte=None, trend="neutral", hedging_mode=False,
                           has_iv_history=False, call_mean=None, call_std=None,
                           put_mean=None, put_std=None, call_ivs=None, put_ivs=None,
-                          call_avg_volume=None, put_avg_volume=None, iv_behavior=None,
-                          premarket_ctx=None):
+                          call_avg_volume=None, put_avg_volume=None, iv_behavior=None):
         """
         Analyze a single strike using quantitative volatility, probability, and structure filters.
         
@@ -1269,18 +1174,6 @@ class DiscountedPremiumScanner:
             )
 
             score = score_details["score"]
-            context_adjustment = 0
-
-            if premarket_ctx:
-                iv_change = premarket_ctx.get("iv_change")
-
-                if iv_change is not None:
-                    if iv_change < -2:
-                        context_adjustment += 8
-                    elif iv_change > 2:
-                        context_adjustment -= 10
-
-            score = clip_score(score + context_adjustment)
             score_adjustment = 0.0
             if expected_move and expected_move_ratio > 1.5:
                 score_adjustment -= 20.0
@@ -1501,7 +1394,6 @@ class DiscountedPremiumScanner:
         put_avg_volume = float(np.mean(put_volumes)) if put_volumes else None
 
         atm_context = self.extract_atm_reference_ivs(option_chain, spot_price)
-        premarket_ctx = self.build_premarket_context(security_id)
         historical_ivs = self.fetch_historical_iv(security_id, security_segment)
         has_iv_history = len(historical_ivs) >= MIN_IV_SAMPLES
         iv_rank_atm = self.calculate_iv_rank(atm_context.get("atm_iv") or 0, historical_ivs) if atm_context.get("atm_iv") and has_iv_history else None
@@ -1603,7 +1495,6 @@ class DiscountedPremiumScanner:
                 call_avg_volume=call_avg_volume,
                 put_avg_volume=put_avg_volume,
                 iv_behavior=iv_behavior,
-                premarket_ctx=premarket_ctx,
             )
             
             all_discounted.extend(discounted)

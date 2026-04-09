@@ -16,7 +16,7 @@ import schedule
 
 from config import Config
 from token_manager import TokenManager
-from discount import DiscountedPremiumScanner
+from discount import DiscountedPremiumScanner, init_iv_db, migrate_csv_to_sqlite
 
 
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Kolkata")
@@ -48,6 +48,11 @@ class StrategySchedulerApp:
     def __init__(self):
         self.token_manager = TokenManager()
         self.strategy_jobs = [
+            {
+                "name": "premarket_warmup",
+                "runner": self.run_premarket_warmup,
+                "times": ["09:15", "09:20", "09:25", "09:30", "09:35", "09:40", "09:45"],
+            },
             {
                 "name": "discount",
                 "runner": self.run_discount_scan,
@@ -103,6 +108,60 @@ class StrategySchedulerApp:
             logger.exception("Discount strategy failed")
             return None
 
+    def run_premarket_warmup(self):
+        """Collect premarket ATM IV snapshots without running the scanner."""
+        logger.info("%s", "=" * 70)
+        logger.info("Running strategy: premarket_warmup")
+        logger.info("%s", "=" * 70)
+
+        try:
+            token = self.token_manager.refresh_if_needed()
+            scanner = DiscountedPremiumScanner(
+                hardtoken=token,
+                client_id=Config.DHAN_CLIENT_ID,
+                store_intraday=True,
+            )
+
+            for security_id, security_name in list(scanner.fno_stocks.items())[:10]:
+                try:
+                    security_segment = "IDX_I" if security_name in ["NIFTY", "BANKNIFTY"] else "NSE_FNO"
+                    expiries = scanner.get_expiry_list(security_id, security_segment)
+                    if not expiries:
+                        continue
+
+                    expiry = expiries[0]
+                    chain_response = scanner.get_option_chain(security_id, security_segment, expiry)
+                    if chain_response.get("status") != "success":
+                        continue
+
+                    chain_data = chain_response.get("data") or {}
+                    chain_data = chain_data.get("data", chain_data) if isinstance(chain_data, dict) else chain_data
+                    spot_price = chain_data.get("last_price") if isinstance(chain_data, dict) else None
+                    option_chain = chain_data.get("oc") if isinstance(chain_data, dict) else None
+                    if spot_price is None or not isinstance(option_chain, dict):
+                        continue
+
+                    atm_context = scanner.extract_atm_reference_ivs(option_chain, spot_price)
+                    if not atm_context:
+                        continue
+
+                    scanner.persist_iv_snapshot(
+                        security_id=security_id,
+                        exchange_segment=security_segment,
+                        security_name=security_name,
+                        expiry=expiry,
+                        spot_price=spot_price,
+                        atm_context=atm_context,
+                        store_intraday=True,
+                    )
+                except Exception:
+                    logger.exception("Premarket warmup failed for %s", security_name)
+
+            return True
+        except Exception:
+            logger.exception("Premarket warmup failed")
+            return None
+
     def setup_schedule(self):
         """Register all strategy jobs."""
         schedule.clear()
@@ -150,6 +209,9 @@ def main():
         help="Run the discount scan immediately and exit without waiting for the next schedule",
     )
     args = parser.parse_args()
+
+    init_iv_db()
+    migrate_csv_to_sqlite()
 
     app = StrategySchedulerApp()
     app.run(run_now=args.run_now or args.once, exit_after_run=args.once)
