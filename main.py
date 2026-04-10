@@ -51,7 +51,7 @@ class StrategySchedulerApp:
             {
                 "name": "premarket_warmup",
                 "runner": self.run_premarket_warmup,
-                "times": ["09:15", "09:20", "09:25", "09:30", "09:35", "09:40", "09:45"],
+                "times": ["09:15", "09:23", "09:31", "09:40"],
             },
             {
                 "name": "discount",
