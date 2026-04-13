@@ -199,8 +199,7 @@ class StrategySchedulerApp:
                     security_segment = "IDX_I" if security_name in ["NIFTY", "BANKNIFTY"] else "NSE_FNO"
                     expiries = scanner.get_expiry_list(security_id, security_segment)
                     if not expiries:
-                        logger.warning("Skipping %s due to missing expiries", security_name)
-                        scanner.blacklist_symbol(security_id, security_name, "missing expiries")
+                        logger.info("Skipping %s - no expiries available", security_name)
                         skipped += 1
                         continue
 
