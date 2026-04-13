@@ -172,6 +172,8 @@ class DiscountedPremiumScanner:
     Using Dhan API with proper authentication pattern
     """
     
+    _shared_runtime_state = None
+
     def __init__(self, hardtoken, client_id="1104878989", store_intraday=False):
         """
         Initialize scanner with Dhan API credentials
@@ -196,7 +198,107 @@ class DiscountedPremiumScanner:
         self.expired_data_cache = {}
         self._scan_quality_stats = {"pre_quality": 0, "post_quality": 0}
         self.expired_options_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.runtime_state = self._ensure_runtime_state()
         self.fno_stocks = self.load_fno_stocks()
+
+    def _ensure_runtime_state(self):
+        today = datetime.now().date().isoformat()
+        if DiscountedPremiumScanner._shared_runtime_state is None:
+            DiscountedPremiumScanner._shared_runtime_state = {
+                "cache_day": today,
+                "fno_symbols": None,
+                "fno_symbols_day": None,
+                "expiries": {},
+                "option_chain": {},
+                "blacklist": {},
+                "metrics": {
+                    "total_calls": 0,
+                    "cache_hits": 0,
+                    "failures": 0,
+                },
+                "last_api_call_ts": 0.0,
+            }
+
+        state = DiscountedPremiumScanner._shared_runtime_state
+        if state.get("cache_day") != today:
+            state["cache_day"] = today
+            state["fno_symbols"] = None
+            state["fno_symbols_day"] = None
+            state["expiries"] = {}
+            state["option_chain"] = {}
+            state["blacklist"] = {}
+            state["metrics"] = {
+                "total_calls": 0,
+                "cache_hits": 0,
+                "failures": 0,
+            }
+            state["last_api_call_ts"] = 0.0
+            logger.info("Reset scanner runtime caches for %s", today)
+        return state
+
+    def rate_limited_call(self, operation_name, func, *args, **kwargs):
+        min_interval = 0.2
+        elapsed = time.monotonic() - self.runtime_state["last_api_call_ts"]
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        response = func(*args, **kwargs)
+        self.runtime_state["last_api_call_ts"] = time.monotonic()
+        self.runtime_state["metrics"]["total_calls"] += 1
+        logger.debug("API call completed for %s", operation_name)
+        return response
+
+    def fetch_with_retry(self, operation_name, fetcher, validator=None, max_attempts=3):
+        last_error = None
+        for attempt in range(max_attempts):
+            try:
+                response = self.rate_limited_call(operation_name, fetcher)
+                if validator and not validator(response):
+                    raise ValueError(f"{operation_name} returned invalid or empty data")
+                return response
+            except Exception as exc:
+                last_error = exc
+                self.runtime_state["metrics"]["failures"] += 1
+                if attempt < max_attempts - 1:
+                    backoff = 2 ** attempt
+                    logger.warning(
+                        "Retry %s for %s after error: %s",
+                        attempt + 1,
+                        operation_name,
+                        exc,
+                    )
+                    time.sleep(backoff)
+                else:
+                    logger.error("Exhausted retries for %s: %s", operation_name, exc)
+        raise RuntimeError(f"{operation_name} failed after {max_attempts} attempts") from last_error
+
+    def get_cached_or_fetch(self, cache, key, fetcher, cache_label, validator=None):
+        if key in cache:
+            self.runtime_state["metrics"]["cache_hits"] += 1
+            logger.info("Cache hit for %s", cache_label)
+            return cache[key]
+
+        logger.info("Cache miss for %s; calling API", cache_label)
+        value = self.fetch_with_retry(cache_label, fetcher, validator=validator)
+        cache[key] = value
+        return value
+
+    def _blacklist_symbol(self, security_id, security_name, reason):
+        symbol_key = str(security_id)
+        self.runtime_state["blacklist"][symbol_key] = {
+            "symbol": security_name,
+            "reason": reason,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        logger.warning("Blacklisting %s (%s): %s", security_name, security_id, reason)
+
+    def blacklist_symbol(self, security_id, security_name, reason):
+        self._blacklist_symbol(security_id, security_name, reason)
+
+    def is_blacklisted(self, security_id):
+        return str(security_id) in self.runtime_state["blacklist"]
+
+    def get_warmup_metrics(self):
+        return dict(self.runtime_state["metrics"])
         
     # ==================== 1. DATA FETCHING METHODS ====================
 
@@ -206,6 +308,14 @@ class DiscountedPremiumScanner:
         1. NSE's live stock-futures symbols
         2. Dhan scrip-master security-id resolution
         """
+        if (
+            self.runtime_state.get("fno_symbols") is not None
+            and self.runtime_state.get("fno_symbols_day") == self.runtime_state.get("cache_day")
+        ):
+            self.runtime_state["metrics"]["cache_hits"] += 1
+            logger.info("Cache hit for F&O universe")
+            return dict(self.runtime_state["fno_symbols"])
+
         reserved_indices = {
             13: "NIFTY",
             14: "BANKNIFTY",
@@ -243,8 +353,10 @@ class DiscountedPremiumScanner:
             if sec_id not in resolved and symbol not in resolved.values()
         }
         resolved.update(fallback_missing)
-
-        return dict(sorted(resolved.items(), key=lambda item: item[1]))
+        ordered = dict(sorted(resolved.items(), key=lambda item: item[1]))
+        self.runtime_state["fno_symbols"] = ordered
+        self.runtime_state["fno_symbols_day"] = self.runtime_state["cache_day"]
+        return dict(ordered)
 
     def send_telegram_summary(self, opportunities_df):
         """Send a short end-of-run summary to Telegram."""
@@ -273,9 +385,14 @@ class DiscountedPremiumScanner:
                 lines.append("")
                 lines.append(f"{strategy_name}:")
                 for _, row in strategy_rows.head(5).iterrows():
+                    pcr_text = f"{row['pcr_value']:.2f}" if pd.notna(row.get('pcr_value')) else "N/A"
+                    relative_skew_text = f"{row['relative_skew']:.2f}" if pd.notna(row.get('relative_skew')) else "N/A"
                     lines.append(
-                        f"{row['symbol']} {row['type']} {row['strike']:.0f} | "
-                        f"Score {row['score']:.1f}"
+                        f"{row['symbol']} {row['type']} {row['strike']:.0f}\n"
+                        f"Score: {row['score']:.1f}\n"
+                        f"Type: {str(row.get('trade_type', 'volatility')).title()}\n"
+                        f"PCR: {pcr_text} ({str(row.get('sentiment_bias', 'neutral')).title()})\n"
+                        f"Skew: {relative_skew_text}"
                     )
             message = "\n".join(lines)
 
@@ -305,20 +422,38 @@ class DiscountedPremiumScanner:
         Returns:
             dict: Option chain data
         """
-        response = self.dhan.option_chain(
-            under_security_id=underlying_security_id,
-            under_exchange_segment=underlying_segment,
-            expiry=expiry
-        )
-        if response.get("status") != "success":
-            logger.error(
-                "Failed to fetch option chain for %s (%s), expiry %s: %s",
+        cache_key = (str(underlying_security_id), underlying_segment, expiry)
+        cache_label = f"{underlying_security_id} option chain {expiry}"
+
+        def fetcher():
+            return self.dhan.option_chain(
+                under_security_id=underlying_security_id,
+                under_exchange_segment=underlying_segment,
+                expiry=expiry,
+            )
+
+        def validator(response):
+            if not isinstance(response, dict) or response.get("status") != "success":
+                return False
+            chain_data = unwrap_dhan_payload(response.get("data") or {})
+            return chain_data.get("last_price") is not None and isinstance(chain_data.get("oc"), dict) and bool(chain_data.get("oc"))
+
+        try:
+            return self.get_cached_or_fetch(
+                self.runtime_state["option_chain"],
+                cache_key,
+                fetcher,
+                cache_label,
+                validator=validator,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to fetch option chain for %s (%s), expiry %s",
                 underlying_security_id,
                 underlying_segment,
                 expiry,
-                response,
             )
-        return response
+            return {"status": "failure", "data": {}}
     
     def get_expiry_list(self, underlying_security_id, underlying_segment):
         """
@@ -331,55 +466,73 @@ class DiscountedPremiumScanner:
         Returns:
             list: List of expiry dates
         """
-        response = self.dhan.expiry_list(
-            under_security_id=underlying_security_id,
-            under_exchange_segment=underlying_segment
-        )
-        if response.get("status") != "success":
-            logger.error(
-                "Failed to fetch expiries for %s (%s): %s",
-                underlying_security_id,
-                underlying_segment,
-                response,
+        cache_key = (str(underlying_security_id), underlying_segment)
+        cache_label = f"{underlying_security_id} expiry list"
+
+        def fetcher():
+            return self.dhan.expiry_list(
+                under_security_id=underlying_security_id,
+                under_exchange_segment=underlying_segment,
             )
-            return []
 
-        raw_data = response.get("data", [])
-        expiries = []
+        def parse_expiries(response):
+            raw_data = response.get("data", [])
+            expiries = []
 
-        if isinstance(raw_data, list):
-            for item in raw_data:
-                normalized = normalize_expiry_value(item)
-                if normalized:
-                    expiries.append(normalized)
-                elif isinstance(item, dict):
-                    for value in item.values():
+            if isinstance(raw_data, list):
+                for item in raw_data:
+                    normalized = normalize_expiry_value(item)
+                    if normalized:
+                        expiries.append(normalized)
+                    elif isinstance(item, dict):
+                        for value in item.values():
+                            normalized = normalize_expiry_value(value)
+                            if normalized:
+                                expiries.append(normalized)
+                                break
+            elif isinstance(raw_data, dict):
+                for key in ("data", "expiryList", "expiries", "results", "result"):
+                    value = raw_data.get(key)
+                    if isinstance(value, list):
+                        for item in value:
+                            normalized = normalize_expiry_value(item)
+                            if normalized:
+                                expiries.append(normalized)
+                            elif isinstance(item, dict):
+                                for nested_value in item.values():
+                                    normalized = normalize_expiry_value(nested_value)
+                                    if normalized:
+                                        expiries.append(normalized)
+                                        break
+                        break
+                if not expiries:
+                    for value in raw_data.values():
                         normalized = normalize_expiry_value(value)
                         if normalized:
                             expiries.append(normalized)
-                            break
-        elif isinstance(raw_data, dict):
-            for key in ("data", "expiryList", "expiries", "results", "result"):
-                value = raw_data.get(key)
-                if isinstance(value, list):
-                    for item in value:
-                        normalized = normalize_expiry_value(item)
-                        if normalized:
-                            expiries.append(normalized)
-                        elif isinstance(item, dict):
-                            for nested_value in item.values():
-                                normalized = normalize_expiry_value(nested_value)
-                                if normalized:
-                                    expiries.append(normalized)
-                                    break
-                    break
-            if not expiries:
-                for value in raw_data.values():
-                    normalized = normalize_expiry_value(value)
-                    if normalized:
-                        expiries.append(normalized)
 
-        expiries = sorted(set(expiries))
+            return sorted(set(expiries))
+
+        def validator(response):
+            return isinstance(response, dict) and response.get("status") == "success" and bool(parse_expiries(response))
+
+        try:
+            response = self.get_cached_or_fetch(
+                self.runtime_state["expiries"],
+                cache_key,
+                fetcher,
+                cache_label,
+                validator=validator,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to fetch expiries for %s (%s)",
+                underlying_security_id,
+                underlying_segment,
+            )
+            return []
+
+        expiries = parse_expiries(response)
         logger.info(
             "Available expiries for %s (%s): %s",
             underlying_security_id,
@@ -1035,11 +1188,18 @@ class DiscountedPremiumScanner:
             if df.empty or len(df) < 2:
                 return None
 
+            iv_series = pd.to_numeric(df["atm_iv"], errors="coerce").dropna().tolist()
+            if len(iv_series) < 2:
+                return None
+
             opening_iv = df.iloc[0]["atm_iv"]
             current_iv = df.iloc[-1]["atm_iv"]
+            iv_trend = float(np.polyfit(np.arange(len(iv_series), dtype=float), np.array(iv_series, dtype=float), 1)[0])
 
             return {
-                "iv_change": current_iv - opening_iv
+                # Warmup context now captures both absolute change and the intraday IV slope.
+                "iv_change": current_iv - opening_iv,
+                "iv_trend": iv_trend,
             }
         except Exception:
             return None
@@ -1093,7 +1253,7 @@ class DiscountedPremiumScanner:
 
     def score_option(self, current_iv, weighted_hv, delta, vega, oi, volume, skew_discount,
                      expected_move_ratio, iv_rank=None, iv_percentile=None, vol_mode="skew",
-                     skew_z=None):
+                     skew_z=None, trade_type="volatility"):
         """Weighted quantitative score for option selection."""
         hv_score = 50.0
         if weighted_hv and weighted_hv > 0:
@@ -1112,16 +1272,53 @@ class DiscountedPremiumScanner:
         liquidity_score = clip_score((math.log1p(max(oi, 0)) * 12) + (math.log1p(max(volume, 0)) * 8))
         skew_score = clip_score(50 + skew_discount * 8) if skew_discount is not None else 50.0
         relevance_score = clip_score(100 - (max(expected_move_ratio - 0.5, 0) / 1.0) * 100)
+        cheap_vol_score = clip_score(100 - ((iv_rank * 0.5) + (iv_percentile * 0.5))) if iv_rank is not None and iv_percentile is not None else None
 
-        if vol_mode == "historical":
-            cheap_vol_score = clip_score(100 - ((iv_rank * 0.5) + (iv_percentile * 0.5)))
+        if trade_type == "directional":
+            if vol_mode == "historical" and cheap_vol_score is not None:
+                final_score = (
+                    cheap_vol_score * 0.20 +
+                    hv_score * 0.15 +
+                    delta_score * 0.25 +
+                    vega_score * 0.05 +
+                    liquidity_score * 0.10 +
+                    skew_score * 0.05 +
+                    relevance_score * 0.20
+                )
+                component_scores = {
+                    "iv_regime": native_number(round(cheap_vol_score, 2)),
+                    "iv_vs_hv": native_number(round(hv_score, 2)),
+                    "delta": native_number(round(delta_score, 2)),
+                    "vega": native_number(round(vega_score, 2)),
+                    "liquidity": native_number(round(liquidity_score, 2)),
+                    "skew": native_number(round(skew_score, 2)),
+                    "strike_relevance": native_number(round(relevance_score, 2)),
+                }
+            else:
+                final_score = (
+                    hv_score * 0.20 +
+                    delta_score * 0.30 +
+                    vega_score * 0.05 +
+                    liquidity_score * 0.10 +
+                    skew_score * 0.10 +
+                    relevance_score * 0.25
+                )
+                component_scores = {
+                    "iv_vs_hv": native_number(round(hv_score, 2)),
+                    "delta": native_number(round(delta_score, 2)),
+                    "vega": native_number(round(vega_score, 2)),
+                    "liquidity": native_number(round(liquidity_score, 2)),
+                    "skew": native_number(round(skew_score, 2)),
+                    "strike_relevance": native_number(round(relevance_score, 2)),
+                }
+        elif vol_mode == "historical" and cheap_vol_score is not None:
             final_score = (
                 cheap_vol_score * 0.25 +
                 hv_score * 0.20 +
-                delta_score * 0.15 +
+                delta_score * 0.10 +
                 vega_score * 0.10 +
                 liquidity_score * 0.10 +
-                skew_score * 0.10 +
+                skew_score * 0.15 +
                 relevance_score * 0.10
             )
             component_scores = {
@@ -1135,12 +1332,12 @@ class DiscountedPremiumScanner:
             }
         else:
             final_score = (
-                skew_score * 0.40 +
-                hv_score * 0.10 +
-                delta_score * 0.15 +
+                skew_score * 0.45 +
+                hv_score * 0.15 +
+                delta_score * 0.10 +
                 vega_score * 0.10 +
                 liquidity_score * 0.10 +
-                relevance_score * 0.15
+                relevance_score * 0.10
             )
             component_scores = {
                 "skew": native_number(round(skew_score, 2)),
@@ -1162,7 +1359,7 @@ class DiscountedPremiumScanner:
                           has_iv_history=False, call_mean=None, call_std=None,
                           put_mean=None, put_std=None, call_ivs=None, put_ivs=None,
                           call_avg_volume=None, put_avg_volume=None, iv_behavior=None,
-                          premarket_ctx=None):
+                          premarket_ctx=None, pcr_value=None, sentiment_bias="neutral"):
         """
         Analyze a single strike using quantitative volatility, probability, and structure filters.
         
@@ -1183,6 +1380,12 @@ class DiscountedPremiumScanner:
         """
         discounted = []
         weighted_hv = (hv_metrics or {}).get("weighted_hv")
+        call_iv = pd.to_numeric((strike_data.get("ce") or {}).get("implied_volatility"), errors="coerce")
+        put_iv = pd.to_numeric((strike_data.get("pe") or {}).get("implied_volatility"), errors="coerce")
+        relative_skew = None
+        if pd.notna(call_iv) and pd.notna(put_iv):
+            # Cross-side skew lets us compare the call and put IV at the same strike.
+            relative_skew = float(call_iv - put_iv)
         
         for option_type in ['ce', 'pe']:
             if option_type not in strike_data:
@@ -1232,6 +1435,15 @@ class DiscountedPremiumScanner:
             vol_mode = "historical" if has_iv_history else "skew"
             iv_rank = self.calculate_iv_rank(current_iv, historical_ivs) if has_iv_history else None
             iv_percentile = self.calculate_iv_percentile(current_iv, historical_ivs) if has_iv_history else None
+            trade_type = "volatility"
+            if (
+                expected_move_ratio <= 1.2 and
+                (
+                    (iv_rank is not None and iv_rank < 35) or
+                    (iv_percentile is not None and iv_percentile < 35)
+                )
+            ):
+                trade_type = "directional"
 
             quality_stats = getattr(self, "_scan_quality_stats", None)
             if isinstance(quality_stats, dict):
@@ -1266,6 +1478,7 @@ class DiscountedPremiumScanner:
                 iv_percentile=iv_percentile,
                 vol_mode=vol_mode,
                 skew_z=skew_z,
+                trade_type=trade_type,
             )
 
             score = score_details["score"]
@@ -1273,17 +1486,29 @@ class DiscountedPremiumScanner:
 
             if premarket_ctx:
                 iv_change = premarket_ctx.get("iv_change")
+                iv_trend = premarket_ctx.get("iv_trend")
 
                 if iv_change is not None:
                     if iv_change < -2:
                         context_adjustment += 8
                     elif iv_change > 2:
                         context_adjustment -= 10
+                if iv_trend is not None:
+                    if iv_trend < 0:
+                        context_adjustment += 6
+                    elif iv_trend > 0:
+                        context_adjustment -= 6
 
             score = clip_score(score + context_adjustment)
             score_adjustment = 0.0
             if expected_move and expected_move_ratio > 1.5:
                 score_adjustment -= 20.0
+
+            if relative_skew is not None:
+                if option_type == "ce":
+                    score_adjustment += 8.0 if relative_skew < 0 else -5.0
+                else:
+                    score_adjustment += 8.0 if relative_skew > 0 else -5.0
 
             chain_percentile = None
             if peer_ivs:
@@ -1357,6 +1582,13 @@ class DiscountedPremiumScanner:
                 reasons.append(f"Delta {delta:.2f} sits in the preferred directional range")
             if skew_discount > 0:
                 reasons.append(f"Strike IV is {skew_discount:.2f} std below same-side chain mean")
+            if relative_skew is not None:
+                if relative_skew < 0:
+                    reasons.append(f"Relative skew {relative_skew:.2f}: calls are cheaper than puts")
+                elif relative_skew > 0:
+                    reasons.append(f"Relative skew {relative_skew:.2f}: puts are cheaper than calls")
+                else:
+                    reasons.append("Relative skew is neutral between calls and puts")
             reasons.append(f"IV context is {iv_context}")
             if expected_move and expected_move_ratio <= 1.0:
                 reasons.append("Strike is inside the 1x expected move envelope")
@@ -1374,6 +1606,14 @@ class DiscountedPremiumScanner:
                     reasons.append("Historical IV expansion observed after similar low IV levels")
                 else:
                     reasons.append("Historically low IV does not lead to strong moves")
+            if pcr_value is not None:
+                reasons.append(f"PCR is {pcr_value:.2f}, which reads as {sentiment_bias}")
+            if premarket_ctx and premarket_ctx.get("iv_trend") is not None:
+                iv_trend = premarket_ctx["iv_trend"]
+                if iv_trend < 0:
+                    reasons.append(f"Warmup IV trend is compressing at slope {iv_trend:.3f}")
+                elif iv_trend > 0:
+                    reasons.append(f"Warmup IV trend is expanding at slope {iv_trend:.3f}")
             if oi > 10000 and volume > 1000:
                 reasons.append("Liquidity is strong in both OI and volume")
 
@@ -1383,6 +1623,7 @@ class DiscountedPremiumScanner:
                 "strike": native_number(strike_price),
                 "short_strike": native_number(strategy_plan["short_strike"]),
                 "type": 'CALL' if option_type == 'ce' else 'PUT',
+                "trade_type": trade_type,
                 "vol_mode": vol_mode,
                 "iv_context": iv_context,
                 "iv": native_number(current_iv),
@@ -1411,9 +1652,14 @@ class DiscountedPremiumScanner:
                 "expected_move": native_number(expected_move),
                 "expected_move_ratio": native_number(expected_move_ratio),
                 "quality_score": quality_score,
+                "pcr_value": native_number(pcr_value),
+                "sentiment_bias": sentiment_bias,
                 "atm_iv": native_number((atm_context or {}).get("atm_iv")),
                 "atm_reference_iv": native_number(reference_iv),
                 "skew_discount": native_number(skew_discount),
+                "relative_skew": native_number(relative_skew),
+                "iv_change": native_number((premarket_ctx or {}).get("iv_change")),
+                "iv_trend": native_number((premarket_ctx or {}).get("iv_trend")),
                 "trend": trend,
                 "dte": dte,
                 "component_scores": score_details["component_scores"],
@@ -1473,6 +1719,8 @@ class DiscountedPremiumScanner:
         put_ivs = []
         call_volumes = []
         put_volumes = []
+        total_call_oi = 0.0
+        total_put_oi = 0.0
         for strike_data in option_chain.values():
             if not isinstance(strike_data, dict):
                 continue
@@ -1483,6 +1731,8 @@ class DiscountedPremiumScanner:
             put_iv = pd.to_numeric(put_opt.get("implied_volatility"), errors="coerce")
             call_volume = pd.to_numeric(call_opt.get("volume"), errors="coerce")
             put_volume = pd.to_numeric(put_opt.get("volume"), errors="coerce")
+            call_oi = pd.to_numeric(call_opt.get("oi"), errors="coerce")
+            put_oi = pd.to_numeric(put_opt.get("oi"), errors="coerce")
 
             if pd.notna(call_iv) and call_iv > 0:
                 call_ivs.append(float(call_iv))
@@ -1492,6 +1742,10 @@ class DiscountedPremiumScanner:
                 call_volumes.append(float(call_volume))
             if pd.notna(put_volume) and put_volume > 0:
                 put_volumes.append(float(put_volume))
+            if pd.notna(call_oi) and call_oi > 0:
+                total_call_oi += float(call_oi)
+            if pd.notna(put_oi) and put_oi > 0:
+                total_put_oi += float(put_oi)
 
         call_mean = float(np.mean(call_ivs)) if call_ivs else None
         put_mean = float(np.mean(put_ivs)) if put_ivs else None
@@ -1499,6 +1753,15 @@ class DiscountedPremiumScanner:
         put_std = float(np.std(put_ivs)) if len(put_ivs) > 1 else 0.0
         call_avg_volume = float(np.mean(call_volumes)) if call_volumes else None
         put_avg_volume = float(np.mean(put_volumes)) if put_volumes else None
+        pcr_value = (total_put_oi / total_call_oi) if total_call_oi > 0 else None
+        if pcr_value is None:
+            sentiment_bias = "neutral"
+        elif pcr_value > 1.2:
+            sentiment_bias = "bullish"
+        elif pcr_value < 0.8:
+            sentiment_bias = "bearish"
+        else:
+            sentiment_bias = "neutral"
 
         atm_context = self.extract_atm_reference_ivs(option_chain, spot_price)
         premarket_ctx = self.build_premarket_context(security_id)
@@ -1534,6 +1797,10 @@ class DiscountedPremiumScanner:
             logger.info("ATM IV Rank / Percentile: %.2f / %.2f", iv_rank_atm, iv_percentile_atm)
         if expected_move is not None:
             logger.info("Expected Move (%.0f DTE): %.2f points", dte, expected_move)
+        if pcr_value is not None:
+            logger.info("PCR: %.2f | Sentiment Bias: %s", pcr_value, sentiment_bias)
+        else:
+            logger.info("PCR: N/A | Sentiment Bias: %s", sentiment_bias)
         
         # Calculate historical volatility if requested
         hv_metrics = {"hv10": None, "hv20": None, "hv60": None, "weighted_hv": None}
@@ -1604,6 +1871,8 @@ class DiscountedPremiumScanner:
                 put_avg_volume=put_avg_volume,
                 iv_behavior=iv_behavior,
                 premarket_ctx=premarket_ctx,
+                pcr_value=pcr_value,
+                sentiment_bias=sentiment_bias,
             )
             
             all_discounted.extend(discounted)
@@ -1617,7 +1886,11 @@ class DiscountedPremiumScanner:
 
         all_discounted.sort(key=lambda x: x['score'], reverse=True)
         before_underlying_cap = len(all_discounted)
-        all_discounted = all_discounted[:10]
+        calls = [item for item in all_discounted if item["type"] == "CALL"]
+        puts = [item for item in all_discounted if item["type"] == "PUT"]
+        top_calls = calls[:5]
+        top_puts = puts[:5]
+        all_discounted = sorted(top_calls + top_puts, key=lambda x: x['score'], reverse=True)
         logger.info(
             "Underlying %s opportunities | before_stock_cap=%s | after_stock_cap=%s",
             security_name,
@@ -1708,15 +1981,29 @@ class DiscountedPremiumScanner:
             hv_text = f"{row['hv']:.2f}%" if pd.notna(row['hv']) else "N/A"
             skew_text = f"{row['skew_discount']:.2f}%" if pd.notna(row['skew_discount']) else "N/A"
             expected_move_text = f"{row['expected_move']:.2f}" if pd.notna(row['expected_move']) else "N/A"
+            pcr_text = f"{row['pcr_value']:.2f}" if pd.notna(row.get('pcr_value')) else "N/A"
+            relative_skew_text = f"{row['relative_skew']:.2f}" if pd.notna(row.get('relative_skew')) else "N/A"
 
             logger.info("%s - %s @ Strike %.2f", row['symbol'], row['strategy'], row['strike'])
             logger.info("%s", "-" * 50)
-            logger.info("Score: %.2f/100 | Type: %s | Vol Mode: %s", row['score'], row['type'], row['vol_mode'])
+            logger.info(
+                "Score: %.2f/100 | Type: %s | Trade Type: %s | Vol Mode: %s",
+                row['score'],
+                row['type'],
+                str(row.get('trade_type', 'volatility')).title(),
+                row['vol_mode'],
+            )
             if pd.notna(row['iv_rank']) and pd.notna(row['iv_percentile']):
                 logger.info("IV: %.2f%% | IV Rank: %.2f | IV Percentile: %.2f", row['iv'], row['iv_rank'], row['iv_percentile'])
             else:
                 logger.info("IV: %.2f%% | IV Context: %s", row['iv'], row['iv_context'])
             logger.info("HV Benchmark: %s | Skew Discount vs ATM: %s", hv_text, skew_text)
+            logger.info(
+                "PCR: %s | Bias: %s | Relative Skew: %s",
+                pcr_text,
+                str(row.get('sentiment_bias', 'neutral')).title(),
+                relative_skew_text,
+            )
             logger.info("Moneyness: %.1f%% | Expected Move: %s | EM Ratio: %.2f", row['moneyness'], expected_move_text, row['expected_move_ratio'])
             logger.info(
                 "Mid Price: %.2f (Bid: %.2f / Ask: %.2f)",
