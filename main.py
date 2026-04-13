@@ -122,7 +122,7 @@ class StrategySchedulerApp:
                 store_intraday=True,
             )
 
-            for security_id, security_name in list(scanner.fno_stocks.items())[:10]:
+            for security_id, security_name in list(scanner.fno_stocks.items()):
                 try:
                     security_segment = "IDX_I" if security_name in ["NIFTY", "BANKNIFTY"] else "NSE_FNO"
                     expiries = scanner.get_expiry_list(security_id, security_segment)
