@@ -45,7 +45,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 WARMUP_BATCH_SIZE = 50
-WARMUP_STATE_FILE = Config.DATA_DIR / "premarket_warmup_state.json"
+# Stay compatible with older Config definitions that may not expose DATA_DIR yet.
+WARMUP_STATE_FILE = getattr(Config, "DATA_DIR", Config.BASE_DIR / "data") / "premarket_warmup_state.json"
 
 
 class WarmupBatchManager:

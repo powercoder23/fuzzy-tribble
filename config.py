@@ -27,6 +27,7 @@ class Config:
     
     # Paths
     BASE_DIR = Path('/app')
+    DATA_DIR = BASE_DIR / 'data'
     TOKEN_DIR = BASE_DIR / 'data' / 'tokens'
     SIGNALS_DIR = BASE_DIR / 'data' / 'signals'
     LOGS_DIR = BASE_DIR / 'logs'
@@ -37,6 +38,7 @@ class Config:
     @classmethod
     def ensure_dirs(cls):
         """Ensure all required directories exist"""
+        cls.DATA_DIR.mkdir(parents=True, exist_ok=True)
         cls.TOKEN_DIR.mkdir(parents=True, exist_ok=True)
         cls.SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
         cls.LOGS_DIR.mkdir(parents=True, exist_ok=True)
