@@ -57,3 +57,5 @@ data/expired_options_cache/
 # Local media / scratch files
 *.jpeg
 *.jpg
+data/fno_cache/nse_fo_symbols_10042026.csv
+data/fno_cache/NSE_FO_contract_10042026.csv.gz
