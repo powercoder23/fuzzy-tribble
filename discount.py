@@ -253,11 +253,21 @@ class DiscountedPremiumScanner:
             try:
                 response = self.rate_limited_call(operation_name, fetcher)
                 if validator and not validator(response):
-                    raise ValueError(f"{operation_name} returned invalid or empty data")
+                    if isinstance(response, dict) and response.get("status") == "success":
+                        return response
+                    raise ValueError(f"{operation_name} returned invalid data")
                 return response
             except Exception as exc:
                 last_error = exc
                 self.runtime_state["metrics"]["failures"] += 1
+                if "invalid data" in str(exc) and "empty" not in str(exc):
+                    pass
+                else:
+                    logger.warning(
+                        "Skipping retries for %s due to empty API response",
+                        operation_name,
+                    )
+                    break
                 if attempt < max_attempts - 1:
                     backoff = 2 ** attempt
                     logger.warning(
@@ -514,7 +524,7 @@ class DiscountedPremiumScanner:
             return sorted(set(expiries))
 
         def validator(response):
-            return isinstance(response, dict) and response.get("status") == "success" and bool(parse_expiries(response))
+            return isinstance(response, dict) and response.get("status") == "success"
 
         try:
             response = self.get_cached_or_fetch(
@@ -533,6 +543,9 @@ class DiscountedPremiumScanner:
             return []
 
         expiries = parse_expiries(response)
+        if not expiries:
+            logger.info(f"No active expiries for {underlying_security_id} ({underlying_segment})")
+            return []
         logger.info(
             "Available expiries for %s (%s): %s",
             underlying_security_id,
