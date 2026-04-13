@@ -46,6 +46,13 @@ data/*_last_updated.txt
 backtest_*.csv
 banknifty_backtest_trades.csv
 nifty_backtest_trades.csv
+discounted_premiums.csv
+iv_history.csv
+iv_history.db
+iv_migrated.flag
+
+# Local option cache
+data/expired_options_cache/
 
 # Local media / scratch files
 *.jpeg
