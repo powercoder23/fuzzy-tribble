@@ -1216,11 +1216,130 @@ class DiscountedPremiumScanner:
             }
         except Exception:
             return None
-    
+
+    def log_option_rejection(self, strike_price, option_type, reason, **details):
+        """Emit readable filter diagnostics for rejected options."""
+        clean_details = {
+            key: value for key, value in details.items()
+            if value is not None and not (isinstance(value, float) and pd.isna(value))
+        }
+        detail_suffix = ""
+        if clean_details:
+            detail_suffix = " | " + " | ".join(f"{key}={value}" for key, value in clean_details.items())
+        logger.info(
+            "Rejected option | strike=%.2f | type=%s | reason=%s%s",
+            float(strike_price),
+            str(option_type).upper(),
+            reason,
+            detail_suffix,
+        )
+
+    def get_execution_prices(self, opt):
+        """Build realistic entry/exit references from the quoted spread."""
+        last_price = native_number(opt.get("last_price", 0)) or 0.0
+        raw_bid = native_number(opt.get("top_bid_price", 0))
+        raw_ask = native_number(opt.get("top_ask_price", 0))
+
+        bid = raw_bid if raw_bid and raw_bid > 0 else None
+        ask = raw_ask if raw_ask and raw_ask > 0 else None
+        entry_price = ask if ask is not None else last_price
+        exit_price = bid if bid is not None else last_price
+
+        if ask is not None and bid is not None:
+            mid_price = (ask * 0.7) + (bid * 0.3)
+        elif ask is not None:
+            mid_price = ask
+        elif bid is not None:
+            mid_price = bid
+        else:
+            mid_price = last_price
+
+        return {
+            "bid": bid if bid is not None else last_price,
+            "ask": ask if ask is not None else last_price,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "mid_price": mid_price,
+        }
+
+    def get_neighboring_ivs(self, option_chain, strike_price, option_type):
+        """Read adjacent-strike IVs from the in-memory chain only."""
+        strike_keys = sorted(float(key) for key in option_chain.keys())
+        try:
+            strike_index = strike_keys.index(float(strike_price))
+        except ValueError:
+            return []
+
+        neighboring_ivs = []
+        for neighbor_index in [strike_index - 1, strike_index + 1]:
+            if neighbor_index < 0 or neighbor_index >= len(strike_keys):
+                continue
+            neighbor_strike = strike_keys[neighbor_index]
+            neighbor_data = option_chain.get(str(neighbor_strike), option_chain.get(neighbor_strike, {}))
+            neighbor_option = (neighbor_data or {}).get(option_type) or {}
+            neighbor_iv = pd.to_numeric(neighbor_option.get("implied_volatility"), errors="coerce")
+            if pd.notna(neighbor_iv) and neighbor_iv > 0:
+                neighboring_ivs.append(float(neighbor_iv))
+        return neighboring_ivs
+
+    def is_iv_stable(self, option_chain, strike_price, option_type, current_iv):
+        """Check whether IV is aligned with neighboring strikes within a 10% band."""
+        neighboring_ivs = self.get_neighboring_ivs(option_chain, strike_price, option_type)
+        if not neighboring_ivs:
+            return True, None
+
+        neighbor_reference = float(np.mean(neighboring_ivs))
+        if neighbor_reference <= 0:
+            return True, neighbor_reference
+
+        deviation = abs(float(current_iv) - neighbor_reference) / neighbor_reference
+        return deviation <= 0.10, deviation
+
+    def classify_trade_type(self, iv_rank, skew_discount, iv_trend, trend, abs_delta, expected_move_ratio):
+        """Keep directional and volatility trade definitions strictly separated."""
+        is_volatility_trade = (
+            iv_rank is not None and
+            iv_rank < 30 and
+            skew_discount is not None and
+            skew_discount > 0 and
+            iv_trend is not None and
+            iv_trend < 0
+        )
+        is_directional_trade = (
+            trend != "neutral" and
+            0.20 <= abs_delta <= 0.40 and
+            expected_move_ratio <= 1.0
+        )
+
+        if is_volatility_trade:
+            return "volatility"
+        if is_directional_trade:
+            return "directional"
+        return None
+
+    def select_top_trades(self, opportunities, limit=3, max_per_direction=2):
+        """Pick the highest-conviction trades with a per-direction cap."""
+        if isinstance(opportunities, pd.DataFrame):
+            rows = opportunities.sort_values("score", ascending=False).to_dict("records")
+        else:
+            rows = sorted(opportunities, key=lambda item: item["score"], reverse=True)
+
+        selected = []
+        direction_counts = {}
+        for row in rows:
+            direction = row.get("type")
+            if direction_counts.get(direction, 0) >= max_per_direction:
+                continue
+            selected.append(row)
+            direction_counts[direction] = direction_counts.get(direction, 0) + 1
+            if len(selected) >= limit:
+                break
+        return selected
+
     # ==================== 3. DISCOUNTED PREMIUM DETECTION ====================
 
     def build_strategy_plan(self, option_type, strike_price, spot_price, mid_price, option_chain,
-                            expected_move, trend, score):
+                            expected_move, trend, score, entry_price=None, exit_price=None):
         """Create tradable strategy suggestions from a shortlisted option."""
         strike_keys = sorted(float(key) for key in option_chain.keys())
         if option_type == "CALL":
@@ -1230,9 +1349,12 @@ class DiscountedPremiumScanner:
             candidate_shorts = [strike for strike in strike_keys if strike < strike_price]
             short_strike = candidate_shorts[-1] if candidate_shorts else None
 
-        entry = mid_price
-        stop_loss = mid_price * 0.65 if mid_price else 0
-        target = mid_price * 1.8 if mid_price else 0
+        reference_entry = entry_price if entry_price is not None else mid_price
+        reference_exit = exit_price if exit_price is not None else mid_price
+
+        entry = reference_entry
+        stop_loss = reference_exit * 0.65 if reference_exit else 0
+        target = reference_entry * 1.8 if reference_entry else 0
         risk_reward = None
         if entry and stop_loss and target and entry != stop_loss:
             risk_reward = (target - entry) / (entry - stop_loss)
@@ -1267,7 +1389,7 @@ class DiscountedPremiumScanner:
     def score_option(self, current_iv, weighted_hv, delta, vega, oi, volume, skew_discount,
                      expected_move_ratio, iv_rank=None, iv_percentile=None, vol_mode="skew",
                      skew_z=None, trade_type="volatility"):
-        """Weighted quantitative score for option selection."""
+        """Score options using only the core decision factors."""
         hv_score = 50.0
         if weighted_hv and weighted_hv > 0:
             hv_edge_pct = ((weighted_hv - current_iv) / weighted_hv) * 100
@@ -1281,82 +1403,35 @@ class DiscountedPremiumScanner:
         else:
             delta_score = 25.0
 
-        vega_score = clip_score(vega * 400) if vega is not None else 20.0
         liquidity_score = clip_score((math.log1p(max(oi, 0)) * 12) + (math.log1p(max(volume, 0)) * 8))
         skew_score = clip_score(50 + skew_discount * 8) if skew_discount is not None else 50.0
-        relevance_score = clip_score(100 - (max(expected_move_ratio - 0.5, 0) / 1.0) * 100)
-        cheap_vol_score = clip_score(100 - ((iv_rank * 0.5) + (iv_percentile * 0.5))) if iv_rank is not None and iv_percentile is not None else None
+        relevance_score = clip_score(100 - (abs(expected_move_ratio - 0.75) / 0.45) * 100)
 
         if trade_type == "directional":
-            if vol_mode == "historical" and cheap_vol_score is not None:
-                final_score = (
-                    cheap_vol_score * 0.20 +
-                    hv_score * 0.15 +
-                    delta_score * 0.25 +
-                    vega_score * 0.05 +
-                    liquidity_score * 0.10 +
-                    skew_score * 0.05 +
-                    relevance_score * 0.20
-                )
-                component_scores = {
-                    "iv_regime": native_number(round(cheap_vol_score, 2)),
-                    "iv_vs_hv": native_number(round(hv_score, 2)),
-                    "delta": native_number(round(delta_score, 2)),
-                    "vega": native_number(round(vega_score, 2)),
-                    "liquidity": native_number(round(liquidity_score, 2)),
-                    "skew": native_number(round(skew_score, 2)),
-                    "strike_relevance": native_number(round(relevance_score, 2)),
-                }
-            else:
-                final_score = (
-                    hv_score * 0.20 +
-                    delta_score * 0.30 +
-                    vega_score * 0.05 +
-                    liquidity_score * 0.10 +
-                    skew_score * 0.10 +
-                    relevance_score * 0.25
-                )
-                component_scores = {
-                    "iv_vs_hv": native_number(round(hv_score, 2)),
-                    "delta": native_number(round(delta_score, 2)),
-                    "vega": native_number(round(vega_score, 2)),
-                    "liquidity": native_number(round(liquidity_score, 2)),
-                    "skew": native_number(round(skew_score, 2)),
-                    "strike_relevance": native_number(round(relevance_score, 2)),
-                }
-        elif vol_mode == "historical" and cheap_vol_score is not None:
             final_score = (
-                cheap_vol_score * 0.25 +
-                hv_score * 0.20 +
-                delta_score * 0.10 +
-                vega_score * 0.10 +
-                liquidity_score * 0.10 +
+                hv_score * 0.25 +
+                delta_score * 0.35 +
                 skew_score * 0.15 +
-                relevance_score * 0.10
+                relevance_score * 0.25
             )
             component_scores = {
-                "iv_regime": native_number(round(cheap_vol_score, 2)),
                 "iv_vs_hv": native_number(round(hv_score, 2)),
                 "delta": native_number(round(delta_score, 2)),
-                "vega": native_number(round(vega_score, 2)),
                 "liquidity": native_number(round(liquidity_score, 2)),
                 "skew": native_number(round(skew_score, 2)),
                 "strike_relevance": native_number(round(relevance_score, 2)),
             }
         else:
             final_score = (
-                skew_score * 0.45 +
-                hv_score * 0.15 +
+                hv_score * 0.30 +
+                skew_score * 0.40 +
                 delta_score * 0.10 +
-                vega_score * 0.10 +
-                liquidity_score * 0.10 +
-                relevance_score * 0.10
+                relevance_score * 0.20
             )
             component_scores = {
-                "skew": native_number(round(skew_score, 2)),
                 "iv_vs_hv": native_number(round(hv_score, 2)),
+                "skew": native_number(round(skew_score, 2)),
                 "delta": native_number(round(delta_score, 2)),
-                "vega": native_number(round(vega_score, 2)),
                 "liquidity": native_number(round(liquidity_score, 2)),
                 "strike_relevance": native_number(round(relevance_score, 2)),
             }
@@ -1405,6 +1480,7 @@ class DiscountedPremiumScanner:
                 continue
             
             opt = strike_data[option_type]
+            option_label = 'CALL' if option_type == 'ce' else 'PUT'
             
             oi = opt.get('oi', 0)
             volume = opt.get('volume', 0)
@@ -1414,15 +1490,20 @@ class DiscountedPremiumScanner:
 
             # Skip illiquid or extremely low-probability options
             if oi < 1000 or volume <= 0:
+                self.log_option_rejection(strike_price, option_label, "Rejected due to insufficient liquidity", oi=oi, volume=volume)
                 continue
             if volume < 200:
+                self.log_option_rejection(strike_price, option_label, "Rejected due to low volume", volume=volume)
                 continue
             if not hedging_mode and abs_delta < 0.10:
+                self.log_option_rejection(strike_price, option_label, "Rejected due to low delta", delta=round(abs_delta, 3))
                 continue
 
-            current_iv = opt.get('implied_volatility', 0)
-            if current_iv == 0:
+            current_iv = pd.to_numeric(opt.get('implied_volatility', 0), errors="coerce")
+            if pd.isna(current_iv) or current_iv <= 0:
+                self.log_option_rejection(strike_price, option_label, "Rejected due to missing IV")
                 continue
+            current_iv = float(current_iv)
 
             if option_type == "ce":
                 reference_iv = call_mean
@@ -1435,6 +1516,43 @@ class DiscountedPremiumScanner:
                 peer_ivs = put_ivs or []
                 avg_peer_volume = put_avg_volume
 
+            pricing = self.get_execution_prices(opt)
+            bid = pricing["bid"]
+            ask = pricing["ask"]
+            entry_price = pricing["entry_price"]
+            exit_price = pricing["exit_price"]
+            mid_price = pricing["mid_price"]
+
+            if ask <= 0:
+                self.log_option_rejection(strike_price, option_label, "Rejected due to invalid ask price", ask=ask, bid=bid)
+                continue
+            spread_pct = (ask - bid) / ask if ask else 1.0
+            if spread_pct > 0.15:
+                self.log_option_rejection(
+                    strike_price,
+                    option_label,
+                    "Rejected due to wide spread",
+                    bid=round(bid, 2),
+                    ask=round(ask, 2),
+                    spread_pct=round(spread_pct, 4),
+                )
+                continue
+
+            if volume < 300:
+                self.log_option_rejection(strike_price, option_label, "Rejected due to low volume for live IV", volume=volume, iv=round(current_iv, 2))
+                continue
+
+            iv_is_stable, iv_deviation = self.is_iv_stable(option_chain, strike_price, option_type, current_iv)
+            if not iv_is_stable:
+                self.log_option_rejection(
+                    strike_price,
+                    option_label,
+                    "Rejected due to unstable IV versus neighboring strikes",
+                    iv=round(current_iv, 2),
+                    iv_deviation=round(iv_deviation, 4) if iv_deviation is not None else None,
+                )
+                continue
+
             skew_z = 0.0
             if reference_iv is not None and skew_std is not None and skew_std > 0:
                 skew_z = (current_iv - reference_iv) / skew_std
@@ -1443,20 +1561,39 @@ class DiscountedPremiumScanner:
 
             distance_from_spot = abs(strike_price - spot_price)
             expected_move_ratio = (distance_from_spot / expected_move) if expected_move and expected_move > 0 else 0
-            if expected_move and expected_move_ratio > 2.0:
+            if expected_move_ratio < 0.5 or expected_move_ratio > 1.2:
+                self.log_option_rejection(
+                    strike_price,
+                    option_label,
+                    "Rejected due to expected move ratio outside strict range",
+                    expected_move_ratio=round(expected_move_ratio, 3),
+                )
                 continue
             vol_mode = "historical" if has_iv_history else "skew"
             iv_rank = self.calculate_iv_rank(current_iv, historical_ivs) if has_iv_history else None
             iv_percentile = self.calculate_iv_percentile(current_iv, historical_ivs) if has_iv_history else None
-            trade_type = "volatility"
-            if (
-                expected_move_ratio <= 1.2 and
-                (
-                    (iv_rank is not None and iv_rank < 35) or
-                    (iv_percentile is not None and iv_percentile < 35)
+            iv_trend = (premarket_ctx or {}).get("iv_trend")
+            trade_type = self.classify_trade_type(
+                iv_rank=iv_rank,
+                skew_discount=skew_discount,
+                iv_trend=iv_trend,
+                trend=trend,
+                abs_delta=abs_delta,
+                expected_move_ratio=expected_move_ratio,
+            )
+            if trade_type is None:
+                self.log_option_rejection(
+                    strike_price,
+                    option_label,
+                    "Rejected due to trade type mismatch",
+                    trend=trend,
+                    iv_rank=round(iv_rank, 2) if iv_rank is not None else None,
+                    skew_discount=round(skew_discount, 2) if skew_discount is not None else None,
+                    iv_trend=round(iv_trend, 4) if iv_trend is not None else None,
+                    abs_delta=round(abs_delta, 3),
+                    expected_move_ratio=round(expected_move_ratio, 3),
                 )
-            ):
-                trade_type = "directional"
+                continue
 
             quality_stats = getattr(self, "_scan_quality_stats", None)
             if isinstance(quality_stats, dict):
@@ -1465,14 +1602,15 @@ class DiscountedPremiumScanner:
             quality_score = 0
             if skew_discount and skew_discount > 0:
                 quality_score += 1
-            if 0.15 <= abs_delta <= 0.40:
+            if 0.20 <= abs_delta <= 0.40:
                 quality_score += 1
-            if expected_move_ratio <= 1.2:
+            if 0.5 <= expected_move_ratio <= 1.2:
                 quality_score += 1
             if volume > 1000:
                 quality_score += 1
 
             if quality_score < 2:
+                self.log_option_rejection(strike_price, option_label, "Rejected due to low quality score", quality_score=quality_score)
                 continue
 
             if isinstance(quality_stats, dict):
@@ -1499,7 +1637,6 @@ class DiscountedPremiumScanner:
 
             if premarket_ctx:
                 iv_change = premarket_ctx.get("iv_change")
-                iv_trend = premarket_ctx.get("iv_trend")
 
                 if iv_change is not None:
                     if iv_change < -2:
@@ -1508,33 +1645,18 @@ class DiscountedPremiumScanner:
                         context_adjustment -= 10
                 if iv_trend is not None:
                     if iv_trend < 0:
-                        context_adjustment += 6
+                        context_adjustment += 8
                     elif iv_trend > 0:
-                        context_adjustment -= 6
+                        context_adjustment -= 10
 
             score = clip_score(score + context_adjustment)
             score_adjustment = 0.0
-            if expected_move and expected_move_ratio > 1.5:
-                score_adjustment -= 20.0
-
-            if relative_skew is not None:
-                if option_type == "ce":
-                    score_adjustment += 8.0 if relative_skew < 0 else -5.0
-                else:
-                    score_adjustment += 8.0 if relative_skew > 0 else -5.0
 
             chain_percentile = None
             if peer_ivs:
                 peer_iv_array = np.array(peer_ivs, dtype=float)
                 if len(peer_iv_array) > 0:
                     chain_percentile = float((peer_iv_array < current_iv).mean() * 100)
-                    if chain_percentile < 20:
-                        score_adjustment += 7.0
-                    elif chain_percentile > 80:
-                        score_adjustment -= 7.0
-
-            if avg_peer_volume is not None and volume > avg_peer_volume:
-                score_adjustment += 7.0
 
             option_iv_behavior = iv_behavior
             if isinstance(iv_behavior, dict) and ("ce" in iv_behavior or "pe" in iv_behavior):
@@ -1545,9 +1667,8 @@ class DiscountedPremiumScanner:
                 avg_move_after_low_iv = option_iv_behavior.get("avg_move_after_low_iv")
                 if current_iv < low_iv_threshold:
                     if avg_move_after_low_iv is not None and avg_move_after_low_iv > 0.01:
-                        score_adjustment += 10.0
                         logger.info(
-                            "IV behavior boost | strike=%.2f | type=%s | current_iv=%.2f | low_iv_threshold=%.2f | avg_move_after_low_iv=%.4f",
+                            "IV behavior context | strike=%.2f | type=%s | current_iv=%.2f | low_iv_threshold=%.2f | avg_move_after_low_iv=%.4f",
                             strike_price,
                             option_type.upper(),
                             current_iv,
@@ -1555,9 +1676,8 @@ class DiscountedPremiumScanner:
                             avg_move_after_low_iv,
                         )
                     else:
-                        score_adjustment -= 10.0
                         logger.info(
-                            "IV behavior penalty | strike=%.2f | type=%s | current_iv=%.2f | low_iv_threshold=%.2f | avg_move_after_low_iv=%s",
+                            "IV behavior context | strike=%.2f | type=%s | current_iv=%.2f | low_iv_threshold=%.2f | avg_move_after_low_iv=%s",
                             strike_price,
                             option_type.upper(),
                             current_iv,
@@ -1567,14 +1687,21 @@ class DiscountedPremiumScanner:
 
             score = round(clip_score(score + score_adjustment), 2)
 
-            bid = opt.get('top_bid_price', opt.get('last_price', 0))
-            ask = opt.get('top_ask_price', opt.get('last_price', 0))
-            mid_price = (bid + ask) / 2 if bid and ask else opt.get('last_price', 0)
+            if dte is not None and dte <= 2 and score <= 80:
+                self.log_option_rejection(
+                    strike_price,
+                    option_label,
+                    "Rejected due to low DTE under strict theta control",
+                    dte=dte,
+                    score=score,
+                )
+                continue
+
             hv_gap = weighted_hv - current_iv if weighted_hv else None
             moneyness = ((strike_price - spot_price) / spot_price * 100) if option_type == 'ce' else ((spot_price - strike_price) / spot_price * 100)
 
             strategy_plan = self.build_strategy_plan(
-                option_type='CALL' if option_type == 'ce' else 'PUT',
+                option_type=option_label,
                 strike_price=strike_price,
                 spot_price=spot_price,
                 mid_price=mid_price,
@@ -1582,16 +1709,18 @@ class DiscountedPremiumScanner:
                 expected_move=expected_move,
                 trend=trend,
                 score=score,
+                entry_price=entry_price,
+                exit_price=exit_price,
             )
 
             reasons = []
-            if has_iv_history and iv_rank is not None and iv_rank <= 35:
+            if has_iv_history and iv_rank is not None and iv_rank < 30:
                 reasons.append(f"IV Rank is compressed at {iv_rank:.1f}")
             if has_iv_history and iv_percentile is not None and iv_percentile <= 35:
                 reasons.append(f"IV Percentile is low at {iv_percentile:.1f}")
             if hv_gap and hv_gap > 0:
                 reasons.append(f"IV is {hv_gap:.2f} points below weighted HV")
-            if 0.15 <= abs_delta <= 0.40:
+            if 0.20 <= abs_delta <= 0.40:
                 reasons.append(f"Delta {delta:.2f} sits in the preferred directional range")
             if skew_discount > 0:
                 reasons.append(f"Strike IV is {skew_discount:.2f} std below same-side chain mean")
@@ -1603,10 +1732,10 @@ class DiscountedPremiumScanner:
                 else:
                     reasons.append("Relative skew is neutral between calls and puts")
             reasons.append(f"IV context is {iv_context}")
-            if expected_move and expected_move_ratio <= 1.0:
+            if expected_move and 0.5 <= expected_move_ratio <= 1.0:
                 reasons.append("Strike is inside the 1x expected move envelope")
-            elif expected_move and expected_move_ratio > 1.5:
-                reasons.append("Strike sits beyond 1.5x expected move, so score was penalized")
+            elif expected_move and expected_move_ratio <= 1.2:
+                reasons.append("Strike remains inside the strict 1.2x expected move ceiling")
             if chain_percentile is not None and chain_percentile < 20:
                 reasons.append(f"Chain IV percentile is cheap at {chain_percentile:.1f}")
             elif chain_percentile is not None and chain_percentile > 80:
@@ -1658,6 +1787,8 @@ class DiscountedPremiumScanner:
                 "mid_price": native_number(mid_price),
                 "bid": native_number(bid),
                 "ask": native_number(ask),
+                "entry_price": native_number(entry_price),
+                "exit_price": native_number(exit_price),
                 "spot": native_number(spot_price),
                 "moneyness": native_number(moneyness),
                 "oi": oi,
@@ -1675,6 +1806,9 @@ class DiscountedPremiumScanner:
                 "iv_trend": native_number((premarket_ctx or {}).get("iv_trend")),
                 "trend": trend,
                 "dte": dte,
+                "recommended_position_size": "2% capital",
+                "max_trades_per_day": 2,
+                "risk_per_trade": native_number(max((strategy_plan["entry"] or 0) - (strategy_plan["stop_loss"] or 0), 0)),
                 "component_scores": score_details["component_scores"],
             })
         
@@ -1897,13 +2031,31 @@ class DiscountedPremiumScanner:
             self._scan_quality_stats.get("post_quality", 0),
         )
 
-        all_discounted.sort(key=lambda x: x['score'], reverse=True)
         before_underlying_cap = len(all_discounted)
-        calls = [item for item in all_discounted if item["type"] == "CALL"]
-        puts = [item for item in all_discounted if item["type"] == "PUT"]
-        top_calls = calls[:5]
-        top_puts = puts[:5]
-        all_discounted = sorted(top_calls + top_puts, key=lambda x: x['score'], reverse=True)
+        if all_discounted:
+            for item in all_discounted:
+                final_rank_score = (
+                    item["score"] +
+                    math.log((item.get("volume") or 0) + 1) * 2 +
+                    math.log((item.get("oi") or 0) + 1) * 1.5
+                )
+                delta_value = abs(item.get("delta") or 0)
+                if 0.2 <= delta_value <= 0.4:
+                    final_rank_score += 5
+                item["final_rank_score"] = round(final_rank_score, 2)
+
+            best_trade = max(all_discounted, key=lambda x: x["final_rank_score"])
+            all_discounted = [best_trade]
+            logger.info(
+                "Selected best trade for %s: %s %.2f score=%.2f",
+                security_name,
+                best_trade["type"],
+                best_trade["strike"],
+                best_trade["score"],
+            )
+        else:
+            all_discounted = []
+
         logger.info(
             "Underlying %s opportunities | before_stock_cap=%s | after_stock_cap=%s",
             security_name,
@@ -1967,7 +2119,7 @@ class DiscountedPremiumScanner:
             df = pd.DataFrame(all_opportunities)
             df = df.sort_values('score', ascending=False)
             logger.info("Global opportunities before_cap=%s", len(df))
-            df = df.head(200)
+            df = pd.DataFrame(self.select_top_trades(df, limit=3, max_per_direction=2))
             logger.info("Global opportunities after_cap=%s", len(df))
             return df
         else:
