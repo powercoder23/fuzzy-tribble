@@ -71,13 +71,8 @@ class StrategySchedulerApp:
         expiry_cache,
         option_chain_cache,
         last_fetched,
-        warmup_failures,
     ):
         symbol_key = str(security_id)
-        if scanner.is_blacklisted(security_id):
-            logger.warning("Skipping blacklisted symbol %s (%s)", security_name, security_id)
-            return False
-
         security_segment = self._warmup_security_segment(security_name)
 
         expiry = expiry_cache.get(symbol_key)
@@ -114,36 +109,22 @@ class StrategySchedulerApp:
                     expiry=expiry,
                 )
             except Exception:
-                failure_count = warmup_failures.get(symbol_key, 0) + 1
-                warmup_failures[symbol_key] = failure_count
-                logger.exception("Premarket warmup fetch failed for %s", security_name)
-                if failure_count >= 3:
-                    scanner.blacklist_symbol(security_id, security_name, "option chain failure")
+                logger.exception("Temporary skip due to API failure for %s", security_name)
                 return False
 
             if not isinstance(chain_response, dict) or chain_response.get("status") != "success":
-                failure_count = warmup_failures.get(symbol_key, 0) + 1
-                warmup_failures[symbol_key] = failure_count
                 logger.warning(
-                    "Skipping %s due to failed option chain fetch (failure %s/3)",
+                    "Temporary skip due to API failure for %s: invalid option chain response",
                     security_name,
-                    failure_count,
                 )
-                if failure_count >= 3:
-                    scanner.blacklist_symbol(security_id, security_name, "option chain failure")
                 return False
 
             chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
             if not isinstance(chain_data, dict):
-                failure_count = warmup_failures.get(symbol_key, 0) + 1
-                warmup_failures[symbol_key] = failure_count
                 logger.warning(
-                    "Skipping %s due to empty option chain payload (failure %s/3)",
+                    "Temporary skip due to API failure for %s: empty option chain payload",
                     security_name,
-                    failure_count,
                 )
-                if failure_count >= 3:
-                    scanner.blacklist_symbol(security_id, security_name, "empty option chain payload")
                 return False
 
             last_fetched[symbol_key] = now_ts
@@ -152,18 +133,12 @@ class StrategySchedulerApp:
         spot_price = chain_data.get("last_price") if isinstance(chain_data, dict) else None
         option_chain = chain_data.get("oc") if isinstance(chain_data, dict) else None
         if spot_price is None or not isinstance(option_chain, dict) or not option_chain:
-            failure_count = warmup_failures.get(symbol_key, 0) + 1
-            warmup_failures[symbol_key] = failure_count
             logger.warning(
-                "Skipping %s due to empty option chain payload (failure %s/3)",
+                "Temporary skip due to API failure for %s: empty option chain payload",
                 security_name,
-                failure_count,
             )
-            if failure_count >= 3:
-                scanner.blacklist_symbol(security_id, security_name, "empty option chain payload")
             return False
 
-        warmup_failures[symbol_key] = 0
         atm_context = scanner.extract_atm_reference_ivs(option_chain, spot_price)
         chain_metrics = scanner.extract_chain_metrics(option_chain)
         if not atm_context or atm_context.get("atm_iv") is None:
@@ -252,7 +227,6 @@ class StrategySchedulerApp:
 
             start_time = dt_time(9, 15)
             end_time = dt_time(9, 50)
-            warmup_failures = scanner.runtime_state.setdefault("warmup_failures", {})
             expiry_cache = {}
             option_chain_cache = {}
             last_fetched = {}
@@ -279,14 +253,9 @@ class StrategySchedulerApp:
                         expiry_cache=expiry_cache,
                         option_chain_cache=option_chain_cache,
                         last_fetched=last_fetched,
-                        warmup_failures=warmup_failures,
                     )
                 except Exception:
-                    failure_count = warmup_failures.get(str(security_id), 0) + 1
-                    warmup_failures[str(security_id)] = failure_count
-                    logger.exception("Premarket warmup failed for %s", security_name)
-                    if failure_count >= 3:
-                        scanner.blacklist_symbol(security_id, security_name, "unexpected warmup exception")
+                    logger.exception("Temporary skip due to API failure for %s", security_name)
 
                 index += 1
                 if index >= total:

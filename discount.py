@@ -246,8 +246,6 @@ class DiscountedPremiumScanner:
                 "fno_symbols_day": None,
                 "expiries": {},
                 "option_chain": {},
-                "blacklist": {},
-                "warmup_failures": {},
                 "metrics": {
                     "total_calls": 0,
                     "cache_hits": 0,
@@ -264,8 +262,6 @@ class DiscountedPremiumScanner:
             state["fno_symbols_day"] = None
             state["expiries"] = {}
             state["option_chain"] = {}
-            state["blacklist"] = {}
-            state["warmup_failures"] = {}
             state["metrics"] = {
                 "total_calls": 0,
                 "cache_hits": 0,
@@ -287,27 +283,19 @@ class DiscountedPremiumScanner:
         logger.debug("API call completed for %s", operation_name)
         return response
 
-    def fetch_with_retry(self, operation_name, fetcher, validator=None, max_attempts=3):
+    def fetch_with_retry(self, operation_name, fetcher, validator=None, max_attempts=5):
         last_error = None
         for attempt in range(max_attempts):
             try:
                 response = self.rate_limited_call(operation_name, fetcher)
                 if validator and not validator(response):
-                    if isinstance(response, dict) and response.get("status") == "success":
+                    if isinstance(response, dict) and "data" in response:
                         return response
                     raise ValueError(f"{operation_name} returned invalid data")
                 return response
             except Exception as exc:
                 last_error = exc
                 self.runtime_state["metrics"]["failures"] += 1
-                if "invalid data" in str(exc) and "empty" not in str(exc):
-                    pass
-                else:
-                    logger.warning(
-                        "Skipping retries for %s due to empty API response",
-                        operation_name,
-                    )
-                    break
                 if attempt < max_attempts - 1:
                     backoff = 2 ** attempt
                     logger.warning(
@@ -318,7 +306,7 @@ class DiscountedPremiumScanner:
                     )
                     time.sleep(backoff)
                 else:
-                    logger.error("Exhausted retries for %s: %s", operation_name, exc)
+                    logger.warning("Exhausted retries for %s: %s", operation_name, exc)
         raise RuntimeError(f"{operation_name} failed after {max_attempts} attempts") from last_error
 
     def get_cached_or_fetch(self, cache, key, fetcher, cache_label, validator=None):
@@ -331,21 +319,6 @@ class DiscountedPremiumScanner:
         value = self.fetch_with_retry(cache_label, fetcher, validator=validator)
         cache[key] = value
         return value
-
-    def _blacklist_symbol(self, security_id, security_name, reason):
-        symbol_key = str(security_id)
-        self.runtime_state["blacklist"][symbol_key] = {
-            "symbol": security_name,
-            "reason": reason,
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        logger.warning("Blacklisting %s (%s): %s", security_name, security_id, reason)
-
-    def blacklist_symbol(self, security_id, security_name, reason):
-        self._blacklist_symbol(security_id, security_name, reason)
-
-    def is_blacklisted(self, security_id):
-        return str(security_id) in self.runtime_state["blacklist"]
 
     def get_warmup_metrics(self):
         return dict(self.runtime_state["metrics"])
@@ -491,10 +464,7 @@ class DiscountedPremiumScanner:
             )
 
         def validator(response):
-            if not isinstance(response, dict) or response.get("status") != "success":
-                return False
-            chain_data = unwrap_dhan_payload(response.get("data") or {})
-            return chain_data.get("last_price") is not None and isinstance(chain_data.get("oc"), dict) and bool(chain_data.get("oc"))
+            return isinstance(response, dict) and "data" in response
 
         try:
             return self.get_cached_or_fetch(
@@ -572,7 +542,7 @@ class DiscountedPremiumScanner:
             return sorted(set(expiries))
 
         def validator(response):
-            return isinstance(response, dict) and response.get("status") == "success"
+            return isinstance(response, dict) and "data" in response
 
         try:
             response = self.get_cached_or_fetch(
