@@ -50,6 +50,28 @@ IV_HISTORY_COLUMNS = [
     "atm_call_iv",
     "atm_put_iv",
 ]
+IV_HISTORY_OPTIONAL_COLUMNS = {
+    "atm_call_oi": "REAL",
+    "atm_put_oi": "REAL",
+    "total_call_oi": "REAL",
+    "total_put_oi": "REAL",
+    "total_call_volume": "REAL",
+    "total_put_volume": "REAL",
+    "max_oi_strike_call": "REAL",
+    "max_oi_strike_put": "REAL",
+}
+
+
+def ensure_iv_history_schema(cursor):
+    existing_columns = {
+        row[1]
+        for row in cursor.execute("PRAGMA table_info(iv_history)").fetchall()
+    }
+    for column_name, column_type in IV_HISTORY_OPTIONAL_COLUMNS.items():
+        if column_name not in existing_columns:
+            cursor.execute(
+                f"ALTER TABLE iv_history ADD COLUMN {column_name} {column_type}"
+            )
 
 
 def init_iv_db():
@@ -71,6 +93,7 @@ def init_iv_db():
         UNIQUE(security_id, timestamp, data_type)
     )
     """)
+    ensure_iv_history_schema(cursor)
 
     cursor.execute("""
     CREATE INDEX IF NOT EXISTS idx_iv_security_time
@@ -95,6 +118,7 @@ def migrate_csv_to_sqlite():
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    ensure_iv_history_schema(cursor)
 
     for _, row in df.iterrows():
         timestamp = f"{row['snapshot_date']} {row.get('snapshot_time', '00:00:00')}"
@@ -110,8 +134,12 @@ def migrate_csv_to_sqlite():
             security_id, symbol, timestamp,
             spot_price, atm_strike,
             atm_iv, atm_call_iv, atm_put_iv,
+            atm_call_oi, atm_put_oi,
+            total_call_oi, total_put_oi,
+            total_call_volume, total_put_volume,
+            max_oi_strike_call, max_oi_strike_put,
             data_type
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(security_id, timestamp, data_type) DO NOTHING
         """, (
             security_id,
@@ -122,6 +150,14 @@ def migrate_csv_to_sqlite():
             atm_iv,
             row.get("atm_call_iv"),
             row.get("atm_put_iv"),
+            row.get("atm_call_oi"),
+            row.get("atm_put_oi"),
+            row.get("total_call_oi"),
+            row.get("total_put_oi"),
+            row.get("total_call_volume"),
+            row.get("total_put_volume"),
+            row.get("max_oi_strike_call"),
+            row.get("max_oi_strike_put"),
             data_type,
         ))
 
@@ -211,10 +247,12 @@ class DiscountedPremiumScanner:
                 "expiries": {},
                 "option_chain": {},
                 "blacklist": {},
+                "warmup_failures": {},
                 "metrics": {
                     "total_calls": 0,
                     "cache_hits": 0,
                     "failures": 0,
+                    "iv_snapshots": 0,
                 },
                 "last_api_call_ts": 0.0,
             }
@@ -227,10 +265,12 @@ class DiscountedPremiumScanner:
             state["expiries"] = {}
             state["option_chain"] = {}
             state["blacklist"] = {}
+            state["warmup_failures"] = {}
             state["metrics"] = {
                 "total_calls": 0,
                 "cache_hits": 0,
                 "failures": 0,
+                "iv_snapshots": 0,
             }
             state["last_api_call_ts"] = 0.0
             logger.info("Reset scanner runtime caches for %s", today)
@@ -385,25 +425,33 @@ class DiscountedPremiumScanner:
                 "Options Scanner Summary",
                 f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
                 f"Matches: {len(opportunities_df)}",
+                "",
             ]
-
-            grouped_rows = (
-                opportunities_df.sort_values("score", ascending=False)
-                .groupby("strategy", sort=False)
-            )
-            for strategy_name, strategy_rows in grouped_rows:
+            for _, row in opportunities_df.sort_values("score", ascending=False).head(12).iterrows():
+                hv_text = f"{row['hv']:.1f}" if pd.notna(row.get("hv")) else "N/A"
+                pcr_value = row.get("pcr_value")
+                pcr_text = f"{pcr_value:.2f}" if pd.notna(pcr_value) else "N/A"
+                rr_text = f"{row['risk_reward']:.2f}" if pd.notna(row.get("risk_reward")) else "N/A"
+                volume_spike_text = "Yes" if bool(row.get("volume_spike")) else "No"
+                lines.append(f"{row['symbol']} | {row['type']} {row['strike']:.0f}")
+                lines.append(f"Score {row['score']:.1f} | {row['strategy']}")
+                lines.append(
+                    f"IV/HV {row['iv']:.1f}/{hv_text} | PCR {pcr_text} {str(row.get('pcr_trend', 'neutral')).title()}"
+                )
+                lines.append(
+                    f"Buildup {str(row.get('buildup_type', 'neutral')).replace('_', ' ').title()} | "
+                    f"OI Shift C:{row.get('oi_shift_call', 'same')} P:{row.get('oi_shift_put', 'same')} | "
+                    f"Vol Spike {volume_spike_text}"
+                )
+                lines.append(
+                    f"Market {str(row.get('market_direction', 'neutral')).title()} "
+                    f"{row.get('market_confidence', 50.0):.0f}"
+                )
+                lines.append(
+                    f"Entry {row['entry']:.2f} | SL {row['stop_loss']:.2f} | "
+                    f"Target {row['target']:.2f} | RR {rr_text}"
+                )
                 lines.append("")
-                lines.append(f"{strategy_name}:")
-                for _, row in strategy_rows.head(5).iterrows():
-                    pcr_text = f"{row['pcr_value']:.2f}" if pd.notna(row.get('pcr_value')) else "N/A"
-                    relative_skew_text = f"{row['relative_skew']:.2f}" if pd.notna(row.get('relative_skew')) else "N/A"
-                    lines.append(
-                        f"{row['symbol']} {row['type']} {row['strike']:.0f}\n"
-                        f"Score: {row['score']:.1f}\n"
-                        f"Type: {str(row.get('trade_type', 'volatility')).title()}\n"
-                        f"PCR: {pcr_text} ({str(row.get('sentiment_bias', 'neutral')).title()})\n"
-                        f"Skew: {relative_skew_text}"
-                    )
             message = "\n".join(lines)
 
         try:
@@ -578,7 +626,7 @@ class DiscountedPremiumScanner:
                 instrument_type=instrument_type,
                 from_date=from_date,
                 to_date=to_date,
-                oi=False
+                oi=True
             )
         except Exception:
             logger.exception(
@@ -1115,14 +1163,71 @@ class DiscountedPremiumScanner:
             return None
         return spot_price * (reference_iv / 100.0) * math.sqrt(dte / 365.0)
 
+    def extract_chain_metrics(self, option_chain):
+        metrics = {
+            "total_call_oi": 0.0,
+            "total_put_oi": 0.0,
+            "total_call_volume": 0.0,
+            "total_put_volume": 0.0,
+            "max_oi_strike_call": None,
+            "max_oi_strike_put": None,
+        }
+        max_call_oi = -1.0
+        max_put_oi = -1.0
+
+        for strike_key, strike_data in (option_chain or {}).items():
+            if not isinstance(strike_data, dict):
+                continue
+
+            strike_price = pd.to_numeric(strike_key, errors="coerce")
+            if pd.isna(strike_price):
+                continue
+            strike_price = float(strike_price)
+
+            call_opt = strike_data.get("ce") or {}
+            put_opt = strike_data.get("pe") or {}
+
+            call_oi = pd.to_numeric(call_opt.get("oi"), errors="coerce")
+            put_oi = pd.to_numeric(put_opt.get("oi"), errors="coerce")
+            call_volume = pd.to_numeric(call_opt.get("volume"), errors="coerce")
+            put_volume = pd.to_numeric(put_opt.get("volume"), errors="coerce")
+
+            if pd.notna(call_oi) and call_oi > 0:
+                call_oi = float(call_oi)
+                metrics["total_call_oi"] += call_oi
+                if call_oi > max_call_oi:
+                    max_call_oi = call_oi
+                    metrics["max_oi_strike_call"] = strike_price
+            if pd.notna(put_oi) and put_oi > 0:
+                put_oi = float(put_oi)
+                metrics["total_put_oi"] += put_oi
+                if put_oi > max_put_oi:
+                    max_put_oi = put_oi
+                    metrics["max_oi_strike_put"] = strike_price
+            if pd.notna(call_volume) and call_volume > 0:
+                metrics["total_call_volume"] += float(call_volume)
+            if pd.notna(put_volume) and put_volume > 0:
+                metrics["total_put_volume"] += float(put_volume)
+
+        return metrics
+
     def extract_atm_reference_ivs(self, option_chain, spot_price):
         if not option_chain:
-            return {"atm_strike": None, "atm_call_iv": None, "atm_put_iv": None, "atm_iv": None}
+            return {
+                "atm_strike": None,
+                "atm_call_iv": None,
+                "atm_put_iv": None,
+                "atm_iv": None,
+                "atm_call_oi": None,
+                "atm_put_oi": None,
+            }
 
         atm_strike = min(option_chain.keys(), key=lambda strike: abs(float(strike) - spot_price))
         atm_data = option_chain.get(atm_strike, {})
         atm_call_iv = (atm_data.get("ce") or {}).get("implied_volatility") or None
         atm_put_iv = (atm_data.get("pe") or {}).get("implied_volatility") or None
+        atm_call_oi = pd.to_numeric((atm_data.get("ce") or {}).get("oi"), errors="coerce")
+        atm_put_oi = pd.to_numeric((atm_data.get("pe") or {}).get("oi"), errors="coerce")
         valid = [value for value in [atm_call_iv, atm_put_iv] if value and value > 0]
         atm_iv = float(np.mean(valid)) if valid else None
         return {
@@ -1130,9 +1235,12 @@ class DiscountedPremiumScanner:
             "atm_call_iv": atm_call_iv,
             "atm_put_iv": atm_put_iv,
             "atm_iv": atm_iv,
+            "atm_call_oi": native_number(atm_call_oi),
+            "atm_put_oi": native_number(atm_put_oi),
         }
 
-    def persist_iv_snapshot(self, security_id, exchange_segment, security_name, expiry, spot_price, atm_context, store_intraday=None):
+    def persist_iv_snapshot(self, security_id, exchange_segment, security_name, expiry, spot_price, atm_context,
+                            chain_metrics=None, store_intraday=None):
         """Persist one ATM IV snapshot per day to build IV rank / percentile history."""
         atm_iv = atm_context.get("atm_iv")
         if atm_iv is None or atm_iv <= 0 or atm_iv < 1 or atm_iv > 200:
@@ -1141,6 +1249,7 @@ class DiscountedPremiumScanner:
         store_intraday = self.store_intraday if store_intraday is None else store_intraday
         snapshot_dt = datetime.now()
         data_type = "intraday" if store_intraday else "daily"
+        chain_metrics = chain_metrics or {}
 
         snapshot = pd.DataFrame([{
             "snapshot_date": snapshot_dt.date().isoformat(),
@@ -1152,17 +1261,30 @@ class DiscountedPremiumScanner:
             "atm_iv": atm_iv,
             "atm_call_iv": atm_context.get("atm_call_iv"),
             "atm_put_iv": atm_context.get("atm_put_iv"),
+            "atm_call_oi": atm_context.get("atm_call_oi"),
+            "atm_put_oi": atm_context.get("atm_put_oi"),
+            "total_call_oi": chain_metrics.get("total_call_oi"),
+            "total_put_oi": chain_metrics.get("total_put_oi"),
+            "total_call_volume": chain_metrics.get("total_call_volume"),
+            "total_put_volume": chain_metrics.get("total_put_volume"),
+            "max_oi_strike_call": chain_metrics.get("max_oi_strike_call"),
+            "max_oi_strike_put": chain_metrics.get("max_oi_strike_put"),
         }])
         try:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
+            ensure_iv_history_schema(cursor)
             cursor.execute("""
             INSERT INTO iv_history (
                 security_id, symbol, timestamp,
                 spot_price, atm_strike,
                 atm_iv, atm_call_iv, atm_put_iv,
+                atm_call_oi, atm_put_oi,
+                total_call_oi, total_put_oi,
+                total_call_volume, total_put_volume,
+                max_oi_strike_call, max_oi_strike_put,
                 data_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(security_id, timestamp, data_type) DO NOTHING
             """, (
                 str(security_id),
@@ -1173,9 +1295,18 @@ class DiscountedPremiumScanner:
                 atm_iv,
                 atm_context.get("atm_call_iv"),
                 atm_context.get("atm_put_iv"),
+                atm_context.get("atm_call_oi"),
+                atm_context.get("atm_put_oi"),
+                chain_metrics.get("total_call_oi"),
+                chain_metrics.get("total_put_oi"),
+                chain_metrics.get("total_call_volume"),
+                chain_metrics.get("total_put_volume"),
+                chain_metrics.get("max_oi_strike_call"),
+                chain_metrics.get("max_oi_strike_put"),
                 data_type,
             ))
             conn.commit()
+            self.runtime_state["metrics"]["iv_snapshots"] += 1
         except Exception:
             logger.exception("Failed to persist IV snapshot to SQLite: %s", DB_PATH)
         finally:
@@ -1184,20 +1315,245 @@ class DiscountedPremiumScanner:
             except Exception:
                 pass
 
-    def build_premarket_context(self, security_id):
+    def get_intraday_snapshots(self, security_id, limit=5):
         try:
             conn = sqlite3.connect(DB_PATH)
             query = """
-            SELECT atm_iv, timestamp
+            SELECT
+                security_id, symbol, timestamp, spot_price, atm_strike, atm_iv,
+                atm_call_iv, atm_put_iv, atm_call_oi, atm_put_oi,
+                total_call_oi, total_put_oi, total_call_volume, total_put_volume,
+                max_oi_strike_call, max_oi_strike_put
             FROM iv_history
             WHERE security_id = ?
             AND data_type = 'intraday'
-            AND DATE(timestamp) = DATE('now')
-            ORDER BY timestamp ASC
+            AND DATE(timestamp) = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
             """
-            df = pd.read_sql(query, conn, params=(str(security_id),))
-            conn.close()
+            df = pd.read_sql(
+                query,
+                conn,
+                params=(str(security_id), datetime.now().date().isoformat(), int(limit)),
+            )
+        except Exception:
+            logger.exception("Failed to read intraday IV history for %s", security_id)
+            return pd.DataFrame()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
+        if df.empty:
+            return df
+
+        numeric_cols = [
+            "spot_price", "atm_strike", "atm_iv", "atm_call_iv", "atm_put_iv",
+            "atm_call_oi", "atm_put_oi", "total_call_oi", "total_put_oi",
+            "total_call_volume", "total_put_volume", "max_oi_strike_call", "max_oi_strike_put",
+        ]
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        for column in numeric_cols:
+            if column in df.columns:
+                df[column] = pd.to_numeric(df[column], errors="coerce")
+        df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+        return df
+
+    def get_oi_buildup(self, security_id):
+        snapshots = self.get_intraday_snapshots(security_id, limit=5)
+        if len(snapshots) < 2:
+            return {"type": "neutral", "strength": 0.0}
+
+        first = snapshots.iloc[0]
+        latest = snapshots.iloc[-1]
+        price_start = pd.to_numeric(first.get("spot_price"), errors="coerce")
+        price_end = pd.to_numeric(latest.get("spot_price"), errors="coerce")
+        oi_start = pd.to_numeric(first.get("total_call_oi"), errors="coerce") + pd.to_numeric(first.get("total_put_oi"), errors="coerce")
+        oi_end = pd.to_numeric(latest.get("total_call_oi"), errors="coerce") + pd.to_numeric(latest.get("total_put_oi"), errors="coerce")
+
+        if pd.isna(price_start) or pd.isna(price_end) or pd.isna(oi_start) or pd.isna(oi_end):
+            return {"type": "neutral", "strength": 0.0}
+
+        price_change_pct = ((price_end - price_start) / price_start * 100.0) if price_start else 0.0
+        oi_change_pct = ((oi_end - oi_start) / oi_start * 100.0) if oi_start else 0.0
+
+        if oi_change_pct >= 1.0 and price_change_pct >= 0.2:
+            buildup_type = "long_buildup"
+        elif oi_change_pct >= 1.0 and price_change_pct <= -0.2:
+            buildup_type = "short_buildup"
+        elif oi_change_pct <= -1.0 and price_change_pct >= 0.2:
+            buildup_type = "short_covering"
+        elif oi_change_pct <= -1.0 and price_change_pct <= -0.2:
+            buildup_type = "long_unwinding"
+        else:
+            buildup_type = "neutral"
+
+        strength = clip_score((abs(price_change_pct) * 12.0) + (abs(oi_change_pct) * 8.0), floor=0.0, ceiling=100.0)
+        return {
+            "type": buildup_type,
+            "strength": round(strength, 2),
+            "price_change_pct": native_number(price_change_pct),
+            "oi_change_pct": native_number(oi_change_pct),
+        }
+
+    def get_pcr_trend(self, security_id):
+        snapshots = self.get_intraday_snapshots(security_id, limit=5)
+        if snapshots.empty:
+            return {"current_pcr": None, "trend": "neutral"}
+
+        pcr_series = []
+        for _, row in snapshots.iterrows():
+            call_oi = pd.to_numeric(row.get("total_call_oi"), errors="coerce")
+            put_oi = pd.to_numeric(row.get("total_put_oi"), errors="coerce")
+            if pd.notna(call_oi) and call_oi > 0 and pd.notna(put_oi):
+                pcr_series.append(float(put_oi / call_oi))
+
+        if not pcr_series:
+            return {"current_pcr": None, "trend": "neutral"}
+
+        current_pcr = pcr_series[-1]
+        slope = float(np.polyfit(np.arange(len(pcr_series), dtype=float), np.array(pcr_series, dtype=float), 1)[0]) if len(pcr_series) >= 2 else 0.0
+
+        if current_pcr >= 1.05 and slope > 0.01:
+            trend = "bullish"
+        elif current_pcr <= 0.95 and slope < -0.01:
+            trend = "bearish"
+        else:
+            trend = "neutral"
+
+        return {
+            "current_pcr": round(current_pcr, 3),
+            "trend": trend,
+            "slope": round(slope, 4),
+        }
+
+    def detect_oi_shift(self, security_id):
+        snapshots = self.get_intraday_snapshots(security_id, limit=2)
+        if len(snapshots) < 2:
+            return {"call_shift": "same", "put_shift": "same"}
+
+        previous = snapshots.iloc[-2]
+        latest = snapshots.iloc[-1]
+
+        def compare_shift(previous_value, latest_value):
+            previous_value = pd.to_numeric(previous_value, errors="coerce")
+            latest_value = pd.to_numeric(latest_value, errors="coerce")
+            if pd.isna(previous_value) or pd.isna(latest_value):
+                return "same"
+            if latest_value > previous_value:
+                return "up"
+            if latest_value < previous_value:
+                return "down"
+            return "same"
+
+        return {
+            "call_shift": compare_shift(previous.get("max_oi_strike_call"), latest.get("max_oi_strike_call")),
+            "put_shift": compare_shift(previous.get("max_oi_strike_put"), latest.get("max_oi_strike_put")),
+            "previous_call_strike": native_number(previous.get("max_oi_strike_call")),
+            "latest_call_strike": native_number(latest.get("max_oi_strike_call")),
+            "previous_put_strike": native_number(previous.get("max_oi_strike_put")),
+            "latest_put_strike": native_number(latest.get("max_oi_strike_put")),
+        }
+
+    def detect_volume_spike(self, security_id):
+        snapshots = self.get_intraday_snapshots(security_id, limit=4)
+        if len(snapshots) < 2:
+            return {"spike": False, "ratio": None, "direction": "neutral"}
+
+        latest = snapshots.iloc[-1]
+        history = snapshots.iloc[:-1]
+        latest_total = 0.0
+        for column in ("total_call_volume", "total_put_volume"):
+            value = pd.to_numeric(latest.get(column), errors="coerce")
+            if pd.notna(value):
+                latest_total += float(value)
+        historical_totals = []
+        for _, row in history.iterrows():
+            total = 0.0
+            for column in ("total_call_volume", "total_put_volume"):
+                value = pd.to_numeric(row.get(column), errors="coerce")
+                if pd.notna(value):
+                    total += float(value)
+            if total > 0:
+                historical_totals.append(total)
+
+        if not historical_totals:
+            return {"spike": False, "ratio": None, "direction": "neutral"}
+
+        avg_total = float(np.mean(historical_totals))
+        ratio = (latest_total / avg_total) if avg_total > 0 else None
+        call_volume = pd.to_numeric(latest.get("total_call_volume"), errors="coerce")
+        put_volume = pd.to_numeric(latest.get("total_put_volume"), errors="coerce")
+        if pd.notna(call_volume) and pd.notna(put_volume):
+            direction = "bullish" if put_volume > call_volume else "bearish" if call_volume > put_volume else "neutral"
+        else:
+            direction = "neutral"
+
+        return {
+            "spike": bool(ratio is not None and ratio > 1.5),
+            "ratio": round(ratio, 2) if ratio is not None else None,
+            "direction": direction,
+        }
+
+    def build_market_signal(self, security_id):
+        buildup = self.get_oi_buildup(security_id)
+        pcr_trend = self.get_pcr_trend(security_id)
+        oi_shift = self.detect_oi_shift(security_id)
+        volume_spike = self.detect_volume_spike(security_id)
+
+        bullish_score = 0.0
+        bearish_score = 0.0
+
+        buildup_type = buildup.get("type")
+        if buildup_type in {"long_buildup", "short_covering"}:
+            bullish_score += 1.5 + (buildup.get("strength", 0.0) / 100.0)
+        elif buildup_type in {"short_buildup", "long_unwinding"}:
+            bearish_score += 1.5 + (buildup.get("strength", 0.0) / 100.0)
+
+        if pcr_trend.get("trend") == "bullish":
+            bullish_score += 1.25
+        elif pcr_trend.get("trend") == "bearish":
+            bearish_score += 1.25
+
+        if oi_shift.get("call_shift") == "up":
+            bearish_score += 0.75
+        elif oi_shift.get("call_shift") == "down":
+            bullish_score += 0.4
+        if oi_shift.get("put_shift") == "up":
+            bullish_score += 0.75
+        elif oi_shift.get("put_shift") == "down":
+            bearish_score += 0.4
+
+        if volume_spike.get("spike"):
+            if volume_spike.get("direction") == "bullish":
+                bullish_score += 0.8
+            elif volume_spike.get("direction") == "bearish":
+                bearish_score += 0.8
+
+        score_gap = bullish_score - bearish_score
+        if score_gap > 0.75:
+            direction = "bullish"
+        elif score_gap < -0.75:
+            direction = "bearish"
+        else:
+            direction = "neutral"
+
+        confidence = clip_score(50 + abs(score_gap) * 18, floor=35.0, ceiling=95.0)
+        return {
+            "direction": direction,
+            "confidence": round(confidence, 1),
+            "components": {
+                "buildup": buildup,
+                "pcr_trend": pcr_trend,
+                "oi_shift": oi_shift,
+                "volume_spike": volume_spike,
+            },
+        }
+
+    def build_premarket_context(self, security_id):
+        try:
+            df = self.get_intraday_snapshots(security_id, limit=12)
             if df.empty or len(df) < 2:
                 return None
 
@@ -1213,6 +1569,7 @@ class DiscountedPremiumScanner:
                 # Warmup context now captures both absolute change and the intraday IV slope.
                 "iv_change": current_iv - opening_iv,
                 "iv_trend": iv_trend,
+                "current_pcr": native_number((self.get_pcr_trend(security_id) or {}).get("current_pcr")),
             }
         except Exception:
             return None
@@ -1298,17 +1655,13 @@ class DiscountedPremiumScanner:
     def classify_trade_type(self, iv_rank, skew_discount, iv_trend, trend, abs_delta, expected_move_ratio):
         """Keep directional and volatility trade definitions strictly separated."""
         is_volatility_trade = (
-            iv_rank is not None and
-            iv_rank < 30 and
-            skew_discount is not None and
-            skew_discount > 0 and
-            iv_trend is not None and
-            iv_trend < 0
+            ((iv_rank is not None and iv_rank < 40) or (skew_discount is not None and skew_discount > 0.1)) and
+            (iv_trend is None or iv_trend <= 0.05)
         )
         is_directional_trade = (
             trend != "neutral" and
-            0.20 <= abs_delta <= 0.40 and
-            expected_move_ratio <= 1.0
+            0.05 <= abs_delta <= 0.55 and
+            expected_move_ratio <= 1.5
         )
 
         if is_volatility_trade:
@@ -1317,7 +1670,7 @@ class DiscountedPremiumScanner:
             return "directional"
         return None
 
-    def select_top_trades(self, opportunities, limit=3, max_per_direction=2):
+    def select_top_trades(self, opportunities, limit=500, max_per_direction=260):
         """Pick the highest-conviction trades with a per-direction cap."""
         if isinstance(opportunities, pd.DataFrame):
             rows = opportunities.sort_values("score", ascending=False).to_dict("records")
@@ -1405,12 +1758,20 @@ class DiscountedPremiumScanner:
 
         liquidity_score = clip_score((math.log1p(max(oi, 0)) * 12) + (math.log1p(max(volume, 0)) * 8))
         skew_score = clip_score(50 + skew_discount * 8) if skew_discount is not None else 50.0
-        relevance_score = clip_score(100 - (abs(expected_move_ratio - 0.75) / 0.45) * 100)
+        if expected_move_ratio <= 1.0:
+            relevance_score = clip_score(92 - (abs(expected_move_ratio - 0.75) / 0.55) * 42)
+        elif expected_move_ratio <= 1.5:
+            relevance_score = clip_score(78 - ((expected_move_ratio - 1.0) / 0.5) * 18)
+        elif expected_move_ratio <= 2.5:
+            relevance_score = clip_score(60 - ((expected_move_ratio - 1.5) / 1.0) * 22)
+        else:
+            relevance_score = 30.0
 
         if trade_type == "directional":
-            final_score = (
+            raw_score = (
                 hv_score * 0.25 +
                 delta_score * 0.35 +
+                liquidity_score * 0.10 +
                 skew_score * 0.15 +
                 relevance_score * 0.25
             )
@@ -1422,10 +1783,11 @@ class DiscountedPremiumScanner:
                 "strike_relevance": native_number(round(relevance_score, 2)),
             }
         else:
-            final_score = (
+            raw_score = (
                 hv_score * 0.30 +
                 skew_score * 0.40 +
                 delta_score * 0.10 +
+                liquidity_score * 0.10 +
                 relevance_score * 0.20
             )
             component_scores = {
@@ -1436,6 +1798,7 @@ class DiscountedPremiumScanner:
                 "strike_relevance": native_number(round(relevance_score, 2)),
             }
 
+        final_score = clip_score(40 + (raw_score * 0.55), floor=40.0, ceiling=95.0)
         return {
             "score": round(final_score, 2),
             "component_scores": component_scores,
@@ -1447,7 +1810,8 @@ class DiscountedPremiumScanner:
                           has_iv_history=False, call_mean=None, call_std=None,
                           put_mean=None, put_std=None, call_ivs=None, put_ivs=None,
                           call_avg_volume=None, put_avg_volume=None, iv_behavior=None,
-                          premarket_ctx=None, pcr_value=None, sentiment_bias="neutral"):
+                          premarket_ctx=None, pcr_value=None, sentiment_bias="neutral",
+                          market_signal=None):
         """
         Analyze a single strike using quantitative volatility, probability, and structure filters.
         
@@ -1468,6 +1832,13 @@ class DiscountedPremiumScanner:
         """
         discounted = []
         weighted_hv = (hv_metrics or {}).get("weighted_hv")
+        market_signal = market_signal or {"direction": "neutral", "confidence": 50.0, "components": {}}
+        market_direction = market_signal.get("direction", "neutral")
+        market_components = market_signal.get("components") or {}
+        buildup = market_components.get("buildup") or {}
+        pcr_signal = market_components.get("pcr_trend") or {}
+        oi_shift = market_components.get("oi_shift") or {}
+        volume_spike = market_components.get("volume_spike") or {}
         call_iv = pd.to_numeric((strike_data.get("ce") or {}).get("implied_volatility"), errors="coerce")
         put_iv = pd.to_numeric((strike_data.get("pe") or {}).get("implied_volatility"), errors="coerce")
         relative_skew = None
@@ -1488,14 +1859,10 @@ class DiscountedPremiumScanner:
             vega = opt.get('greeks', {}).get('vega', 0)
             abs_delta = abs(delta)
 
-            # Skip illiquid or extremely low-probability options
-            if oi < 1000 or volume <= 0:
-                self.log_option_rejection(strike_price, option_label, "Rejected due to insufficient liquidity", oi=oi, volume=volume)
-                continue
-            if volume < 200:
-                self.log_option_rejection(strike_price, option_label, "Rejected due to low volume", volume=volume)
-                continue
-            if not hedging_mode and abs_delta < 0.10:
+            # if volume <= 0:
+            #     self.log_option_rejection(strike_price, option_label, "Rejected due to zero volume", oi=oi, volume=volume)
+            #     continue
+            if not hedging_mode and abs_delta < 0.05:
                 self.log_option_rejection(strike_price, option_label, "Rejected due to low delta", delta=round(abs_delta, 3))
                 continue
 
@@ -1527,19 +1894,15 @@ class DiscountedPremiumScanner:
                 self.log_option_rejection(strike_price, option_label, "Rejected due to invalid ask price", ask=ask, bid=bid)
                 continue
             spread_pct = (ask - bid) / ask if ask else 1.0
-            if spread_pct > 0.15:
+            if spread_pct >= 0.60:
                 self.log_option_rejection(
                     strike_price,
                     option_label,
-                    "Rejected due to wide spread",
+                    "Rejected due to unusably wide spread",
                     bid=round(bid, 2),
                     ask=round(ask, 2),
                     spread_pct=round(spread_pct, 4),
                 )
-                continue
-
-            if volume < 300:
-                self.log_option_rejection(strike_price, option_label, "Rejected due to low volume for live IV", volume=volume, iv=round(current_iv, 2))
                 continue
 
             iv_is_stable, iv_deviation = self.is_iv_stable(option_chain, strike_price, option_type, current_iv)
@@ -1561,11 +1924,11 @@ class DiscountedPremiumScanner:
 
             distance_from_spot = abs(strike_price - spot_price)
             expected_move_ratio = (distance_from_spot / expected_move) if expected_move and expected_move > 0 else 0
-            if expected_move_ratio < 0.5 or expected_move_ratio > 1.2:
+            if expected_move_ratio > 2.5:
                 self.log_option_rejection(
                     strike_price,
                     option_label,
-                    "Rejected due to expected move ratio outside strict range",
+                    "Rejected due to expected move ratio above relaxed ceiling",
                     expected_move_ratio=round(expected_move_ratio, 3),
                 )
                 continue
@@ -1602,14 +1965,16 @@ class DiscountedPremiumScanner:
             quality_score = 0
             if skew_discount and skew_discount > 0:
                 quality_score += 1
-            if 0.20 <= abs_delta <= 0.40:
+            if 0.15 <= abs_delta <= 0.45:
                 quality_score += 1
-            if 0.5 <= expected_move_ratio <= 1.2:
+            if expected_move_ratio <= 1.5:
                 quality_score += 1
             if volume > 1000:
                 quality_score += 1
+            if oi >= 1000:
+                quality_score += 1
 
-            if quality_score < 2:
+            if quality_score < 1:
                 self.log_option_rejection(strike_price, option_label, "Rejected due to low quality score", quality_score=quality_score)
                 continue
 
@@ -1634,6 +1999,7 @@ class DiscountedPremiumScanner:
 
             score = score_details["score"]
             context_adjustment = 0
+            score_adjustment = 0.0
 
             if premarket_ctx:
                 iv_change = premarket_ctx.get("iv_change")
@@ -1649,8 +2015,30 @@ class DiscountedPremiumScanner:
                     elif iv_trend > 0:
                         context_adjustment -= 10
 
-            score = clip_score(score + context_adjustment)
-            score_adjustment = 0.0
+            score += context_adjustment
+
+            if volume < 200:
+                score_adjustment -= 8.0
+            elif volume < 500:
+                score_adjustment -= 4.0
+            elif volume > 1500:
+                score_adjustment += 3.0
+
+            if oi < 1000:
+                score_adjustment -= 6.0
+            elif oi > 8000:
+                score_adjustment += 3.0
+
+            if spread_pct > 0.20:
+                score_adjustment -= min(12.0, (spread_pct - 0.20) * 45.0)
+            elif spread_pct < 0.08:
+                score_adjustment += 2.5
+
+            if expected_move_ratio > 1.0:
+                if expected_move_ratio <= 2.5:
+                    score_adjustment -= min(15.0, (expected_move_ratio - 1.0) * 8.0)
+            elif expected_move_ratio < 0.35:
+                score_adjustment -= min(8.0, (0.35 - expected_move_ratio) * 15.0)
 
             chain_percentile = None
             if peer_ivs:
@@ -1685,9 +2073,23 @@ class DiscountedPremiumScanner:
                             f"{avg_move_after_low_iv:.4f}" if avg_move_after_low_iv is not None else "None",
                         )
 
-            score = round(clip_score(score + score_adjustment), 2)
+            option_direction = "bullish" if option_label == "CALL" else "bearish"
+            aligned_buildup = (
+                (option_direction == "bullish" and buildup.get("type") in {"long_buildup", "short_covering"}) or
+                (option_direction == "bearish" and buildup.get("type") in {"short_buildup", "long_unwinding"})
+            )
+            if market_direction == option_direction:
+                confidence_bonus = 10.0 + ((market_signal.get("confidence", 50.0) - 50.0) / 4.0)
+                score_adjustment += min(20.0, max(10.0, confidence_bonus))
+            elif market_direction != "neutral":
+                score_adjustment -= 10.0
 
-            if dte is not None and dte <= 2 and score <= 80:
+            if volume_spike.get("spike") and aligned_buildup:
+                score_adjustment += 5.0
+
+            score = round(clip_score(score + score_adjustment, floor=40.0, ceiling=95.0), 2)
+
+            if dte is not None and dte <= 2 and score <= 55:
                 self.log_option_rejection(
                     strike_price,
                     option_label,
@@ -1720,7 +2122,7 @@ class DiscountedPremiumScanner:
                 reasons.append(f"IV Percentile is low at {iv_percentile:.1f}")
             if hv_gap and hv_gap > 0:
                 reasons.append(f"IV is {hv_gap:.2f} points below weighted HV")
-            if 0.20 <= abs_delta <= 0.40:
+            if 0.15 <= abs_delta <= 0.45:
                 reasons.append(f"Delta {delta:.2f} sits in the preferred directional range")
             if skew_discount > 0:
                 reasons.append(f"Strike IV is {skew_discount:.2f} std below same-side chain mean")
@@ -1734,14 +2136,20 @@ class DiscountedPremiumScanner:
             reasons.append(f"IV context is {iv_context}")
             if expected_move and 0.5 <= expected_move_ratio <= 1.0:
                 reasons.append("Strike is inside the 1x expected move envelope")
-            elif expected_move and expected_move_ratio <= 1.2:
-                reasons.append("Strike remains inside the strict 1.2x expected move ceiling")
+            elif expected_move and expected_move_ratio <= 2.5:
+                reasons.append(f"Strike remains inside the relaxed {expected_move_ratio:.2f}x expected move envelope")
             if chain_percentile is not None and chain_percentile < 20:
                 reasons.append(f"Chain IV percentile is cheap at {chain_percentile:.1f}")
             elif chain_percentile is not None and chain_percentile > 80:
                 reasons.append(f"Chain IV percentile is rich at {chain_percentile:.1f}")
             if avg_peer_volume is not None and volume > avg_peer_volume:
                 reasons.append("Volume is above same-side chain average")
+            elif volume < 200:
+                reasons.append("Volume is below 200, so liquidity score was penalized instead of rejected")
+            if oi < 1000:
+                reasons.append("Open interest is below 1000, so score was penalized instead of rejected")
+            if spread_pct > 0.20:
+                reasons.append(f"Spread is wide at {spread_pct:.1%}, so score was penalized")
             if option_iv_behavior and option_iv_behavior.get("low_iv_threshold") is not None and current_iv < option_iv_behavior["low_iv_threshold"]:
                 avg_move_after_low_iv = option_iv_behavior.get("avg_move_after_low_iv")
                 if avg_move_after_low_iv is not None and avg_move_after_low_iv > 0.01:
@@ -1758,6 +2166,15 @@ class DiscountedPremiumScanner:
                     reasons.append(f"Warmup IV trend is expanding at slope {iv_trend:.3f}")
             if oi > 10000 and volume > 1000:
                 reasons.append("Liquidity is strong in both OI and volume")
+            if pcr_signal.get("trend") and pcr_signal.get("trend") != "neutral":
+                reasons.append(f"PCR trend is {pcr_signal['trend']} at {pcr_signal.get('current_pcr')}")
+            if buildup.get("type") and buildup.get("type") != "neutral":
+                reasons.append(f"OI buildup reads as {buildup['type']} ({buildup.get('strength', 0):.0f})")
+            if oi_shift.get("call_shift") != "same" or oi_shift.get("put_shift") != "same":
+                reasons.append(f"OI shift call={oi_shift.get('call_shift')} put={oi_shift.get('put_shift')}")
+            if volume_spike.get("spike"):
+                reasons.append(f"Volume spike detected at {volume_spike.get('ratio')}x recent average")
+            reasons.append(f"Market signal is {market_direction} with {market_signal.get('confidence', 50.0):.1f} confidence")
 
             discounted.append({
                 "symbol": None,
@@ -1798,12 +2215,21 @@ class DiscountedPremiumScanner:
                 "quality_score": quality_score,
                 "pcr_value": native_number(pcr_value),
                 "sentiment_bias": sentiment_bias,
+                "pcr_trend": pcr_signal.get("trend", "neutral"),
                 "atm_iv": native_number((atm_context or {}).get("atm_iv")),
                 "atm_reference_iv": native_number(reference_iv),
                 "skew_discount": native_number(skew_discount),
                 "relative_skew": native_number(relative_skew),
                 "iv_change": native_number((premarket_ctx or {}).get("iv_change")),
                 "iv_trend": native_number((premarket_ctx or {}).get("iv_trend")),
+                "buildup_type": buildup.get("type", "neutral"),
+                "buildup_strength": native_number(buildup.get("strength")),
+                "oi_shift_call": oi_shift.get("call_shift", "same"),
+                "oi_shift_put": oi_shift.get("put_shift", "same"),
+                "volume_spike": bool(volume_spike.get("spike")),
+                "volume_spike_ratio": native_number(volume_spike.get("ratio")),
+                "market_direction": market_direction,
+                "market_confidence": native_number(market_signal.get("confidence")),
                 "trend": trend,
                 "dte": dte,
                 "recommended_position_size": "2% capital",
@@ -1866,8 +2292,7 @@ class DiscountedPremiumScanner:
         put_ivs = []
         call_volumes = []
         put_volumes = []
-        total_call_oi = 0.0
-        total_put_oi = 0.0
+        chain_metrics = self.extract_chain_metrics(option_chain)
         for strike_data in option_chain.values():
             if not isinstance(strike_data, dict):
                 continue
@@ -1889,10 +2314,6 @@ class DiscountedPremiumScanner:
                 call_volumes.append(float(call_volume))
             if pd.notna(put_volume) and put_volume > 0:
                 put_volumes.append(float(put_volume))
-            if pd.notna(call_oi) and call_oi > 0:
-                total_call_oi += float(call_oi)
-            if pd.notna(put_oi) and put_oi > 0:
-                total_put_oi += float(put_oi)
 
         call_mean = float(np.mean(call_ivs)) if call_ivs else None
         put_mean = float(np.mean(put_ivs)) if put_ivs else None
@@ -1900,6 +2321,8 @@ class DiscountedPremiumScanner:
         put_std = float(np.std(put_ivs)) if len(put_ivs) > 1 else 0.0
         call_avg_volume = float(np.mean(call_volumes)) if call_volumes else None
         put_avg_volume = float(np.mean(put_volumes)) if put_volumes else None
+        total_call_oi = chain_metrics.get("total_call_oi") or 0.0
+        total_put_oi = chain_metrics.get("total_put_oi") or 0.0
         pcr_value = (total_put_oi / total_call_oi) if total_call_oi > 0 else None
         if pcr_value is None:
             sentiment_bias = "neutral"
@@ -1916,7 +2339,8 @@ class DiscountedPremiumScanner:
         has_iv_history = len(historical_ivs) >= MIN_IV_SAMPLES
         iv_rank_atm = self.calculate_iv_rank(atm_context.get("atm_iv") or 0, historical_ivs) if atm_context.get("atm_iv") and has_iv_history else None
         iv_percentile_atm = self.calculate_iv_percentile(atm_context.get("atm_iv") or 0, historical_ivs) if atm_context.get("atm_iv") and has_iv_history else None
-        self.persist_iv_snapshot(security_id, security_segment, security_name, expiry, spot_price, atm_context)
+        self.persist_iv_snapshot(security_id, security_segment, security_name, expiry, spot_price, atm_context, chain_metrics=chain_metrics)
+        market_signal = self.build_market_signal(security_id)
         dte = self.days_to_expiry(expiry)
         expected_move = self.compute_expected_move(spot_price, atm_context.get("atm_iv"), dte)
         iv_behavior = None
@@ -1948,6 +2372,16 @@ class DiscountedPremiumScanner:
             logger.info("PCR: %.2f | Sentiment Bias: %s", pcr_value, sentiment_bias)
         else:
             logger.info("PCR: N/A | Sentiment Bias: %s", sentiment_bias)
+        logger.info(
+            "Market signal: %s (confidence %.1f) | buildup=%s | pcr_trend=%s | oi_shift=%s/%s | volume_spike=%s",
+            market_signal.get("direction", "neutral"),
+            market_signal.get("confidence", 50.0),
+            (market_signal.get("components") or {}).get("buildup", {}).get("type", "neutral"),
+            (market_signal.get("components") or {}).get("pcr_trend", {}).get("trend", "neutral"),
+            (market_signal.get("components") or {}).get("oi_shift", {}).get("call_shift", "same"),
+            (market_signal.get("components") or {}).get("oi_shift", {}).get("put_shift", "same"),
+            (market_signal.get("components") or {}).get("volume_spike", {}).get("spike", False),
+        )
         
         # Calculate historical volatility if requested
         hv_metrics = {"hv10": None, "hv20": None, "hv60": None, "weighted_hv": None}
@@ -2020,6 +2454,7 @@ class DiscountedPremiumScanner:
                 premarket_ctx=premarket_ctx,
                 pcr_value=pcr_value,
                 sentiment_bias=sentiment_bias,
+                market_signal=market_signal,
             )
             
             all_discounted.extend(discounted)
@@ -2042,17 +2477,18 @@ class DiscountedPremiumScanner:
                 delta_value = abs(item.get("delta") or 0)
                 if 0.2 <= delta_value <= 0.4:
                     final_rank_score += 5
+                if item.get("market_direction") == ("bullish" if item.get("type") == "CALL" else "bearish"):
+                    market_confidence = item.get("market_confidence")
+                    market_confidence = market_confidence if market_confidence is not None else 50.0
+                    final_rank_score += min(8.0, max(0.0, (market_confidence - 50.0) / 5.0))
                 item["final_rank_score"] = round(final_rank_score, 2)
 
-            best_trade = max(all_discounted, key=lambda x: x["final_rank_score"])
-            all_discounted = [best_trade]
-            logger.info(
-                "Selected best trade for %s: %s %.2f score=%.2f",
-                security_name,
-                best_trade["type"],
-                best_trade["strike"],
-                best_trade["score"],
-            )
+            all_discounted = sorted(
+                all_discounted,
+                key=lambda item: item.get("final_rank_score", item.get("score", 0)),
+                reverse=True,
+            )[:8]
+            logger.info("Selected top %s trades for %s", len(all_discounted), security_name)
         else:
             all_discounted = []
 
@@ -2119,7 +2555,7 @@ class DiscountedPremiumScanner:
             df = pd.DataFrame(all_opportunities)
             df = df.sort_values('score', ascending=False)
             logger.info("Global opportunities before_cap=%s", len(df))
-            df = pd.DataFrame(self.select_top_trades(df, limit=3, max_per_direction=2))
+            df = pd.DataFrame(self.select_top_trades(df, limit=500, max_per_direction=260))
             logger.info("Global opportunities after_cap=%s", len(df))
             return df
         else:
