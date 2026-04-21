@@ -177,7 +177,7 @@ class StrategySchedulerApp:
                 client_id=Config.DHAN_CLIENT_ID,
             )
 
-            opportunities = scanner.scan_all_fno_stocks(min_discount_score=55)
+            opportunities = scanner.scan_all_fno_stocks(min_discount_score=40)
             scanner.generate_report(opportunities)
 
             if not opportunities.empty:
