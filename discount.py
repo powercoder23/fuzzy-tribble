@@ -253,6 +253,7 @@ class DiscountedPremiumScanner:
                     "iv_snapshots": 0,
                 },
                 "last_api_call_ts": 0.0,
+                "previous_state": {},
             }
 
         state = DiscountedPremiumScanner._shared_runtime_state
@@ -269,11 +270,12 @@ class DiscountedPremiumScanner:
                 "iv_snapshots": 0,
             }
             state["last_api_call_ts"] = 0.0
+            state["previous_state"] = {}
             logger.info("Reset scanner runtime caches for %s", today)
         return state
 
     def rate_limited_call(self, operation_name, func, *args, **kwargs):
-        min_interval = 0.2
+        min_interval = 1.5
         elapsed = time.monotonic() - self.runtime_state["last_api_call_ts"]
         if elapsed < min_interval:
             time.sleep(min_interval - elapsed)
@@ -308,6 +310,9 @@ class DiscountedPremiumScanner:
                 else:
                     logger.warning("Exhausted retries for %s: %s", operation_name, exc)
         raise RuntimeError(f"{operation_name} failed after {max_attempts} attempts") from last_error
+
+    def get_previous_state_store(self):
+        return self.runtime_state.setdefault("previous_state", {})
 
     def get_cached_or_fetch(self, cache, key, fetcher, cache_label, validator=None):
         if key in cache:
@@ -406,6 +411,13 @@ class DiscountedPremiumScanner:
                 pcr_text = f"{pcr_value:.2f}" if pd.notna(pcr_value) else "N/A"
                 rr_text = f"{row['risk_reward']:.2f}" if pd.notna(row.get("risk_reward")) else "N/A"
                 volume_spike_text = "Yes" if bool(row.get("volume_spike")) else "No"
+                oi_change_pct = row.get("oi_change_pct")
+                price_change_pct = row.get("price_change_pct")
+                oi_change_text = f"{oi_change_pct:+.2f}%" if pd.notna(oi_change_pct) else "N/A"
+                price_change_text = f"{price_change_pct:+.2f}%" if pd.notna(price_change_pct) else "N/A"
+                nearest_support = row.get("nearest_put_wall") if row.get("type") == "CALL" else row.get("nearest_call_wall")
+                support_label = "PUT wall" if row.get("type") == "CALL" else "CALL wall"
+                support_text = f"{nearest_support:.0f} ({support_label})" if pd.notna(nearest_support) else "N/A"
                 lines.append(f"{row['symbol']} | {row['type']} {row['strike']:.0f}")
                 lines.append(f"Score {row['score']:.1f} | {row['strategy']}")
                 lines.append(
@@ -413,11 +425,11 @@ class DiscountedPremiumScanner:
                 )
                 lines.append(
                     f"Buildup {str(row.get('buildup_type', 'neutral')).replace('_', ' ').title()} | "
-                    f"OI Shift C:{row.get('oi_shift_call', 'same')} P:{row.get('oi_shift_put', 'same')} | "
-                    f"Vol Spike {volume_spike_text}"
+                    f"OI {oi_change_text} | Price {price_change_text} | Vol Spike {volume_spike_text}"
                 )
                 lines.append(
-                    f"Market {str(row.get('market_direction', 'neutral')).title()} "
+                    f"Support/Resistance {support_text} | Market {str(row.get('market_direction', 'neutral')).title()} "
+                    f"{str(row.get('market_strength', 'neutral')).replace('_', ' ').title()} "
                     f"{row.get('market_confidence', 50.0):.0f}"
                 )
                 lines.append(
@@ -1137,6 +1149,7 @@ class DiscountedPremiumScanner:
         metrics = {
             "total_call_oi": 0.0,
             "total_put_oi": 0.0,
+            "total_oi": 0.0,
             "total_call_volume": 0.0,
             "total_put_volume": 0.0,
             "max_oi_strike_call": None,
@@ -1165,12 +1178,14 @@ class DiscountedPremiumScanner:
             if pd.notna(call_oi) and call_oi > 0:
                 call_oi = float(call_oi)
                 metrics["total_call_oi"] += call_oi
+                metrics["total_oi"] += call_oi
                 if call_oi > max_call_oi:
                     max_call_oi = call_oi
                     metrics["max_oi_strike_call"] = strike_price
             if pd.notna(put_oi) and put_oi > 0:
                 put_oi = float(put_oi)
                 metrics["total_put_oi"] += put_oi
+                metrics["total_oi"] += put_oi
                 if put_oi > max_put_oi:
                     max_put_oi = put_oi
                     metrics["max_oi_strike_put"] = strike_price
@@ -1179,7 +1194,125 @@ class DiscountedPremiumScanner:
             if pd.notna(put_volume) and put_volume > 0:
                 metrics["total_put_volume"] += float(put_volume)
 
+        oi_walls = self.find_oi_walls(option_chain)
+        metrics["call_walls"] = oi_walls["call_walls"]
+        metrics["put_walls"] = oi_walls["put_walls"]
         return metrics
+
+    def find_oi_walls(self, option_chain):
+        ordered_rows = []
+        for strike_key, strike_data in (option_chain or {}).items():
+            if not isinstance(strike_data, dict):
+                continue
+            strike_price = pd.to_numeric(strike_key, errors="coerce")
+            if pd.isna(strike_price):
+                continue
+            ordered_rows.append({
+                "strike": float(strike_price),
+                "call_oi": native_number(pd.to_numeric((strike_data.get("ce") or {}).get("oi"), errors="coerce")) or 0.0,
+                "put_oi": native_number(pd.to_numeric((strike_data.get("pe") or {}).get("oi"), errors="coerce")) or 0.0,
+            })
+
+        ordered_rows.sort(key=lambda item: item["strike"])
+        call_walls = []
+        put_walls = []
+        for index in range(1, len(ordered_rows) - 1):
+            previous_row = ordered_rows[index - 1]
+            current_row = ordered_rows[index]
+            next_row = ordered_rows[index + 1]
+            if (
+                current_row["call_oi"] > 0
+                and current_row["call_oi"] > 1.5 * previous_row["call_oi"]
+                and current_row["call_oi"] > 1.5 * next_row["call_oi"]
+            ):
+                call_walls.append({
+                    "strike": current_row["strike"],
+                    "oi": current_row["call_oi"],
+                })
+            if (
+                current_row["put_oi"] > 0
+                and current_row["put_oi"] > 1.5 * previous_row["put_oi"]
+                and current_row["put_oi"] > 1.5 * next_row["put_oi"]
+            ):
+                put_walls.append({
+                    "strike": current_row["strike"],
+                    "oi": current_row["put_oi"],
+                })
+
+        return {"call_walls": call_walls, "put_walls": put_walls}
+
+    def compute_buildup_from_state(self, security_id, spot_price, chain_metrics):
+        previous_state = self.get_previous_state_store()
+        state_key = str(security_id)
+        current_total_oi = native_number(chain_metrics.get("total_oi")) or 0.0
+        current_spot = native_number(spot_price)
+        now_iso = datetime.now().isoformat()
+        previous = previous_state.get(state_key)
+
+        result = {
+            "type": "NEUTRAL",
+            "strength": 0.0,
+            "price_change": None,
+            "price_change_pct": None,
+            "oi_change": None,
+            "oi_change_pct": None,
+            "previous_spot": native_number((previous or {}).get("spot")),
+            "previous_total_oi": native_number((previous or {}).get("total_oi")),
+            "timestamp": now_iso,
+        }
+
+        if previous is not None and current_spot is not None:
+            previous_spot = pd.to_numeric(previous.get("spot"), errors="coerce")
+            previous_total_oi = pd.to_numeric(previous.get("total_oi"), errors="coerce")
+            if pd.notna(previous_spot) and pd.notna(previous_total_oi):
+                price_change = float(current_spot - previous_spot)
+                oi_change = float(current_total_oi - previous_total_oi)
+                price_change_pct = ((price_change / previous_spot) * 100.0) if previous_spot else 0.0
+                oi_change_pct = ((oi_change / previous_total_oi) * 100.0) if previous_total_oi else 0.0
+
+                if price_change > 0 and oi_change > 0:
+                    buildup_type = "LONG_BUILDUP"
+                elif price_change < 0 and oi_change > 0:
+                    buildup_type = "SHORT_BUILDUP"
+                elif price_change > 0 and oi_change < 0:
+                    buildup_type = "SHORT_COVERING"
+                elif price_change < 0 and oi_change < 0:
+                    buildup_type = "LONG_UNWINDING"
+                else:
+                    buildup_type = "NEUTRAL"
+
+                strength = clip_score((abs(price_change_pct) * 12.0) + (abs(oi_change_pct) * 8.0), floor=0.0, ceiling=100.0)
+                result.update({
+                    "type": buildup_type,
+                    "strength": round(strength, 2),
+                    "price_change": native_number(price_change),
+                    "price_change_pct": native_number(price_change_pct),
+                    "oi_change": native_number(oi_change),
+                    "oi_change_pct": native_number(oi_change_pct),
+                })
+
+        previous_state[state_key] = {
+            "spot": current_spot,
+            "total_oi": current_total_oi,
+            "timestamp": now_iso,
+        }
+        return result
+
+    def find_nearest_oi_wall(self, spot_price, walls):
+        if spot_price is None or not walls:
+            return None
+        nearest = min(
+            walls,
+            key=lambda wall: abs((native_number(wall.get("strike")) or 0.0) - spot_price),
+        )
+        strike = native_number(nearest.get("strike"))
+        if strike is None:
+            return None
+        return {
+            "strike": strike,
+            "oi": native_number(nearest.get("oi")),
+            "distance": abs(strike - spot_price),
+        }
 
     def extract_atm_reference_ivs(self, option_chain, spot_price):
         if not option_chain:
@@ -1331,40 +1464,17 @@ class DiscountedPremiumScanner:
         return df
 
     def get_oi_buildup(self, security_id):
-        snapshots = self.get_intraday_snapshots(security_id, limit=5)
-        if len(snapshots) < 2:
-            return {"type": "neutral", "strength": 0.0}
-
-        first = snapshots.iloc[0]
-        latest = snapshots.iloc[-1]
-        price_start = pd.to_numeric(first.get("spot_price"), errors="coerce")
-        price_end = pd.to_numeric(latest.get("spot_price"), errors="coerce")
-        oi_start = pd.to_numeric(first.get("total_call_oi"), errors="coerce") + pd.to_numeric(first.get("total_put_oi"), errors="coerce")
-        oi_end = pd.to_numeric(latest.get("total_call_oi"), errors="coerce") + pd.to_numeric(latest.get("total_put_oi"), errors="coerce")
-
-        if pd.isna(price_start) or pd.isna(price_end) or pd.isna(oi_start) or pd.isna(oi_end):
-            return {"type": "neutral", "strength": 0.0}
-
-        price_change_pct = ((price_end - price_start) / price_start * 100.0) if price_start else 0.0
-        oi_change_pct = ((oi_end - oi_start) / oi_start * 100.0) if oi_start else 0.0
-
-        if oi_change_pct >= 1.0 and price_change_pct >= 0.2:
-            buildup_type = "long_buildup"
-        elif oi_change_pct >= 1.0 and price_change_pct <= -0.2:
-            buildup_type = "short_buildup"
-        elif oi_change_pct <= -1.0 and price_change_pct >= 0.2:
-            buildup_type = "short_covering"
-        elif oi_change_pct <= -1.0 and price_change_pct <= -0.2:
-            buildup_type = "long_unwinding"
-        else:
-            buildup_type = "neutral"
-
-        strength = clip_score((abs(price_change_pct) * 12.0) + (abs(oi_change_pct) * 8.0), floor=0.0, ceiling=100.0)
+        previous_state = self.get_previous_state_store().get(str(security_id)) or {}
         return {
-            "type": buildup_type,
-            "strength": round(strength, 2),
-            "price_change_pct": native_number(price_change_pct),
-            "oi_change_pct": native_number(oi_change_pct),
+            "type": str(previous_state.get("type") or "NEUTRAL"),
+            "strength": native_number(previous_state.get("strength")) or 0.0,
+            "price_change": native_number(previous_state.get("price_change")),
+            "price_change_pct": native_number(previous_state.get("price_change_pct")),
+            "oi_change": native_number(previous_state.get("oi_change")),
+            "oi_change_pct": native_number(previous_state.get("oi_change_pct")),
+            "previous_spot": native_number(previous_state.get("previous_spot")),
+            "previous_total_oi": native_number(previous_state.get("previous_total_oi")),
+            "timestamp": previous_state.get("timestamp"),
         }
 
     def get_pcr_trend(self, security_id):
@@ -1466,19 +1576,22 @@ class DiscountedPremiumScanner:
             "direction": direction,
         }
 
-    def build_market_signal(self, security_id):
+    def build_market_signal(self, security_id, spot_price=None, chain_metrics=None):
         buildup = self.get_oi_buildup(security_id)
         pcr_trend = self.get_pcr_trend(security_id)
         oi_shift = self.detect_oi_shift(security_id)
         volume_spike = self.detect_volume_spike(security_id)
+        chain_metrics = chain_metrics or {}
+        nearest_put_wall = self.find_nearest_oi_wall(spot_price, chain_metrics.get("put_walls") or [])
+        nearest_call_wall = self.find_nearest_oi_wall(spot_price, chain_metrics.get("call_walls") or [])
 
         bullish_score = 0.0
         bearish_score = 0.0
 
         buildup_type = buildup.get("type")
-        if buildup_type in {"long_buildup", "short_covering"}:
+        if buildup_type in {"LONG_BUILDUP", "SHORT_COVERING"}:
             bullish_score += 1.5 + (buildup.get("strength", 0.0) / 100.0)
-        elif buildup_type in {"short_buildup", "long_unwinding"}:
+        elif buildup_type in {"SHORT_BUILDUP", "LONG_UNWINDING"}:
             bearish_score += 1.5 + (buildup.get("strength", 0.0) / 100.0)
 
         if pcr_trend.get("trend") == "bullish":
@@ -1501,6 +1614,29 @@ class DiscountedPremiumScanner:
             elif volume_spike.get("direction") == "bearish":
                 bearish_score += 0.8
 
+        bias_from_wall = "neutral"
+        near_put_wall = False
+        near_call_wall = False
+        wall_threshold = None
+        if spot_price is not None:
+            wall_threshold = max(20.0, spot_price * 0.003)
+        if nearest_put_wall and wall_threshold is not None and nearest_put_wall["distance"] <= wall_threshold:
+            bullish_score += 1.5
+            near_put_wall = True
+            bias_from_wall = "bullish"
+        if nearest_call_wall and wall_threshold is not None and nearest_call_wall["distance"] <= wall_threshold:
+            bearish_score += 1.5
+            near_call_wall = True
+            bias_from_wall = "bearish" if bias_from_wall == "neutral" else bias_from_wall
+
+        market_strength = "NEUTRAL"
+        if buildup_type == "LONG_BUILDUP" and near_put_wall:
+            bullish_score += 2.0
+            market_strength = "STRONG_BULLISH"
+        elif buildup_type == "SHORT_BUILDUP" and near_call_wall:
+            bearish_score += 2.0
+            market_strength = "STRONG_BEARISH"
+
         score_gap = bullish_score - bearish_score
         if score_gap > 0.75:
             direction = "bullish"
@@ -1509,15 +1645,31 @@ class DiscountedPremiumScanner:
         else:
             direction = "neutral"
 
+        if market_strength == "NEUTRAL":
+            if direction == "bullish":
+                market_strength = "BULLISH"
+            elif direction == "bearish":
+                market_strength = "BEARISH"
+
         confidence = clip_score(50 + abs(score_gap) * 18, floor=35.0, ceiling=95.0)
         return {
             "direction": direction,
             "confidence": round(confidence, 1),
+            "strength": market_strength if direction != "neutral" else "NEUTRAL",
             "components": {
                 "buildup": buildup,
                 "pcr_trend": pcr_trend,
                 "oi_shift": oi_shift,
                 "volume_spike": volume_spike,
+                "oi_walls": {
+                    "call_walls": chain_metrics.get("call_walls") or [],
+                    "put_walls": chain_metrics.get("put_walls") or [],
+                    "nearest_call_wall": nearest_call_wall,
+                    "nearest_put_wall": nearest_put_wall,
+                    "bias_from_wall": bias_from_wall,
+                    "near_call_wall": near_call_wall,
+                    "near_put_wall": near_put_wall,
+                },
             },
         }
 
@@ -1809,6 +1961,10 @@ class DiscountedPremiumScanner:
         pcr_signal = market_components.get("pcr_trend") or {}
         oi_shift = market_components.get("oi_shift") or {}
         volume_spike = market_components.get("volume_spike") or {}
+        oi_wall_signal = market_components.get("oi_walls") or {}
+        nearest_put_wall = oi_wall_signal.get("nearest_put_wall")
+        nearest_call_wall = oi_wall_signal.get("nearest_call_wall")
+        market_strength = market_signal.get("strength", "NEUTRAL")
         call_iv = pd.to_numeric((strike_data.get("ce") or {}).get("implied_volatility"), errors="coerce")
         put_iv = pd.to_numeric((strike_data.get("pe") or {}).get("implied_volatility"), errors="coerce")
         relative_skew = None
@@ -2045,9 +2201,29 @@ class DiscountedPremiumScanner:
 
             option_direction = "bullish" if option_label == "CALL" else "bearish"
             aligned_buildup = (
-                (option_direction == "bullish" and buildup.get("type") in {"long_buildup", "short_covering"}) or
-                (option_direction == "bearish" and buildup.get("type") in {"short_buildup", "long_unwinding"})
+                (option_direction == "bullish" and buildup.get("type") in {"LONG_BUILDUP", "SHORT_COVERING"}) or
+                (option_direction == "bearish" and buildup.get("type") in {"SHORT_BUILDUP", "LONG_UNWINDING"})
             )
+            has_oi_support = bool(
+                (option_label == "CALL" and oi_wall_signal.get("near_put_wall")) or
+                (option_label == "PUT" and oi_wall_signal.get("near_call_wall"))
+            )
+            if not has_oi_support:
+                self.log_option_rejection(
+                    strike_price,
+                    option_label,
+                    "Rejected due to missing OI wall support",
+                    market_direction=market_direction,
+                )
+                continue
+            if not aligned_buildup:
+                self.log_option_rejection(
+                    strike_price,
+                    option_label,
+                    "Rejected due to missing buildup confirmation",
+                    buildup_type=buildup.get("type", "NEUTRAL"),
+                )
+                continue
             if market_direction == option_direction:
                 confidence_bonus = 10.0 + ((market_signal.get("confidence", 50.0) - 50.0) / 4.0)
                 score_adjustment += min(20.0, max(10.0, confidence_bonus))
@@ -2056,6 +2232,16 @@ class DiscountedPremiumScanner:
 
             if volume_spike.get("spike") and aligned_buildup:
                 score_adjustment += 5.0
+            if has_oi_support:
+                score_adjustment += 6.0
+            if option_label == "CALL" and aligned_buildup:
+                score_adjustment += 10.0
+            if option_label == "PUT" and aligned_buildup:
+                score_adjustment += 10.0
+            if market_strength == "STRONG_BULLISH" and option_label == "CALL":
+                score_adjustment += 6.0
+            if market_strength == "STRONG_BEARISH" and option_label == "PUT":
+                score_adjustment += 6.0
 
             score = round(clip_score(score + score_adjustment, floor=40.0, ceiling=95.0), 2)
 
@@ -2138,12 +2324,16 @@ class DiscountedPremiumScanner:
                 reasons.append("Liquidity is strong in both OI and volume")
             if pcr_signal.get("trend") and pcr_signal.get("trend") != "neutral":
                 reasons.append(f"PCR trend is {pcr_signal['trend']} at {pcr_signal.get('current_pcr')}")
-            if buildup.get("type") and buildup.get("type") != "neutral":
+            if buildup.get("type") and buildup.get("type") != "NEUTRAL":
                 reasons.append(f"OI buildup reads as {buildup['type']} ({buildup.get('strength', 0):.0f})")
             if oi_shift.get("call_shift") != "same" or oi_shift.get("put_shift") != "same":
                 reasons.append(f"OI shift call={oi_shift.get('call_shift')} put={oi_shift.get('put_shift')}")
             if volume_spike.get("spike"):
                 reasons.append(f"Volume spike detected at {volume_spike.get('ratio')}x recent average")
+            if nearest_put_wall:
+                reasons.append(f"Nearest put wall sits at {nearest_put_wall.get('strike'):.0f}")
+            if nearest_call_wall:
+                reasons.append(f"Nearest call wall sits at {nearest_call_wall.get('strike'):.0f}")
             reasons.append(f"Market signal is {market_direction} with {market_signal.get('confidence', 50.0):.1f} confidence")
 
             discounted.append({
@@ -2192,14 +2382,22 @@ class DiscountedPremiumScanner:
                 "relative_skew": native_number(relative_skew),
                 "iv_change": native_number((premarket_ctx or {}).get("iv_change")),
                 "iv_trend": native_number((premarket_ctx or {}).get("iv_trend")),
-                "buildup_type": buildup.get("type", "neutral"),
+                "buildup_type": buildup.get("type", "NEUTRAL"),
                 "buildup_strength": native_number(buildup.get("strength")),
+                "oi_change": native_number(buildup.get("oi_change")),
+                "oi_change_pct": native_number(buildup.get("oi_change_pct")),
+                "price_change": native_number(buildup.get("price_change")),
+                "price_change_pct": native_number(buildup.get("price_change_pct")),
                 "oi_shift_call": oi_shift.get("call_shift", "same"),
                 "oi_shift_put": oi_shift.get("put_shift", "same"),
                 "volume_spike": bool(volume_spike.get("spike")),
                 "volume_spike_ratio": native_number(volume_spike.get("ratio")),
                 "market_direction": market_direction,
+                "market_strength": market_strength,
                 "market_confidence": native_number(market_signal.get("confidence")),
+                "nearest_call_wall": native_number((nearest_call_wall or {}).get("strike")),
+                "nearest_put_wall": native_number((nearest_put_wall or {}).get("strike")),
+                "oi_support_side": "PUT_WALL" if option_label == "CALL" else "CALL_WALL",
                 "trend": trend,
                 "dte": dte,
                 "recommended_position_size": "2% capital",
@@ -2304,13 +2502,15 @@ class DiscountedPremiumScanner:
             sentiment_bias = "neutral"
 
         atm_context = self.extract_atm_reference_ivs(option_chain, spot_price)
+        buildup_state = self.compute_buildup_from_state(security_id, spot_price, chain_metrics)
+        self.get_previous_state_store()[str(security_id)].update(buildup_state)
         premarket_ctx = self.build_premarket_context(security_id)
         historical_ivs = self.fetch_historical_iv(security_id, security_segment)
         has_iv_history = len(historical_ivs) >= MIN_IV_SAMPLES
         iv_rank_atm = self.calculate_iv_rank(atm_context.get("atm_iv") or 0, historical_ivs) if atm_context.get("atm_iv") and has_iv_history else None
         iv_percentile_atm = self.calculate_iv_percentile(atm_context.get("atm_iv") or 0, historical_ivs) if atm_context.get("atm_iv") and has_iv_history else None
         self.persist_iv_snapshot(security_id, security_segment, security_name, expiry, spot_price, atm_context, chain_metrics=chain_metrics)
-        market_signal = self.build_market_signal(security_id)
+        market_signal = self.build_market_signal(security_id, spot_price=spot_price, chain_metrics=chain_metrics)
         dte = self.days_to_expiry(expiry)
         expected_move = self.compute_expected_move(spot_price, atm_context.get("atm_iv"), dte)
         iv_behavior = None

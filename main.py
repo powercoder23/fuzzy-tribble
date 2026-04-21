@@ -11,6 +11,7 @@ import time
 import argparse
 from datetime import datetime, time as dt_time
 from pathlib import Path
+from collections import deque
 
 import schedule
 
@@ -63,14 +64,28 @@ class StrategySchedulerApp:
     def _warmup_security_segment(security_name):
         return "IDX_I" if security_name in ["NIFTY", "BANKNIFTY"] else "NSE_FNO"
 
-    def process_symbol_if_allowed(
+    @staticmethod
+    def _validate_warmup_chain(scanner, chain_data):
+        if not isinstance(chain_data, dict):
+            return False, "empty option chain payload"
+        spot_price = chain_data.get("last_price")
+        option_chain = chain_data.get("oc")
+        if spot_price is None or not isinstance(option_chain, dict) or not option_chain:
+            return False, "empty option chain payload"
+        if len(option_chain) < 20:
+            return False, f"incomplete option chain ({len(option_chain)} strikes)"
+        atm_context = scanner.extract_atm_reference_ivs(option_chain, spot_price)
+        if not atm_context or atm_context.get("atm_iv") is None:
+            return False, "missing ATM IV"
+        return True, None
+
+    def process_symbol_with_retry(
         self,
         scanner,
         security_id,
         security_name,
         expiry_cache,
-        option_chain_cache,
-        last_fetched,
+        max_retries=3,
     ):
         symbol_key = str(security_id)
         security_segment = self._warmup_security_segment(security_name)
@@ -84,79 +99,49 @@ class StrategySchedulerApp:
             expiry = expiries[0]
             expiry_cache[symbol_key] = expiry
 
-        now_ts = time.time()
-        cached_entry = option_chain_cache.get(symbol_key)
-        if cached_entry:
-            cached_ts, cached_data = cached_entry
-            if now_ts - cached_ts < 3:
-                chain_data = cached_data
-            else:
-                chain_data = None
-        else:
-            chain_data = None
-
-        if chain_data is None:
-            last_time = last_fetched.get(symbol_key, 0)
-            if now_ts - last_time < 3:
-                logger.info("Skipping %s due to rate limit", security_name)
-                return False
-
-            logger.info("Fetching %s", security_name)
+        last_error = None
+        for attempt in range(max_retries):
+            logger.info("Warmup fetch %s | attempt %s/%s", security_name, attempt + 1, max_retries)
             try:
-                chain_response = scanner.dhan.option_chain(
-                    under_security_id=security_id,
-                    under_exchange_segment=security_segment,
+                chain_response = scanner.get_option_chain(security_id, security_segment, expiry)
+                if not isinstance(chain_response, dict) or chain_response.get("status") != "success":
+                    raise ValueError("invalid option chain response")
+                chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
+                is_valid, reason = self._validate_warmup_chain(scanner, chain_data)
+                if not is_valid:
+                    raise ValueError(reason)
+
+                spot_price = chain_data.get("last_price")
+                option_chain = chain_data.get("oc")
+                atm_context = scanner.extract_atm_reference_ivs(option_chain, spot_price)
+                chain_metrics = scanner.extract_chain_metrics(option_chain)
+                scanner.persist_iv_snapshot(
+                    security_id=security_id,
+                    exchange_segment=security_segment,
+                    security_name=security_name,
                     expiry=expiry,
+                    spot_price=spot_price,
+                    atm_context=atm_context,
+                    chain_metrics=chain_metrics,
+                    store_intraday=True,
                 )
-            except Exception:
-                logger.exception("Temporary skip due to API failure for %s", security_name)
-                return False
-
-            if not isinstance(chain_response, dict) or chain_response.get("status") != "success":
+                logger.info("Persisted IV snapshot for %s", security_name)
+                return True
+            except Exception as exc:
+                last_error = exc
+                scanner.runtime_state.get("option_chain", {}).pop((str(security_id), security_segment, expiry), None)
                 logger.warning(
-                    "Temporary skip due to API failure for %s: invalid option chain response",
+                    "Warmup fetch failed for %s on attempt %s/%s: %s",
                     security_name,
+                    attempt + 1,
+                    max_retries,
+                    exc,
                 )
-                return False
+                if attempt < max_retries - 1:
+                    time.sleep(min(3.0, 1.5 + (attempt * 0.75)))
 
-            chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
-            if not isinstance(chain_data, dict):
-                logger.warning(
-                    "Temporary skip due to API failure for %s: empty option chain payload",
-                    security_name,
-                )
-                return False
-
-            last_fetched[symbol_key] = now_ts
-            option_chain_cache[symbol_key] = (now_ts, chain_data)
-
-        spot_price = chain_data.get("last_price") if isinstance(chain_data, dict) else None
-        option_chain = chain_data.get("oc") if isinstance(chain_data, dict) else None
-        if spot_price is None or not isinstance(option_chain, dict) or not option_chain:
-            logger.warning(
-                "Temporary skip due to API failure for %s: empty option chain payload",
-                security_name,
-            )
-            return False
-
-        atm_context = scanner.extract_atm_reference_ivs(option_chain, spot_price)
-        chain_metrics = scanner.extract_chain_metrics(option_chain)
-        if not atm_context or atm_context.get("atm_iv") is None:
-            logger.info("Skipping %s because ATM context was empty", security_name)
-            return False
-
-        scanner.persist_iv_snapshot(
-            security_id=security_id,
-            exchange_segment=security_segment,
-            security_name=security_name,
-            expiry=expiry,
-            spot_price=spot_price,
-            atm_context=atm_context,
-            chain_metrics=chain_metrics,
-            store_intraday=True,
-        )
-        logger.info("Persisted IV snapshot for %s", security_name)
-        return True
+        logger.warning("Warmup retries exhausted for %s: %s", security_name, last_error)
+        return False
 
     def build_discount_scanner(self):
         """Create the discount scanner with a valid token."""
@@ -228,14 +213,11 @@ class StrategySchedulerApp:
             start_time = dt_time(9, 15)
             end_time = dt_time(9, 50)
             expiry_cache = {}
-            option_chain_cache = {}
-            last_fetched = {}
-            symbols = list(all_symbols)
-            index = 0
-            total = len(symbols)
+            symbols_queue = deque(all_symbols)
             cycle_count = 0
+            processed_in_cycle = 0
 
-            while True:
+            while symbols_queue:
                 now = datetime.now().time()
                 if not ignore_time_window:
                     if now < start_time:
@@ -244,29 +226,33 @@ class StrategySchedulerApp:
                     if now >= end_time:
                         break
 
-                security_id, security_name = symbols[index]
+                security_id, security_name = symbols_queue.popleft()
                 try:
-                    self.process_symbol_if_allowed(
+                    success = self.process_symbol_with_retry(
                         scanner=scanner,
                         security_id=security_id,
                         security_name=security_name,
                         expiry_cache=expiry_cache,
-                        option_chain_cache=option_chain_cache,
-                        last_fetched=last_fetched,
                     )
+                    if success:
+                        logger.info("Warmup completed for %s | remaining=%s", security_name, len(symbols_queue))
+                    else:
+                        symbols_queue.append((security_id, security_name))
                 except Exception:
-                    logger.exception("Temporary skip due to API failure for %s", security_name)
+                    logger.exception("Warmup processing failed for %s", security_name)
+                    symbols_queue.append((security_id, security_name))
 
-                index += 1
-                if index >= total:
-                    index = 0
+                processed_in_cycle += 1
+                if processed_in_cycle >= len(all_symbols):
+                    processed_in_cycle = 0
                     cycle_count += 1
                     logger.info("Completed full cycle, restarting from beginning")
                     logger.info("Completed full cycle | metrics=%s", scanner.get_warmup_metrics())
                     if max_cycles is not None and cycle_count >= max_cycles:
                         break
 
-                time.sleep(0.1)
+                if symbols_queue:
+                    time.sleep(1.5)
             return True
         except Exception:
             logger.exception("Premarket warmup failed")
