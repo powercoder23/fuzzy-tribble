@@ -185,6 +185,21 @@ def normalize_expiry_value(value):
         return None
 
 
+def get_trading_days_to_expiry(expiry_str):
+    expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+    today = datetime.now().date()
+    if expiry_date < today:
+        return 0
+
+    trading_days = 0
+    current_date = today
+    while current_date <= expiry_date:
+        if current_date.weekday() < 5:
+            trading_days += 1
+        current_date += timedelta(days=1)
+    return trading_days
+
+
 def unwrap_dhan_payload(payload):
     """Return the innermost data dict from Dhan's nested success payloads."""
     current = payload
@@ -2503,8 +2518,22 @@ class DiscountedPremiumScanner:
             if not expiries:
                 logger.warning("No expiries found for %s (%s)", security_name, security_segment)
                 return []
-            expiry = expiries[0]  # Nearest expiry
-            logger.info("Using nearest expiry: %s", expiry)
+            selected_expiry = None
+
+            for i, exp in enumerate(expiries):
+                dte = get_trading_days_to_expiry(exp)
+
+                if dte >= 7:
+                    selected_expiry = exp
+                    break
+
+            if not selected_expiry:
+                selected_expiry = expiries[min(1, len(expiries) - 1)]
+
+            expiry = selected_expiry
+
+        dte = get_trading_days_to_expiry(expiry)
+        logger.info(f"Selected expiry: {expiry} (DTE: {dte})")
         
         # Fetch option chain
         chain_response = self.get_option_chain(security_id, security_segment, expiry)

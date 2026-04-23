@@ -17,7 +17,13 @@ import schedule
 
 from config import Config
 from token_manager import TokenManager
-from discount import DiscountedPremiumScanner, init_iv_db, migrate_csv_to_sqlite, unwrap_dhan_payload
+from discount import (
+    DiscountedPremiumScanner,
+    get_trading_days_to_expiry,
+    init_iv_db,
+    migrate_csv_to_sqlite,
+    unwrap_dhan_payload,
+)
 
 
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Kolkata")
@@ -96,8 +102,23 @@ class StrategySchedulerApp:
             if not expiries:
                 logger.info("Skipping %s - no expiries available", security_name)
                 return False
-            expiry = expiries[0]
+            selected_expiry = None
+
+            for i, exp in enumerate(expiries):
+                dte = get_trading_days_to_expiry(exp)
+
+                if dte >= 7:
+                    selected_expiry = exp
+                    break
+
+            if not selected_expiry:
+                selected_expiry = expiries[min(1, len(expiries) - 1)]
+
+            expiry = selected_expiry
             expiry_cache[symbol_key] = expiry
+
+        dte = get_trading_days_to_expiry(expiry)
+        logger.info(f"Selected expiry: {expiry} (DTE: {dte})")
 
         last_error = None
         for attempt in range(max_retries):
