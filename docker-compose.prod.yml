@@ -1,17 +1,28 @@
 services:
-  scanner-dev:
+  scanner:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: discount-scanner
+    restart: unless-stopped
     env_file:
       - .env
     environment:
       TZ: Asia/Kolkata
       APP_TIMEZONE: Asia/Kolkata
+      APP_BASE_DIR: /app
+      SCHEDULER_STATE_FILE: /app/data/scheduler_state.json
+      MAX_JOB_RETRIES: "3"
+      MISSED_RUN_MAX_AGE_HOURS: "24"
+      PYTHONUNBUFFERED: "1"
     volumes:
       - .:/app
       - ./data:/app/data
       - ./logs:/app/logs
       - ./data/tokens:/app/data/tokens
-    command: python main.py
+    command: ["--recover-missed"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

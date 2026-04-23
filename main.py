@@ -9,7 +9,8 @@ import logging
 import os
 import time
 import argparse
-from datetime import datetime, time as dt_time
+import json
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from collections import deque
 
@@ -27,6 +28,9 @@ from discount import (
 
 
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Kolkata")
+STATE_FILE = Path(os.getenv("SCHEDULER_STATE_FILE", Config.DATA_DIR / "scheduler_state.json"))
+MAX_JOB_RETRIES = int(os.getenv("MAX_JOB_RETRIES", "3"))
+MISSED_RUN_MAX_AGE_HOURS = int(os.getenv("MISSED_RUN_MAX_AGE_HOURS", "24"))
 
 # Force the process to use the configured timezone instead of the container default.
 os.environ["TZ"] = APP_TIMEZONE
@@ -53,6 +57,7 @@ logger = logging.getLogger(__name__)
 class StrategySchedulerApp:
     def __init__(self):
         self.token_manager = TokenManager()
+        self.state = self.load_state()
         self.strategy_jobs = [
             {
                 "name": "premarket_warmup",
@@ -65,6 +70,168 @@ class StrategySchedulerApp:
                 "times": DEFAULT_SCAN_TIMES,
             }
         ]
+
+    def load_state(self):
+        """Load persisted scheduler state from disk."""
+        if not STATE_FILE.exists():
+            return {"jobs": {}}
+
+        try:
+            with STATE_FILE.open("r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+            if not isinstance(state, dict):
+                raise ValueError("scheduler state root must be an object")
+            state.setdefault("jobs", {})
+            return state
+        except Exception:
+            logger.exception("Failed to load scheduler state from %s; starting fresh", STATE_FILE)
+            return {"jobs": {}}
+
+    def save_state(self):
+        """Persist scheduler state atomically enough for container restarts."""
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = STATE_FILE.with_suffix(".tmp")
+        with tmp_path.open("w", encoding="utf-8") as state_file:
+            json.dump(self.state, state_file, indent=2, sort_keys=True)
+        tmp_path.replace(STATE_FILE)
+
+    @staticmethod
+    def _job_key(job_name, scheduled_time):
+        scheduled_label = (
+            scheduled_time.strftime("%H:%M")
+            if isinstance(scheduled_time, datetime)
+            else str(scheduled_time)
+        )
+        return f"{job_name}@{scheduled_label}"
+
+    @staticmethod
+    def _parse_timestamp(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            logger.warning("Ignoring invalid persisted timestamp: %s", value)
+            return None
+
+    def should_run_job(self, job_name, scheduled_time):
+        """Return True when a scheduled slot has not completed successfully."""
+        job_key = self._job_key(job_name, scheduled_time)
+        job_state = self.state.setdefault("jobs", {}).get(job_key, {})
+        last_success = self._parse_timestamp(job_state.get("last_success"))
+        return last_success is None or last_success < scheduled_time
+
+    def mark_job_run(self, job_name, scheduled_time, success=True, error=None):
+        """Record the latest job attempt and last successful completion."""
+        now = datetime.now()
+        job_key = self._job_key(job_name, scheduled_time)
+        job_state = self.state.setdefault("jobs", {}).setdefault(job_key, {})
+        job_state["last_attempt"] = now.isoformat(timespec="seconds")
+        job_state["scheduled_time"] = scheduled_time.isoformat(timespec="seconds")
+
+        if success:
+            job_state["last_success"] = now.isoformat(timespec="seconds")
+            job_state["last_successful_scheduled_time"] = scheduled_time.isoformat(timespec="seconds")
+            job_state["failure_count"] = 0
+            job_state.pop("last_failure", None)
+            job_state.pop("last_error", None)
+        else:
+            job_state["last_failure"] = now.isoformat(timespec="seconds")
+            job_state["last_error"] = str(error)
+            job_state["failure_count"] = int(job_state.get("failure_count", 0)) + 1
+
+        self.state["last_health_log"] = now.isoformat(timespec="seconds")
+        self.save_state()
+
+    @staticmethod
+    def _scheduled_datetime_for_today(run_time):
+        hour, minute = map(int, run_time.split(":", 1))
+        now = datetime.now()
+        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    @staticmethod
+    def _latest_scheduled_datetime(run_time, now=None):
+        now = now or datetime.now()
+        hour, minute = map(int, run_time.split(":", 1))
+        for day_offset in range(0, 8):
+            candidate_date = (now - timedelta(days=day_offset)).date()
+            if candidate_date.weekday() >= 5:
+                continue
+            candidate = datetime.combine(candidate_date, dt_time(hour, minute))
+            if candidate <= now:
+                return candidate
+        return None
+
+    def execute_job(self, job, scheduled_time, recovered=False):
+        """Run a strategy job with retries and persistent success/failure logging."""
+        if isinstance(scheduled_time, str):
+            scheduled_time = self._scheduled_datetime_for_today(scheduled_time)
+
+        job_name = job["name"]
+        if not recovered and not self.should_run_job(job_name, scheduled_time):
+            logger.info("Skipping already completed slot: %s at %s", job_name, scheduled_time)
+            return None
+
+        last_error = None
+        run_type = "recovered missed" if recovered else "scheduled"
+        for attempt in range(1, MAX_JOB_RETRIES + 1):
+            try:
+                logger.info(
+                    "Starting %s job %s for slot %s | attempt %s/%s",
+                    run_type,
+                    job_name,
+                    scheduled_time.strftime("%Y-%m-%d %H:%M"),
+                    attempt,
+                    MAX_JOB_RETRIES,
+                )
+                result = job["runner"]()
+                self.mark_job_run(job_name, scheduled_time, success=True)
+                logger.info("Job %s completed successfully", job_name)
+                return result
+            except Exception as exc:
+                last_error = exc
+                logger.exception(
+                    "Job %s failed for slot %s on attempt %s/%s",
+                    job_name,
+                    scheduled_time.strftime("%Y-%m-%d %H:%M"),
+                    attempt,
+                    MAX_JOB_RETRIES,
+                )
+                if attempt < MAX_JOB_RETRIES:
+                    time.sleep(min(30, 5 * attempt))
+
+        self.mark_job_run(job_name, scheduled_time, success=False, error=last_error)
+        logger.error("Job %s exhausted retries: %s", job_name, last_error)
+        return None
+
+    def recover_missed_jobs(self):
+        """Execute scheduled slots that were missed while the process was down."""
+        now = datetime.now()
+        recovered_count = 0
+        max_age = timedelta(hours=MISSED_RUN_MAX_AGE_HOURS)
+
+        for job in self.strategy_jobs:
+            for run_time in job["times"]:
+                scheduled_time = self._latest_scheduled_datetime(run_time, now=now)
+                if scheduled_time is None:
+                    continue
+                if now - scheduled_time > max_age:
+                    logger.info(
+                        "Skipping stale missed slot: %s at %s",
+                        job["name"],
+                        scheduled_time.strftime("%Y-%m-%d %H:%M"),
+                    )
+                    continue
+                if self.should_run_job(job["name"], scheduled_time):
+                    recovered_count += 1
+                    logger.warning(
+                        "Detected missed job: %s at %s",
+                        job["name"],
+                        scheduled_time.strftime("%Y-%m-%d %H:%M"),
+                    )
+                    self.execute_job(job, scheduled_time, recovered=True)
+
+        logger.info("Missed-run recovery complete | recovered_slots=%s", recovered_count)
 
     @staticmethod
     def _warmup_security_segment(security_name):
@@ -210,7 +377,7 @@ class StrategySchedulerApp:
             return opportunities
         except Exception:
             logger.exception("Discount strategy failed")
-            return None
+            raise
 
     def run_premarket_warmup(self, ignore_time_window=False, max_cycles=None):
         """Collect premarket ATM IV snapshots without running the scanner."""
@@ -277,7 +444,7 @@ class StrategySchedulerApp:
             return True
         except Exception:
             logger.exception("Premarket warmup failed")
-            return None
+            raise
 
     def setup_schedule(self):
         """Register all strategy jobs."""
@@ -286,10 +453,14 @@ class StrategySchedulerApp:
         for job in self.strategy_jobs:
             for day in WEEKDAYS:
                 for run_time in job["times"]:
-                    getattr(schedule.every(), day).at(run_time).do(job["runner"])
+                    getattr(schedule.every(), day).at(run_time).do(
+                        self.execute_job,
+                        job=job,
+                        scheduled_time=run_time,
+                    )
                     logger.info("Scheduled %s on %s at %s", job["name"], day, run_time)
 
-    def run(self, run_now=False, exit_after_run=False):
+    def run(self, run_now=False, exit_after_run=False, recover_missed=True):
         """Start the scheduler loop, with optional immediate execution."""
         self.warm_up_token()
         self.setup_schedule()
@@ -303,10 +474,14 @@ class StrategySchedulerApp:
 
         if run_now:
             logger.info("Immediate run requested")
-            self.run_discount_scan()
+            discount_job = next(job for job in self.strategy_jobs if job["name"] == "discount")
+            self.execute_job(discount_job, datetime.now())
             if exit_after_run:
                 logger.info("Exiting after immediate run")
                 return
+
+        if recover_missed:
+            self.recover_missed_jobs()
 
         while True:
             schedule.run_pending()
@@ -336,6 +511,11 @@ def main():
         default=None,
         help="Stop warmup after the given number of full symbol cycles",
     )
+    parser.add_argument(
+        "--recover-missed",
+        action="store_true",
+        help="Force missed scheduled jobs to run on startup",
+    )
     args = parser.parse_args()
 
     init_iv_db()
@@ -347,7 +527,11 @@ def main():
         app.run_premarket_warmup(ignore_time_window=True, max_cycles=args.warmup_cycles)
         return
 
-    app.run(run_now=args.run_now or args.once, exit_after_run=args.once)
+    app.run(
+        run_now=args.run_now or args.once,
+        exit_after_run=args.once,
+        recover_missed=args.recover_missed or not args.once,
+    )
 
 
 if __name__ == "__main__":

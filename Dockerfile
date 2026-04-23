@@ -20,4 +20,4 @@ RUN mkdir -p /app/data/tokens /app/data/signals /app/logs && \
 
 COPY . /app
 
-# CMD ["python", "main.py"]
+ENTRYPOINT ["python", "main.py"]

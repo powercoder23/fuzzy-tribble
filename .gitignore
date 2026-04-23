@@ -36,6 +36,7 @@ Thumbs.db
 logs/
 data/tokens/
 data/signals/
+data/scheduler_state.json
 data/*.db
 data/*.sqlite
 data/*.csv
