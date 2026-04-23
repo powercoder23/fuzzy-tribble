@@ -218,6 +218,19 @@ def native_number(value):
     return float(value)
 
 
+def classify_iv_regime(iv_rank, iv_percentile):
+    """Classify historical IV state from IV Rank and IV Percentile."""
+    if iv_rank is None or iv_percentile is None:
+        return "MID"
+    if iv_rank < 30 and iv_percentile < 30:
+        return "LOW"
+    if iv_rank > 60 or iv_percentile > 70:
+        return "HIGH"
+    if 30 <= iv_rank <= 60:
+        return "MID"
+    return "MID"
+
+
 NEAR_WALL_STRIKE_DISTANCE = 50.0
 
 class DiscountedPremiumScanner:
@@ -1957,6 +1970,15 @@ class DiscountedPremiumScanner:
 
         liquidity_score = clip_score((math.log1p(max(oi, 0)) * 12) + (math.log1p(max(volume, 0)) * 8))
         skew_score = clip_score(50 + skew_discount * 8) if skew_discount is not None else 50.0
+        iv_regime = classify_iv_regime(iv_rank, iv_percentile)
+        if iv_regime == "LOW":
+            iv_regime_bonus = 10.0
+        elif iv_regime == "HIGH":
+            iv_regime_bonus = -15.0
+        else:
+            iv_regime_bonus = 0.0
+        iv_rank_penalty = 20.0 if iv_rank is not None and iv_rank > 60 else 0.0
+
         if expected_move_ratio <= 1.0:
             relevance_score = clip_score(92 - (abs(expected_move_ratio - 0.75) / 0.55) * 42)
         elif expected_move_ratio <= 1.5:
@@ -1980,6 +2002,8 @@ class DiscountedPremiumScanner:
                 "liquidity": native_number(round(liquidity_score, 2)),
                 "skew": native_number(round(skew_score, 2)),
                 "strike_relevance": native_number(round(relevance_score, 2)),
+                "iv_regime_bonus": native_number(round(iv_regime_bonus, 2)),
+                "iv_rank_penalty": native_number(round(iv_rank_penalty, 2)),
             }
         else:
             raw_score = (
@@ -1995,12 +2019,19 @@ class DiscountedPremiumScanner:
                 "delta": native_number(round(delta_score, 2)),
                 "liquidity": native_number(round(liquidity_score, 2)),
                 "strike_relevance": native_number(round(relevance_score, 2)),
+                "iv_regime_bonus": native_number(round(iv_regime_bonus, 2)),
+                "iv_rank_penalty": native_number(round(iv_rank_penalty, 2)),
             }
 
-        final_score = clip_score(40 + (raw_score * 0.55), floor=40.0, ceiling=95.0)
+        final_score = clip_score(
+            40 + (raw_score * 0.55) + iv_regime_bonus - iv_rank_penalty,
+            floor=0.0,
+            ceiling=95.0,
+        )
         return {
             "score": round(final_score, 2),
             "component_scores": component_scores,
+            "iv_regime": iv_regime,
         }
     
     def scan_single_strike(self, strike_data, strike_price, spot_price, option_chain,
@@ -2141,6 +2172,7 @@ class DiscountedPremiumScanner:
             vol_mode = "historical" if has_iv_history else "skew"
             iv_rank = self.calculate_iv_rank(current_iv, historical_ivs) if has_iv_history else None
             iv_percentile = self.calculate_iv_percentile(current_iv, historical_ivs) if has_iv_history else None
+            iv_regime = classify_iv_regime(iv_rank, iv_percentile)
             iv_trend = (premarket_ctx or {}).get("iv_trend")
             trade_type = self.classify_trade_type(
                 iv_rank=iv_rank,
@@ -2163,6 +2195,98 @@ class DiscountedPremiumScanner:
                     expected_move_ratio=round(expected_move_ratio, 3),
                 )
                 continue
+
+            option_iv_behavior = iv_behavior
+            if isinstance(iv_behavior, dict) and ("ce" in iv_behavior or "pe" in iv_behavior):
+                option_iv_behavior = iv_behavior.get(option_type)
+
+            if iv_rank is None or iv_percentile is None:
+                self.log_option_rejection(
+                    strike_price,
+                    option_label,
+                    "Rejected due to IV regime",
+                    iv_rank=round(iv_rank, 2) if iv_rank is not None else None,
+                    iv_percentile=round(iv_percentile, 2) if iv_percentile is not None else None,
+                    iv_regime=iv_regime,
+                    trade_type=trade_type,
+                    detail="missing historical IV context",
+                )
+                continue
+
+            if trade_type == "volatility" and iv_rank > 60:
+                self.log_option_rejection(
+                    strike_price,
+                    option_label,
+                    "Rejected due to IV regime",
+                    iv_rank=round(iv_rank, 2),
+                    iv_percentile=round(iv_percentile, 2),
+                    iv_regime=iv_regime,
+                    trade_type=trade_type,
+                    detail="volatility trade rejected above IV Rank 60",
+                )
+                continue
+
+            if trade_type == "directional" and iv_rank > 70 and skew_discount <= 0:
+                self.log_option_rejection(
+                    strike_price,
+                    option_label,
+                    "Rejected due to IV regime",
+                    iv_rank=round(iv_rank, 2),
+                    iv_percentile=round(iv_percentile, 2),
+                    iv_regime=iv_regime,
+                    trade_type=trade_type,
+                    skew_discount=round(skew_discount, 2),
+                    detail="directional trade rejected with rich IV and no skew discount",
+                )
+                continue
+
+            if skew_discount <= 0:
+                self.log_option_rejection(
+                    strike_price,
+                    option_label,
+                    "Rejected due to IV regime",
+                    iv_rank=round(iv_rank, 2),
+                    iv_percentile=round(iv_percentile, 2),
+                    iv_regime=iv_regime,
+                    trade_type=trade_type,
+                    skew_discount=round(skew_discount, 2),
+                    detail="requires positive skew discount",
+                )
+                continue
+
+            if iv_rank >= 50:
+                self.log_option_rejection(
+                    strike_price,
+                    option_label,
+                    "Rejected due to IV regime",
+                    iv_rank=round(iv_rank, 2),
+                    iv_percentile=round(iv_percentile, 2),
+                    iv_regime=iv_regime,
+                    trade_type=trade_type,
+                    skew_discount=round(skew_discount, 2),
+                    detail="positive skew requires IV Rank below 50",
+                )
+                continue
+
+            if option_iv_behavior and option_iv_behavior.get("low_iv_threshold") is not None:
+                low_iv_threshold = option_iv_behavior["low_iv_threshold"]
+                avg_move_after_low_iv = option_iv_behavior.get("avg_move_after_low_iv")
+                if current_iv < low_iv_threshold and (
+                    avg_move_after_low_iv is None or avg_move_after_low_iv < 0.01
+                ):
+                    self.log_option_rejection(
+                        strike_price,
+                        option_label,
+                        "Rejected due to IV regime",
+                        iv_rank=round(iv_rank, 2),
+                        iv_percentile=round(iv_percentile, 2),
+                        iv_regime=iv_regime,
+                        current_iv=round(current_iv, 2),
+                        low_iv_threshold=round(low_iv_threshold, 2),
+                        avg_move_after_low_iv=round(avg_move_after_low_iv, 4) if avg_move_after_low_iv is not None else None,
+                        detail="low IV has not historically produced enough follow-through",
+                    )
+                    continue
 
             quality_stats = getattr(self, "_scan_quality_stats", None)
             if isinstance(quality_stats, dict):
@@ -2253,10 +2377,6 @@ class DiscountedPremiumScanner:
                 if len(peer_iv_array) > 0:
                     chain_percentile = float((peer_iv_array < current_iv).mean() * 100)
 
-            option_iv_behavior = iv_behavior
-            if isinstance(iv_behavior, dict) and ("ce" in iv_behavior or "pe" in iv_behavior):
-                option_iv_behavior = iv_behavior.get(option_type)
-
             if option_iv_behavior and option_iv_behavior.get("low_iv_threshold") is not None:
                 low_iv_threshold = option_iv_behavior["low_iv_threshold"]
                 avg_move_after_low_iv = option_iv_behavior.get("avg_move_after_low_iv")
@@ -2313,6 +2433,7 @@ class DiscountedPremiumScanner:
                 "base": native_number(round(base_discount_score, 2)),
                 "context": native_number(round(context_adjustment, 2)),
                 "adjustment": native_number(round(score_adjustment, 2)),
+                "iv_regime": iv_regime,
                 "near_put_wall": near_put_wall,
                 "near_call_wall": near_call_wall,
                 "buildup": option_buildup.get("type", "NEUTRAL"),
@@ -2355,7 +2476,15 @@ class DiscountedPremiumScanner:
                 exit_price=exit_price,
             )
 
+            if iv_rank < 40 and skew_discount > 0 and expected_move_ratio <= 1.5:
+                conviction = "HIGH"
+            elif iv_rank < 50:
+                conviction = "MEDIUM"
+            else:
+                conviction = "LOW"
+
             reasons = []
+            reasons.append(f"IV regime is {iv_regime}")
             if has_iv_history and iv_rank is not None and iv_rank < 30:
                 reasons.append(f"IV Rank is compressed at {iv_rank:.1f}")
             if has_iv_history and iv_percentile is not None and iv_percentile <= 35:
@@ -2432,6 +2561,8 @@ class DiscountedPremiumScanner:
                 "iv": native_number(current_iv),
                 "iv_rank": native_number(iv_rank),
                 "iv_percentile": native_number(iv_percentile),
+                "iv_regime": iv_regime,
+                "conviction": conviction,
                 "hv": native_number(weighted_hv),
                 "hv10": native_number((hv_metrics or {}).get("hv10")),
                 "hv20": native_number((hv_metrics or {}).get("hv20")),
@@ -2907,6 +3038,11 @@ class DiscountedPremiumScanner:
                 logger.info("IV: %.2f%% | IV Rank: %.2f | IV Percentile: %.2f", row['iv'], row['iv_rank'], row['iv_percentile'])
             else:
                 logger.info("IV: %.2f%% | IV Context: %s", row['iv'], row['iv_context'])
+            logger.info(
+                "IV Regime: %s | Conviction: %s",
+                row.get('iv_regime', 'MID'),
+                row.get('conviction', 'LOW'),
+            )
             logger.info("HV Benchmark: %s | Skew Discount vs ATM: %s", hv_text, skew_text)
             logger.info(
                 "PCR: %s | Bias: %s | Relative Skew: %s",
