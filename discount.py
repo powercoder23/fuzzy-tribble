@@ -231,6 +231,42 @@ def classify_iv_regime(iv_rank, iv_percentile):
     return "MID"
 
 
+def format_expiry_label(expiry_value):
+    """Format expiry values as 'DD MON' for Telegram output."""
+    if expiry_value is None or pd.isna(expiry_value):
+        return "N/A"
+    expiry_dt = pd.to_datetime(expiry_value, errors="coerce")
+    if pd.isna(expiry_dt):
+        return str(expiry_value)
+    return expiry_dt.strftime("%d %b").upper()
+
+
+def reduce_to_one_per_symbol_expiry(df):
+    """
+    Keep only the highest-scoring trade per (symbol, expiry).
+
+    Args:
+        df: DataFrame from scan_all_fno_stocks
+
+    Returns:
+        pd.DataFrame: Best row per symbol and expiry
+    """
+    if df is None:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+
+    reduced_df = df.copy()
+    reduced_df["expiry"] = pd.to_datetime(reduced_df.get("expiry"), errors="coerce")
+    reduced_df = reduced_df.dropna(subset=["symbol", "expiry"])
+    if reduced_df.empty:
+        return reduced_df
+
+    reduced_df = reduced_df.sort_values("score", ascending=False)
+    reduced_df = reduced_df.drop_duplicates(subset=["symbol", "expiry"], keep="first")
+    return reduced_df.reset_index(drop=True)
+
+
 NEAR_WALL_STRIKE_DISTANCE = 50.0
 
 class DiscountedPremiumScanner:
@@ -417,56 +453,27 @@ class DiscountedPremiumScanner:
         self.runtime_state["fno_symbols_day"] = self.runtime_state["cache_day"]
         return dict(ordered)
 
-    def send_telegram_summary(self, opportunities_df):
-        """Send a short end-of-run summary to Telegram."""
+    def send_clean_telegram(self, df):
+        """Send a concise trader-friendly Telegram summary."""
         if not self.telegram_bot_token or not self.telegram_chat_id:
             logger.info("Telegram alert skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing")
             return
 
-        if opportunities_df is None or opportunities_df.empty:
+        if df is None or df.empty:
             message = (
                 "Options Scanner Summary\n"
                 f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
                 "No qualifying opportunities found."
             )
         else:
-            lines = [
-                "Options Scanner Summary",
-                f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                f"Matches: {len(opportunities_df)}",
-                "",
-            ]
-            for _, row in opportunities_df.sort_values("score", ascending=False).head(12).iterrows():
-                hv_text = f"{row['hv']:.1f}" if pd.notna(row.get("hv")) else "N/A"
-                pcr_value = row.get("pcr_value")
-                pcr_text = f"{pcr_value:.2f}" if pd.notna(pcr_value) else "N/A"
-                rr_text = f"{row['risk_reward']:.2f}" if pd.notna(row.get("risk_reward")) else "N/A"
-                volume_spike_text = "Yes" if bool(row.get("volume_spike")) else "No"
-                oi_change_pct = row.get("oi_change_pct")
-                price_change_pct = row.get("price_change_pct")
-                oi_change_text = f"{oi_change_pct:+.2f}%" if pd.notna(oi_change_pct) else "N/A"
-                price_change_text = f"{price_change_pct:+.2f}%" if pd.notna(price_change_pct) else "N/A"
-                nearest_support = row.get("nearest_put_wall") if row.get("type") == "CALL" else row.get("nearest_call_wall")
-                support_label = "PUT wall" if row.get("type") == "CALL" else "CALL wall"
-                support_text = f"{nearest_support:.0f} ({support_label})" if pd.notna(nearest_support) else "N/A"
-                lines.append(f"{row['symbol']} | {row['type']} {row['strike']:.0f}")
-                lines.append(f"Score {row['score']:.1f} | {row['strategy']}")
-                lines.append(
-                    f"IV/HV {row['iv']:.1f}/{hv_text} | PCR {pcr_text} {str(row.get('pcr_trend', 'neutral')).title()}"
-                )
-                lines.append(
-                    f"Buildup {str(row.get('buildup_type', 'neutral')).replace('_', ' ').title()} | "
-                    f"OI {oi_change_text} | Price {price_change_text} | Vol Spike {volume_spike_text}"
-                )
-                lines.append(
-                    f"Support/Resistance {support_text} | Market {str(row.get('market_direction', 'neutral')).title()} "
-                    f"{str(row.get('market_strength', 'neutral')).replace('_', ' ').title()} "
-                    f"{row.get('market_confidence', 50.0):.0f}"
-                )
-                lines.append(
-                    f"Entry {row['entry']:.2f} | SL {row['stop_loss']:.2f} | "
-                    f"Target {row['target']:.2f} | RR {rr_text}"
-                )
+            telegram_df = reduce_to_one_per_symbol_expiry(df)
+            lines = []
+            for _, row in telegram_df.sort_values("score", ascending=False).iterrows():
+                expiry_label = format_expiry_label(row.get("expiry"))
+                option_type = "CE" if str(row.get("type", "")).upper() == "CALL" else "PE"
+                buildup_type = str(row.get("buildup_type", "NEUTRAL")).upper()
+                lines.append(f"{row['symbol']} {expiry_label} {row['strike']:.0f} {option_type} | {buildup_type}")
+                lines.append(f"Entry: {row['entry']:.2f} | SL: {row['stop_loss']:.2f} | Target: {row['target']:.2f}")
                 lines.append("")
             message = "\n".join(lines)
 
@@ -480,9 +487,13 @@ class DiscountedPremiumScanner:
                 timeout=15,
             )
             response.raise_for_status()
-            logger.info("Telegram summary sent")
+            logger.info("Clean Telegram summary sent")
         except Exception:
-            logger.exception("Failed to send Telegram summary")
+            logger.exception("Failed to send clean Telegram summary")
+
+    def send_telegram_summary(self, opportunities_df):
+        """Backward-compatible wrapper for the clean Telegram sender."""
+        self.send_clean_telegram(opportunities_df)
     
     def get_option_chain(self, underlying_security_id, underlying_segment, expiry):
         """
@@ -2551,6 +2562,7 @@ class DiscountedPremiumScanner:
 
             discounted.append({
                 "symbol": None,
+                "expiry": expiry,
                 "strategy": strategy_plan["strategy"],
                 "strike": native_number(strike_price),
                 "short_strike": native_number(strategy_plan["short_strike"]),
@@ -2649,19 +2661,7 @@ class DiscountedPremiumScanner:
             if not expiries:
                 logger.warning("No expiries found for %s (%s)", security_name, security_segment)
                 return []
-            selected_expiry = None
-
-            for i, exp in enumerate(expiries):
-                dte = get_trading_days_to_expiry(exp)
-
-                if dte >= 7:
-                    selected_expiry = exp
-                    break
-
-            if not selected_expiry:
-                selected_expiry = expiries[min(1, len(expiries) - 1)]
-
-            expiry = selected_expiry
+            expiry = expiries[0]
 
         dte = get_trading_days_to_expiry(expiry)
         logger.info(f"Selected expiry: {expiry} (DTE: {dte})")
@@ -2968,24 +2968,31 @@ class DiscountedPremiumScanner:
                     segment = "IDX_I"
                 else:
                     segment = "NSE_FNO"
-                
-                discounted = self.scan_underlying(
-                    security_id=sec_id,
-                    security_segment=segment,
-                    security_name=sec_name,
-                    expiry=expiry,
-                    use_hv=True
-                )
-                
-                # Add stock info and filter
-                for opt in discounted:
-                    if opt['score'] >= min_discount_score:
-                        opt['symbol'] = sec_name
-                        opt['security_id'] = sec_id
-                        all_opportunities.append(opt)
-                
-                # Rate limiting
-                time.sleep(1)
+
+                expiries = [expiry] if expiry else self.get_expiry_list(sec_id, segment)
+                if not expiries:
+                    logger.warning("No expiries found for %s (%s)", sec_name, segment)
+                    continue
+
+                for current_expiry in expiries:
+                    discounted = self.scan_underlying(
+                        security_id=sec_id,
+                        security_segment=segment,
+                        security_name=sec_name,
+                        expiry=current_expiry,
+                        use_hv=True
+                    )
+
+                    # Add stock info and filter
+                    for opt in discounted:
+                        if opt['score'] >= min_discount_score:
+                            opt['symbol'] = sec_name
+                            opt['security_id'] = sec_id
+                            opt['expiry'] = opt.get('expiry') or current_expiry
+                            all_opportunities.append(opt)
+
+                    # Rate limiting
+                    time.sleep(1)
                 
             except Exception:
                 logger.exception("Error scanning %s", sec_name)
@@ -3126,6 +3133,7 @@ if __name__ == "__main__":
     all_opportunities = scanner.scan_all_fno_stocks(
         min_discount_score=40
     )
+    all_opportunities = reduce_to_one_per_symbol_expiry(all_opportunities)
     
     # Generate report
     scanner.generate_report(all_opportunities)
@@ -3135,4 +3143,4 @@ if __name__ == "__main__":
         all_opportunities.to_csv("discounted_premiums.csv", index=False)
         logger.info("Results saved to discounted_premiums.csv")
 
-    scanner.send_telegram_summary(all_opportunities)
+    scanner.send_clean_telegram(all_opportunities)
