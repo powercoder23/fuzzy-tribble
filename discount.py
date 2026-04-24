@@ -2052,7 +2052,7 @@ class DiscountedPremiumScanner:
                           put_mean=None, put_std=None, call_ivs=None, put_ivs=None,
                           call_avg_volume=None, put_avg_volume=None, iv_behavior=None,
                           premarket_ctx=None, pcr_value=None, sentiment_bias="neutral",
-                          market_signal=None):
+                          market_signal=None, expiry=None):
         """
         Analyze a single strike using quantitative volatility, probability, and structure filters.
         
@@ -2111,7 +2111,6 @@ class DiscountedPremiumScanner:
             #     self.log_option_rejection(strike_price, option_label, "Rejected due to zero volume", oi=oi, volume=volume)
             #     continue
             if not hedging_mode and abs_delta < 0.05:
-                self.log_option_rejection(strike_price, option_label, "Rejected due to low delta", delta=round(abs_delta, 3))
                 continue
 
             current_iv = pd.to_numeric(opt.get('implied_volatility', 0), errors="coerce")
@@ -2119,6 +2118,9 @@ class DiscountedPremiumScanner:
                 self.log_option_rejection(strike_price, option_label, "Rejected due to missing IV")
                 continue
             current_iv = float(current_iv)
+            atm_iv = atm_context.get("atm_iv") if atm_context else None
+            if atm_iv and current_iv and abs(current_iv - atm_iv) > 20:
+                logger.debug(f"IV mismatch | strike_iv={current_iv} | atm_iv={atm_iv}")
 
             if option_type == "ce":
                 reference_iv = call_mean
@@ -2762,6 +2764,7 @@ class DiscountedPremiumScanner:
         )
         dte = self.days_to_expiry(expiry)
         expected_move = self.compute_expected_move(spot_price, atm_context.get("atm_iv"), dte)
+        atm_context["expected_move"] = expected_move
         iv_behavior = None
         historical_option_df = self.fetch_expired_option_data(
             security_id=security_id,
@@ -2841,13 +2844,28 @@ class DiscountedPremiumScanner:
 
         if historical_ivs:
             logger.info("Historical IV samples: %s", len(historical_ivs))
+
+        atm_strike = atm_context.get("atm_strike")
+        expected_move = atm_context.get("expected_move")
+        if atm_strike and expected_move:
+            strike_range = expected_move * 2
+        else:
+            strike_range = spot_price * 0.1
+
+        filtered_option_chain = {
+            strike: data
+            for strike, data in option_chain.items()
+            if atm_strike is not None and abs(float(strike) - atm_strike) <= strike_range
+        }
+        if not filtered_option_chain:
+            filtered_option_chain = dict(option_chain)
         
         # Scan each strike
         self._scan_quality_stats = {"pre_quality": 0, "post_quality": 0}
         self._score_debug_candidates = []
         all_discounted = []
         
-        for strike_str, strike_data in option_chain.items():
+        for strike_str, strike_data in filtered_option_chain.items():
             strike_price = float(strike_str)
             
             discounted = self.scan_single_strike(
@@ -2875,6 +2893,7 @@ class DiscountedPremiumScanner:
                 pcr_value=pcr_value,
                 sentiment_bias=sentiment_bias,
                 market_signal=market_signal,
+                expiry=expiry,
             )
             
             all_discounted.extend(discounted)
@@ -2938,6 +2957,7 @@ class DiscountedPremiumScanner:
                     candidate.get("volume"),
                 )
         self._score_debug_candidates = []
+        logger.info("Expiry %s -> trades found: %s", expiry, len(all_discounted))
         logger.info("Completed scan for %s with %s discounted opportunities", security_name, len(all_discounted))
         
         return all_discounted
