@@ -267,6 +267,10 @@ def reduce_to_one_per_symbol_expiry(df):
     return reduced_df.reset_index(drop=True)
 
 
+def split_message(msg, chunk_size=4000):
+    return [msg[i:i + chunk_size] for i in range(0, len(msg), chunk_size)]
+
+
 NEAR_WALL_STRIKE_DISTANCE = 50.0
 
 class DiscountedPremiumScanner:
@@ -460,33 +464,55 @@ class DiscountedPremiumScanner:
             return
 
         if df is None or df.empty:
-            message = (
-                "Options Scanner Summary\n"
-                f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-                "No qualifying opportunities found."
-            )
+            message = "📊 Options Scanner Summary\n\nNo qualifying opportunities found."
+            messages = split_message(message[:4000])
+            logger.info("Telegram summary trades total=%s filtered=%s message_length=%s", 0, 0, len(message))
         else:
-            telegram_df = reduce_to_one_per_symbol_expiry(df)
-            lines = []
-            for _, row in telegram_df.sort_values("score", ascending=False).iterrows():
-                expiry_label = format_expiry_label(row.get("expiry"))
-                option_type = "CE" if str(row.get("type", "")).upper() == "CALL" else "PE"
-                buildup_type = str(row.get("buildup_type", "NEUTRAL")).upper()
-                lines.append(f"{row['symbol']} {expiry_label} {row['strike']:.0f} {option_type} | {buildup_type}")
-                lines.append(f"Entry: {row['entry']:.2f} | SL: {row['stop_loss']:.2f} | Target: {row['target']:.2f}")
+            total_trades = len(df)
+            telegram_df = (
+                df.sort_values("score", ascending=False)
+                .groupby("strategy", group_keys=False)
+                .head(5)
+                .reset_index(drop=True)
+            )
+            lines = ["📊 Options Scanner Summary", ""]
+            for strategy, strategy_df in telegram_df.groupby("strategy", sort=False):
+                lines.append(str(strategy))
                 lines.append("")
-            message = "\n".join(lines)
+                for _, row in strategy_df.iterrows():
+                    expiry_label = pd.to_datetime(row["expiry"]).strftime("%d %b").upper()
+                    buildup_type = str(row.get("buildup_type", "NA"))
+                    lines.append(
+                        f"{row['symbol']} {expiry_label} {int(row['strike'])} {row['type']} | {buildup_type}"
+                    )
+                    lines.append(
+                        f"Entry: {row['entry']:.2f} | SL: {row['stop_loss']:.2f} | Target: {row['target']:.2f}"
+                    )
+                    lines.append("")
+
+            message = "\n".join(lines).strip()
+            if len(message) > 4000:
+                message = message[:4000]
+            logger.info(
+                "Telegram summary trades total=%s filtered=%s message_length=%s",
+                total_trades,
+                len(telegram_df),
+                len(message),
+            )
+            messages = split_message(message)
 
         try:
-            response = requests.post(
-                f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage",
-                json={
-                    "chat_id": self.telegram_chat_id,
-                    "text": message,
-                },
-                timeout=15,
-            )
-            response.raise_for_status()
+            for chunk in messages:
+                response = requests.post(
+                    f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage",
+                    json={
+                        "chat_id": self.telegram_chat_id,
+                        "text": chunk,
+                        "parse_mode": None,
+                    },
+                    timeout=15,
+                )
+                response.raise_for_status()
             logger.info("Clean Telegram summary sent")
         except Exception:
             logger.exception("Failed to send clean Telegram summary")
