@@ -465,34 +465,36 @@ class DiscountedPremiumScanner:
 
         if df is None or df.empty:
             message = "📊 Options Scanner Summary\n\nNo qualifying opportunities found."
+            message = message.replace("None", "N/A")
             messages = split_message(message[:4000])
             logger.info("Telegram summary trades total=%s filtered=%s message_length=%s", 0, 0, len(message))
         else:
             total_trades = len(df)
-            telegram_df = (
-                df.sort_values("score", ascending=False)
-                .groupby("strategy", group_keys=False)
-                .head(5)
-                .reset_index(drop=True)
-            )
-            lines = ["📊 Options Scanner Summary", ""]
-            for strategy, strategy_df in telegram_df.groupby("strategy", sort=False):
-                lines.append(str(strategy))
+            telegram_df = df.sort_values("score", ascending=False).head(10).reset_index(drop=True)
+            lines = []
+            for _, row in telegram_df.iterrows():
+                expiry_label = pd.to_datetime(row["expiry"], errors="coerce").strftime("%d %b").upper() if pd.notna(row.get("expiry")) else ""
+
+                buildup = str(row.get("buildup_type", "NA"))
+
+                line1 = f"{row['symbol']} {expiry_label} {int(row['strike'])}{row['type'][0]} | {buildup}"
+
+                rr = row.get("risk_reward")
+                rr_text = f"{rr:.1f}" if rr is not None else "N/A"
+
+                line2 = (
+                    f"E:{row['entry']:.1f} SL:{row['stop_loss']:.1f} "
+                    f"T:{row['target']:.1f} RR:{rr_text}"
+                )
+
+                lines.append(line1)
+                lines.append(line2)
                 lines.append("")
-                for _, row in strategy_df.iterrows():
-                    expiry_label = pd.to_datetime(row["expiry"]).strftime("%d %b").upper()
-                    buildup_type = str(row.get("buildup_type", "NA"))
-                    lines.append(
-                        f"{row['symbol']} {expiry_label} {int(row['strike'])} {row['type']} | {buildup_type}"
-                    )
-                    lines.append(
-                        f"Entry: {row['entry']:.2f} | SL: {row['stop_loss']:.2f} | Target: {row['target']:.2f}"
-                    )
-                    lines.append("")
 
             message = "\n".join(lines).strip()
-            if len(message) > 4000:
-                message = message[:4000]
+            if len(message) > 3800:
+                message = message[:3800] + "\n...truncated"
+            message = message.replace("None", "N/A")
             logger.info(
                 "Telegram summary trades total=%s filtered=%s message_length=%s",
                 total_trades,
