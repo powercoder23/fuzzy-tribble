@@ -510,10 +510,11 @@ class DiscountedPremiumScanner:
                     json={
                         "chat_id": self.telegram_chat_id,
                         "text": chunk,
-                        "parse_mode": None,
                     },
                     timeout=15,
                 )
+                if not response.ok:
+                    logger.error("Telegram sendMessage rejected: %s", response.text)
                 response.raise_for_status()
             logger.info("Clean Telegram summary sent")
         except Exception:
