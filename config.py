@@ -26,7 +26,7 @@ class Config:
     SCREENER_URL = "https://www.screener.in/screens/3528566/fvg-screener/"
     
     # Paths
-    BASE_DIR = Path('/app')
+    BASE_DIR = Path(os.getenv('APP_BASE_DIR', os.getcwd()))
     DATA_DIR = BASE_DIR / 'data'
     TOKEN_DIR = BASE_DIR / 'data' / 'tokens'
     SIGNALS_DIR = BASE_DIR / 'data' / 'signals'

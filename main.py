@@ -59,12 +59,8 @@ class StrategySchedulerApp:
                 "runner": self.run_premarket_warmup,
                 "times": ["09:15"],
             },
-            {
-                "name": "discount",
-                "runner": self.run_discount_scan,
-                "times": DEFAULT_SCAN_TIMES,
-            }
         ]
+        logger.info("Legacy scanner disabled - using trigger-based system")
 
     @staticmethod
     def _warmup_security_segment(security_name):
@@ -212,6 +208,75 @@ class StrategySchedulerApp:
             logger.exception("Discount strategy failed")
             return None
 
+    def run_auto_watchlist_eod(self):
+        """Build the automated NSE F&O watchlist for the next active session."""
+        logger.info("%s", "=" * 70)
+        logger.info("Running strategy: auto_watchlist_eod")
+        logger.info("%s", "=" * 70)
+        try:
+            token = self.token_manager.refresh_if_needed()
+            scanner = DiscountedPremiumScanner(
+                hardtoken=token,
+                client_id=Config.DHAN_CLIENT_ID,
+            )
+            return scanner.build_watchlist_eod()
+        except Exception:
+            logger.exception("Automated watchlist build failed")
+            return []
+
+    def run_auto_warmup_cycle(self):
+        """Run one automated warmup cycle over the persisted watchlist."""
+        logger.info("%s", "=" * 70)
+        logger.info("Running strategy: auto_warmup_cycle")
+        logger.info("%s", "=" * 70)
+        try:
+            token = self.token_manager.refresh_if_needed()
+            scanner = DiscountedPremiumScanner(
+                hardtoken=token,
+                client_id=Config.DHAN_CLIENT_ID,
+                store_intraday=True,
+            )
+            return scanner.run_warmup_cycle()
+        except Exception:
+            logger.exception("Automated warmup cycle failed")
+            return []
+
+    def run_auto_active_scanner(self):
+        """Run one automated active scanner cycle."""
+        logger.info("%s", "=" * 70)
+        logger.info("Running strategy: auto_active_scanner")
+        logger.info("%s", "=" * 70)
+        try:
+            token = self.token_manager.refresh_if_needed()
+            scanner = DiscountedPremiumScanner(
+                hardtoken=token,
+                client_id=Config.DHAN_CLIENT_ID,
+                store_intraday=True,
+            )
+            return scanner.run_active_scanner()
+        except Exception:
+            logger.exception("Automated active scanner failed")
+            return []
+
+    def run_auto_loop(self, exit_after_one_cycle=False):
+        """Clock-aware automated loop: watchlist before 09:15, warmup until 09:50, active scan until 15:20."""
+        self.warm_up_token()
+        logger.info("Automated strategy loop started")
+        while True:
+            now = datetime.now().time()
+            if now < dt_time(9, 15):
+                self.run_auto_watchlist_eod()
+            elif dt_time(9, 15) <= now < dt_time(9, 50):
+                self.run_auto_warmup_cycle()
+            elif dt_time(9, 50) <= now <= dt_time(15, 20):
+                self.run_auto_active_scanner()
+            else:
+                logger.info("Automated loop idle outside trading window")
+
+            if exit_after_one_cycle:
+                return
+            time.sleep(300)
+
     def run_premarket_warmup(self, ignore_time_window=False, max_cycles=None):
         """Collect premarket ATM IV snapshots without running the scanner."""
         logger.info("%s", "=" * 70)
@@ -303,7 +368,7 @@ class StrategySchedulerApp:
 
         if run_now:
             logger.info("Immediate run requested")
-            self.run_discount_scan()
+            logger.info("Legacy scanner disabled - using trigger-based system")
             if exit_after_run:
                 logger.info("Exiting after immediate run")
                 return
@@ -336,12 +401,56 @@ def main():
         default=None,
         help="Stop warmup after the given number of full symbol cycles",
     )
+    parser.add_argument(
+        "--auto-loop",
+        action="store_true",
+        help="Run the automated IV-compression options system loop",
+    )
+    parser.add_argument(
+        "--auto-once",
+        action="store_true",
+        help="Run one clock-aware automated system cycle and exit",
+    )
+    parser.add_argument(
+        "--build-watchlist",
+        action="store_true",
+        help="Build the automated F&O watchlist immediately and exit",
+    )
+    parser.add_argument(
+        "--active-scan",
+        action="store_true",
+        help="Run one automated active scanner cycle immediately and exit",
+    )
+    parser.add_argument(
+        "--backtest-auto",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help="Backtest the automated strategy over the given number of days",
+    )
     args = parser.parse_args()
 
     init_iv_db()
     migrate_csv_to_sqlite()
 
     app = StrategySchedulerApp()
+    if args.build_watchlist:
+        app.run_auto_watchlist_eod()
+        return
+    if args.active_scan:
+        app.run_auto_active_scanner()
+        return
+    if args.backtest_auto is not None:
+        token = app.token_manager.refresh_if_needed()
+        scanner = DiscountedPremiumScanner(
+            hardtoken=token,
+            client_id=Config.DHAN_CLIENT_ID,
+        )
+        scanner.backtest_strategy(days=args.backtest_auto)
+        return
+    if args.auto_loop or args.auto_once:
+        app.run_auto_loop(exit_after_one_cycle=args.auto_once)
+        return
     if args.warmup:
         logger.info("Running warmup in dev mode")
         app.run_premarket_warmup(ignore_time_window=True, max_cycles=args.warmup_cycles)

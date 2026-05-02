@@ -60,6 +60,36 @@ IV_HISTORY_OPTIONAL_COLUMNS = {
     "max_oi_strike_call": "REAL",
     "max_oi_strike_put": "REAL",
 }
+WATCHLIST_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS watchlist (
+    symbol TEXT NOT NULL,
+    security_id TEXT NOT NULL,
+    score REAL NOT NULL,
+    created_at DATETIME NOT NULL,
+    PRIMARY KEY(symbol, created_at)
+)
+"""
+TRADES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT,
+    security_id TEXT,
+    expiry TEXT,
+    strike REAL,
+    option_type TEXT,
+    direction TEXT,
+    score REAL,
+    entry REAL,
+    stop_loss REAL,
+    target REAL,
+    lots INTEGER,
+    quantity INTEGER,
+    risk_amount REAL,
+    pnl REAL DEFAULT 0,
+    status TEXT DEFAULT 'OPEN',
+    created_at DATETIME NOT NULL
+)
+"""
 
 
 def ensure_iv_history_schema(cursor):
@@ -94,6 +124,7 @@ def init_iv_db():
     )
     """)
     ensure_iv_history_schema(cursor)
+    ensure_strategy_schema(cursor)
 
     cursor.execute("""
     CREATE INDEX IF NOT EXISTS idx_iv_security_time
@@ -102,6 +133,19 @@ def init_iv_db():
 
     conn.commit()
     conn.close()
+
+
+def ensure_strategy_schema(cursor):
+    cursor.execute(WATCHLIST_TABLE_SQL)
+    cursor.execute(TRADES_TABLE_SQL)
+    cursor.execute("""
+    CREATE INDEX IF NOT EXISTS idx_watchlist_created_at
+    ON watchlist(created_at)
+    """)
+    cursor.execute("""
+    CREATE INDEX IF NOT EXISTS idx_trades_symbol_created_at
+    ON trades(symbol, created_at)
+    """)
 
 
 def migrate_csv_to_sqlite():
@@ -317,6 +361,9 @@ class DiscountedPremiumScanner:
                 "fno_symbols_day": None,
                 "expiries": {},
                 "option_chain": {},
+                "option_chain_ts": {},
+                "last_symbol_trade_ts": {},
+                "last_trigger_trade_ts": {},
                 "metrics": {
                     "total_calls": 0,
                     "cache_hits": 0,
@@ -334,6 +381,9 @@ class DiscountedPremiumScanner:
             state["fno_symbols_day"] = None
             state["expiries"] = {}
             state["option_chain"] = {}
+            state["option_chain_ts"] = {}
+            state["last_symbol_trade_ts"] = {}
+            state["last_trigger_trade_ts"] = {}
             state["metrics"] = {
                 "total_calls": 0,
                 "cache_hits": 0,
@@ -550,13 +600,15 @@ class DiscountedPremiumScanner:
             return isinstance(response, dict) and "data" in response
 
         try:
-            return self.get_cached_or_fetch(
+            response = self.get_cached_or_fetch(
                 self.runtime_state["option_chain"],
                 cache_key,
                 fetcher,
                 cache_label,
                 validator=validator,
             )
+            self.runtime_state.setdefault("option_chain_ts", {}).setdefault(cache_key, time.monotonic())
+            return response
         except Exception:
             logger.exception(
                 "Failed to fetch option chain for %s (%s), expiry %s",
@@ -564,6 +616,45 @@ class DiscountedPremiumScanner:
                 underlying_segment,
                 expiry,
             )
+            return {"status": "failure", "data": {}}
+
+    def get_option_chain_active(self, underlying_security_id, underlying_segment, expiry, retry=2, cache_ttl_seconds=300):
+        """
+        Fetch a fresh option chain for the active scanner, falling back to a recent cached chain.
+        Dhan's SDK does not expose per-call timeout consistently, so retry and cache age are enforced here.
+        """
+        cache_key = (str(underlying_security_id), underlying_segment, expiry)
+        cache = self.runtime_state.setdefault("option_chain", {})
+        cache_ts = self.runtime_state.setdefault("option_chain_ts", {})
+        previous_cached = cache.get(cache_key)
+        previous_ts = cache_ts.get(cache_key)
+
+        cache.pop(cache_key, None)
+        try:
+            response = self.fetch_with_retry(
+                f"{underlying_security_id} active option chain {expiry}",
+                lambda: self.dhan.option_chain(
+                    under_security_id=underlying_security_id,
+                    under_exchange_segment=underlying_segment,
+                    expiry=expiry,
+                ),
+                validator=lambda item: isinstance(item, dict) and "data" in item,
+                max_attempts=max(1, int(retry)),
+            )
+            cache[cache_key] = response
+            cache_ts[cache_key] = time.monotonic()
+            return response
+        except Exception as exc:
+            if previous_cached is not None and previous_ts is not None and (time.monotonic() - previous_ts) <= cache_ttl_seconds:
+                self.runtime_state["metrics"]["cache_hits"] += 1
+                logger.warning(
+                    "Using cached option chain for %s after active fetch failure: %s",
+                    underlying_security_id,
+                    exc,
+                )
+                cache[cache_key] = previous_cached
+                return previous_cached
+            logger.warning("No usable cached chain for %s after active fetch failure: %s", underlying_security_id, exc)
             return {"status": "failure", "data": {}}
     
     def get_expiry_list(self, underlying_security_id, underlying_segment):
@@ -1473,15 +1564,15 @@ class DiscountedPremiumScanner:
         }
 
     def persist_iv_snapshot(self, security_id, exchange_segment, security_name, expiry, spot_price, atm_context,
-                            chain_metrics=None, store_intraday=None):
+                            chain_metrics=None, store_intraday=None, data_type=None, snapshot_dt=None):
         """Persist one ATM IV snapshot per day to build IV rank / percentile history."""
         atm_iv = atm_context.get("atm_iv")
         if atm_iv is None or atm_iv <= 0 or atm_iv < 1 or atm_iv > 200:
             return
 
         store_intraday = self.store_intraday if store_intraday is None else store_intraday
-        snapshot_dt = datetime.now()
-        data_type = "intraday" if store_intraday else "daily"
+        snapshot_dt = snapshot_dt or datetime.now()
+        data_type = data_type or ("intraday" if store_intraday else "daily")
         chain_metrics = chain_metrics or {}
 
         snapshot = pd.DataFrame([{
@@ -1825,6 +1916,855 @@ class DiscountedPremiumScanner:
             }
         except Exception:
             return None
+
+    def _strategy_segment(self, security_name):
+        return "IDX_I" if str(security_name).upper() in {"NIFTY", "BANKNIFTY"} else "NSE_FNO"
+
+    def _floor_to_five_minutes(self, value=None):
+        value = value or datetime.now()
+        return value.replace(minute=(value.minute // 5) * 5, second=0, microsecond=0)
+
+    def _latest_expiry(self, security_id, security_segment):
+        expiries = self.get_expiry_list(security_id, security_segment)
+        valid_expiries = [
+            exp for exp in expiries
+            if self.days_to_expiry(exp) >= 3
+        ]
+        return valid_expiries[0] if valid_expiries else None
+
+    def _read_latest_watchlist(self, limit=20):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            ensure_strategy_schema(conn.cursor())
+            query = """
+            SELECT symbol, security_id, score, created_at
+            FROM watchlist
+            WHERE created_at = (SELECT MAX(created_at) FROM watchlist)
+            ORDER BY score DESC
+            LIMIT ?
+            """
+            df = pd.read_sql(query, conn, params=(int(limit),))
+            return df.to_dict("records") if not df.empty else []
+        except Exception:
+            logger.exception("Failed to load automated watchlist")
+            return []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _persist_watchlist(self, rows):
+        created_at = datetime.now().replace(second=0, microsecond=0).isoformat(sep=" ")
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            ensure_strategy_schema(cursor)
+            for row in rows:
+                cursor.execute("""
+                INSERT OR REPLACE INTO watchlist (symbol, security_id, score, created_at)
+                VALUES (?, ?, ?, ?)
+                """, (
+                    row["symbol"],
+                    str(row["security_id"]),
+                    float(row["score"]),
+                    created_at,
+                ))
+            conn.commit()
+        except Exception:
+            logger.exception("Failed to persist automated watchlist")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _extract_avg_option_volume(self, option_chain):
+        volumes = []
+        for strike_data in (option_chain or {}).values():
+            if not isinstance(strike_data, dict):
+                continue
+            for option_type in ("ce", "pe"):
+                volume = pd.to_numeric((strike_data.get(option_type) or {}).get("volume"), errors="coerce")
+                if pd.notna(volume) and volume > 0:
+                    volumes.append(float(volume))
+        return float(np.mean(volumes)) if volumes else 0.0
+
+    def _five_day_price_range_pct(self, price_df):
+        if price_df is None or price_df.empty:
+            return 0.0
+        window = price_df.tail(5).copy()
+        high_col = next((col for col in ("high", "High", "HIGH") if col in window.columns), None)
+        low_col = next((col for col in ("low", "Low", "LOW") if col in window.columns), None)
+        close_col = next((col for col in ("close", "Close", "CLOSE") if col in window.columns), None)
+        if not high_col or not low_col:
+            return 0.0
+        high = pd.to_numeric(window[high_col], errors="coerce").max()
+        low = pd.to_numeric(window[low_col], errors="coerce").min()
+        reference = pd.to_numeric(window[close_col], errors="coerce").dropna().iloc[-1] if close_col and not pd.to_numeric(window[close_col], errors="coerce").dropna().empty else low
+        if pd.isna(high) or pd.isna(low) or not reference:
+            return 0.0
+        return float((high - low) / reference * 100.0)
+
+    def build_watchlist_eod(self):
+        """Build and persist the next-session low-IV automated F&O watchlist."""
+        rows = []
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=10)
+        for security_id, symbol in self.fno_stocks.items():
+            try:
+                segment = self._strategy_segment(symbol)
+                expiry = self._latest_expiry(security_id, segment)
+                if not expiry:
+                    logger.info("Watchlist rejected %s: no expiry", symbol)
+                    continue
+
+                chain_response = self.get_option_chain(security_id, segment, expiry)
+                chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
+                option_chain = chain_data.get("oc") if isinstance(chain_data, dict) else {}
+                avg_volume = self._extract_avg_option_volume(option_chain)
+
+                historical_ivs = self.fetch_historical_iv(security_id, segment, lookback_days=20)
+                current_iv = historical_ivs[-1] if historical_ivs else None
+                iv_percentile = self.calculate_iv_percentile(current_iv, historical_ivs) if current_iv else None
+
+                price_df = self.fetch_historical_prices(
+                    security_id,
+                    segment,
+                    start_date.strftime("%Y-%m-%d"),
+                    end_date.strftime("%Y-%m-%d"),
+                )
+                range_pct = self._five_day_price_range_pct(price_df)
+
+                if avg_volume <= 500 or iv_percentile is None or iv_percentile >= 40 or range_pct <= 2.0:
+                    logger.info(
+                        "Watchlist rejected %s | avg_volume=%.1f | iv_pct=%s | range_pct=%.2f",
+                        symbol,
+                        avg_volume,
+                        f"{iv_percentile:.2f}" if iv_percentile is not None else "N/A",
+                        range_pct,
+                    )
+                    continue
+
+                score = (1.0 / max(float(iv_percentile), 1.0)) * avg_volume
+                rows.append({
+                    "symbol": symbol,
+                    "security_id": str(security_id),
+                    "score": round(score, 4),
+                    "iv_percentile": native_number(iv_percentile),
+                    "avg_volume": native_number(avg_volume),
+                    "range_pct": native_number(range_pct),
+                })
+            except Exception:
+                logger.exception("Watchlist evaluation failed for %s", symbol)
+
+        rows = sorted(rows, key=lambda item: item["score"], reverse=True)[:20]
+        self._persist_watchlist(rows)
+        logger.info("Automated watchlist built with %s symbols", len(rows))
+        return rows
+
+    def run_warmup_cycle(self):
+        """Collect one 5-minute ATM intraday IV snapshot for each current watchlist symbol."""
+        watchlist = self._read_latest_watchlist(limit=20)
+        if not watchlist:
+            logger.info("Warmup skipped: watchlist is empty")
+            return []
+
+        snapshot_dt = self._floor_to_five_minutes()
+        persisted = []
+        for row in watchlist:
+            symbol = row["symbol"]
+            security_id = row["security_id"]
+            segment = self._strategy_segment(symbol)
+            try:
+                expiry = self._latest_expiry(security_id, segment)
+                if not expiry:
+                    continue
+                chain_response = self.get_option_chain_active(security_id, segment, expiry, retry=2)
+                if chain_response.get("status") != "success":
+                    continue
+                chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
+                spot_price = chain_data.get("last_price")
+                option_chain = chain_data.get("oc")
+                if spot_price is None or not isinstance(option_chain, dict):
+                    continue
+                atm_context = self.extract_atm_reference_ivs(option_chain, spot_price)
+                chain_metrics = self.extract_chain_metrics(option_chain)
+                self.persist_iv_snapshot(
+                    security_id=security_id,
+                    exchange_segment=segment,
+                    security_name=symbol,
+                    expiry=expiry,
+                    spot_price=spot_price,
+                    atm_context=atm_context,
+                    chain_metrics=chain_metrics,
+                    store_intraday=True,
+                    data_type="intraday",
+                    snapshot_dt=snapshot_dt,
+                )
+                persisted.append(symbol)
+                logger.info("Warmup IV snapshot persisted for %s at %s", symbol, snapshot_dt)
+            except Exception:
+                logger.exception("Warmup cycle failed for %s", symbol)
+        return persisted
+
+    def fetch_intraday_prices(self, security_id, exchange_segment, minutes=120):
+        """Fetch recent 5-minute underlying candles, falling back to IV spot snapshots."""
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(minutes=minutes)
+        history_exchange_segment = "IDX_I" if exchange_segment == "IDX_I" else "NSE_EQ"
+        instrument_type = "INDEX" if history_exchange_segment == "IDX_I" else "EQUITY"
+        try:
+            fetcher = getattr(self.dhan, "intraday_minute_data", None)
+            if fetcher is not None:
+                response = self.rate_limited_call(
+                    f"{security_id} intraday prices",
+                    fetcher,
+                    security_id=security_id,
+                    exchange_segment=history_exchange_segment,
+                    instrument_type=instrument_type,
+                    from_date=start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    to_date=end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    interval=5,
+                )
+                payload = unwrap_dhan_payload(response.get("data") or {}) if isinstance(response, dict) else {}
+                candles = payload if isinstance(payload, list) else response.get("data") if isinstance(response, dict) else []
+                df = pd.DataFrame(candles)
+                if not df.empty:
+                    return df
+        except Exception:
+            logger.warning("Intraday price fetch failed for %s; falling back to IV spot snapshots", security_id)
+
+        snapshots = self.get_intraday_snapshots(security_id, limit=30)
+        if snapshots.empty:
+            return pd.DataFrame()
+        fallback = snapshots.rename(columns={"timestamp": "date", "spot_price": "close"}).copy()
+        fallback["high"] = fallback["close"]
+        fallback["low"] = fallback["close"]
+        fallback["volume"] = fallback.get("total_call_volume", 0).fillna(0) + fallback.get("total_put_volume", 0).fillna(0)
+        return fallback[["date", "high", "low", "close", "volume"]]
+
+    def _normalise_intraday_frame(self, intraday_data):
+        if intraday_data is None or intraday_data.empty:
+            return pd.DataFrame()
+        df = intraday_data.copy()
+        rename_map = {}
+        for target, candidates in {
+            "timestamp": ("timestamp", "start_Time", "start_time", "date", "Date"),
+            "high": ("high", "High", "HIGH"),
+            "low": ("low", "Low", "LOW"),
+            "close": ("close", "Close", "CLOSE"),
+            "volume": ("volume", "Volume", "VOLUME"),
+        }.items():
+            for candidate in candidates:
+                if candidate in df.columns:
+                    rename_map[candidate] = target
+                    break
+        df = df.rename(columns=rename_map)
+        if "timestamp" in df.columns:
+            if pd.api.types.is_numeric_dtype(df["timestamp"]):
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", errors="coerce")
+            else:
+                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        for column in ("high", "low", "close", "volume"):
+            if column in df.columns:
+                df[column] = pd.to_numeric(df[column], errors="coerce")
+        required = [column for column in ("high", "low", "close") if column in df.columns]
+        if len(required) < 3:
+            return pd.DataFrame()
+        return df.dropna(subset=required).sort_values("timestamp" if "timestamp" in df.columns else required[0]).reset_index(drop=True)
+
+    def _same_direction_pcr(self, security_id, direction):
+        pcr = self.get_pcr_trend(security_id)
+        snapshots = self.get_intraday_snapshots(security_id, limit=4)
+        if len(snapshots) < 3:
+            return False
+        series = []
+        for _, row in snapshots.tail(3).iterrows():
+            call_oi = pd.to_numeric(row.get("total_call_oi"), errors="coerce")
+            put_oi = pd.to_numeric(row.get("total_put_oi"), errors="coerce")
+            if pd.notna(call_oi) and call_oi > 0 and pd.notna(put_oi):
+                series.append(float(put_oi / call_oi))
+        if len(series) < 3:
+            return False
+        if direction == "bullish":
+            return pcr.get("trend") == "bullish" and series[0] <= series[1] <= series[2]
+        if direction == "bearish":
+            return pcr.get("trend") == "bearish" and series[0] >= series[1] >= series[2]
+        return False
+
+    def compute_triggers(self, symbol, option_chain, intraday_data):
+        """Compute directional trigger flags and a normalized strength score."""
+        security_id = next((sec_id for sec_id, name in self.fno_stocks.items() if str(name) == str(symbol)), None)
+        df = self._normalise_intraday_frame(intraday_data)
+        flags = {
+            "price_breakout": False,
+            "volume_spike": False,
+            "oi_shift": False,
+            "oi_wall_proximity": False,
+            "pcr_trend": False,
+            "retest_hold": False,
+            "valid_breakout": False,
+        }
+        strengths = {}
+        direction = "neutral"
+        spot = None
+
+        if not df.empty and len(df) >= 2:
+            latest = df.iloc[-1]
+            lookback = df.iloc[-7:-1] if len(df) >= 7 else df.iloc[:-1]
+            spot = native_number(latest.get("close"))
+            if not lookback.empty and spot is not None:
+                high_30 = pd.to_numeric(lookback["high"], errors="coerce").max()
+                low_30 = pd.to_numeric(lookback["low"], errors="coerce").min()
+                if pd.notna(high_30) and spot > high_30:
+                    flags["price_breakout"] = True
+                    direction = "bullish"
+                    strengths["price_breakout"] = min(1.0, (spot - high_30) / max(high_30, 1.0) * 50.0)
+                    prev_close = native_number(df.iloc[-2].get("close"))
+                    if prev_close is not None and prev_close >= high_30:
+                        flags["retest_hold"] = True
+                elif pd.notna(low_30) and spot < low_30:
+                    flags["price_breakout"] = True
+                    direction = "bearish"
+                    strengths["price_breakout"] = min(1.0, (low_30 - spot) / max(low_30, 1.0) * 50.0)
+                    prev_close = native_number(df.iloc[-2].get("close"))
+                    if prev_close is not None and prev_close <= low_30:
+                        flags["retest_hold"] = True
+
+            if "volume" in df.columns and len(df) >= 20:
+                latest_volume = native_number(latest.get("volume")) or 0.0
+                avg_volume = pd.to_numeric(df.iloc[-20:-1]["volume"], errors="coerce").dropna().mean()
+                if pd.notna(avg_volume) and avg_volume > 0 and latest_volume > 1.5 * avg_volume:
+                    flags["volume_spike"] = True
+                    strengths["volume_spike"] = min(1.0, latest_volume / (1.5 * avg_volume) - 1.0)
+
+            flags["valid_breakout"] = bool(
+                flags["price_breakout"] and flags.get("volume_spike") and flags.get("retest_hold")
+            )
+            if flags["price_breakout"] and not flags["valid_breakout"]:
+                strengths.pop("price_breakout", None)
+
+        chain_metrics = self.extract_chain_metrics(option_chain)
+        if security_id is not None:
+            buildup = self.compute_buildup_from_state(security_id, spot, chain_metrics)
+            oi_change_pct = native_number(buildup.get("oi_change_pct")) or 0.0
+            buildup_type = buildup.get("type")
+            if abs(oi_change_pct) > 5:
+                if direction == "bullish" and buildup_type in {"LONG_BUILDUP", "SHORT_COVERING"}:
+                    flags["oi_shift"] = True
+                elif direction == "bearish" and buildup_type in {"SHORT_BUILDUP", "LONG_UNWINDING"}:
+                    flags["oi_shift"] = True
+                strengths["oi_shift"] = min(1.0, abs(oi_change_pct) / 15.0) if flags["oi_shift"] else 0.0
+
+            if self._same_direction_pcr(security_id, direction):
+                flags["pcr_trend"] = True
+                strengths["pcr_trend"] = 0.7
+
+        if spot is not None:
+            walls = self.find_oi_walls(option_chain)
+            relevant_walls = walls.get("put_walls") if direction == "bullish" else walls.get("call_walls") if direction == "bearish" else (walls.get("put_walls") or []) + (walls.get("call_walls") or [])
+            nearest = self.find_nearest_oi_wall(spot, relevant_walls or [])
+            if nearest and nearest.get("distance") is not None and nearest["distance"] < spot * 0.01:
+                flags["oi_wall_proximity"] = True
+                strengths["oi_wall_proximity"] = max(0.0, 1.0 - (nearest["distance"] / (spot * 0.01)))
+
+        strength_score = min(1.0, sum(strengths.values()) / 5.0)
+        result = {
+            "symbol": symbol,
+            "direction": direction,
+            "flags": flags,
+            "strengths": strengths,
+            "strength_score": round(strength_score, 4),
+            "trigger_key": "|".join(sorted(
+                key for key, enabled in flags.items()
+                if enabled and (key != "price_breakout" or flags.get("valid_breakout"))
+            )) or "none",
+        }
+        logger.info("Triggers %s | direction=%s | flags=%s | strength=%.2f", symbol, direction, flags, strength_score)
+        return result
+
+    def score_candidate(self, option, triggers, iv_percentile, spread, delta):
+        discount_score = max(0.0, (30.0 - float(iv_percentile)) / 30.0)
+        abs_delta = abs(float(delta or 0.0))
+        if 0.45 <= abs_delta <= 0.55:
+            delta_score = 1.0
+        elif 0.3 <= abs_delta < 0.45:
+            delta_score = 0.7
+        elif 0.2 <= abs_delta < 0.3:
+            delta_score = 0.5
+        else:
+            delta_score = 0.2
+        trigger_strengths = (triggers or {}).get("strengths") or {}
+        trig_score = min(1.0, sum(float(value or 0.0) for value in trigger_strengths.values()))
+        liquidity_score = 1.0 - min(float(spread or 0.0) / 0.10, 1.0)
+        final_score = (
+            0.4 * discount_score +
+            0.3 * delta_score +
+            0.2 * trig_score +
+            0.1 * liquidity_score
+        )
+        return {
+            "score": round(final_score, 4),
+            "score_pct": round(final_score * 100.0, 2),
+            "components": {
+                "discount_score": round(discount_score, 4),
+                "delta_score": round(delta_score, 4),
+                "trig_score": round(trig_score, 4),
+                "liquidity_score": round(liquidity_score, 4),
+            },
+        }
+
+    def _spread_ratio(self, bid, ask):
+        bid = native_number(bid) or 0.0
+        ask = native_number(ask) or 0.0
+        if ask <= 0:
+            return 1.0
+        return max(0.0, (ask - bid) / ask)
+
+    def _build_candidate_rows(self, symbol, security_id, expiry, spot_price, option_chain, triggers, iv_percentile):
+        atm_context = self.extract_atm_reference_ivs(option_chain, spot_price)
+        atm_strike = atm_context.get("atm_strike")
+        if atm_strike is None:
+            return []
+        strike_data = option_chain.get(str(atm_strike), option_chain.get(atm_strike, {})) or {}
+        direction = triggers.get("direction", "neutral")
+        option_sides = []
+        if iv_percentile is not None and iv_percentile < 15 and direction == "neutral":
+            call_opt = strike_data.get("ce") or {}
+            put_opt = strike_data.get("pe") or {}
+            call_prices = self.get_execution_prices(call_opt)
+            put_prices = self.get_execution_prices(put_opt)
+            call_ask = call_prices["ask"]
+            put_ask = put_prices["ask"]
+            call_bid = call_prices["bid"]
+            put_bid = put_prices["bid"]
+            entry = (call_ask or 0.0) + (put_ask or 0.0)
+            combined_spread = self._spread_ratio((call_bid or 0.0) + (put_bid or 0.0), entry)
+            if entry > 0 and combined_spread <= 0.10:
+                scored = self.score_candidate({}, triggers, iv_percentile, combined_spread, 0.5)
+                return [{
+                    "symbol": symbol,
+                    "security_id": str(security_id),
+                    "expiry": expiry,
+                    "strategy": "STRADDLE",
+                    "strike": atm_strike,
+                    "type": "STRADDLE",
+                    "direction": "neutral",
+                    "combined": True,
+                    "legs": [
+                        {"type": "CALL", "strike": atm_strike, "option": call_opt, "ask": call_ask, "bid": call_bid},
+                        {"type": "PUT", "strike": atm_strike, "option": put_opt, "ask": put_ask, "bid": put_bid},
+                    ],
+                    "entry": round(entry, 2),
+                    "bid": round((call_bid or 0.0) + (put_bid or 0.0), 2),
+                    "ask": round(entry, 2),
+                    "spread": combined_spread,
+                    "delta": 0.0,
+                    "iv_percentile": native_number(iv_percentile),
+                    "triggers": triggers,
+                    "score": scored["score_pct"],
+                    "raw_score": scored["score"],
+                    "score_components": scored["components"],
+                }]
+            logger.info("Rejected straddle %s: invalid entry or spread %.2f%%", symbol, combined_spread * 100)
+            return []
+
+        if direction == "bullish":
+            option_sides = [("CALL", strike_data.get("ce") or {})]
+        elif direction == "bearish":
+            option_sides = [("PUT", strike_data.get("pe") or {})]
+
+        candidates = []
+        for option_type, opt in option_sides:
+            prices = self.get_execution_prices(opt)
+            ask = prices["ask"]
+            bid = prices["bid"]
+            spread = self._spread_ratio(bid, ask)
+            if spread > 0.10:
+                logger.info("Rejected trade %s %s: spread %.2f%% > 10%%", symbol, option_type, spread * 100)
+                continue
+            delta = native_number(pd.to_numeric(opt.get("delta"), errors="coerce")) or (0.5 if option_type == "CALL" else -0.5)
+            scored = self.score_candidate(opt, triggers, iv_percentile, spread, delta)
+            candidates.append({
+                "symbol": symbol,
+                "security_id": str(security_id),
+                "expiry": expiry,
+                "strike": atm_strike,
+                "type": option_type,
+                "direction": direction,
+                "option": opt,
+                "entry": round(ask, 2) if ask else 0.0,
+                "bid": round(bid, 2) if bid else 0.0,
+                "ask": round(ask, 2) if ask else 0.0,
+                "spread": spread,
+                "delta": delta,
+                "iv_percentile": native_number(iv_percentile),
+                "triggers": triggers,
+                "score": scored["score_pct"],
+                "raw_score": scored["score"],
+                "score_components": scored["components"],
+            })
+        return candidates
+
+    def _daily_trade_stats(self):
+        today = datetime.now().date().isoformat()
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            ensure_strategy_schema(conn.cursor())
+            df = pd.read_sql(
+                "SELECT pnl FROM trades WHERE DATE(created_at) = ?",
+                conn,
+                params=(today,),
+            )
+        except Exception:
+            logger.exception("Failed to read daily trade stats")
+            return {"count": 0, "pnl": 0.0}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        pnl = pd.to_numeric(df.get("pnl"), errors="coerce").fillna(0).sum() if not df.empty else 0.0
+        return {"count": int(len(df)), "pnl": float(pnl)}
+
+    def _capital(self):
+        return float(os.getenv("TRADING_CAPITAL", os.getenv("CAPITAL", "100000")))
+
+    def _lot_size(self, candidate):
+        raw = candidate.get("lot_size") or candidate.get("option", {}).get("lot_size") or os.getenv("DEFAULT_LOT_SIZE", "1")
+        try:
+            return max(1, int(float(raw)))
+        except Exception:
+            return 1
+
+    def _passes_trade_cooldown(self, candidate):
+        now = datetime.now()
+        symbol_key = str(candidate.get("symbol"))
+        trigger_key = f"{symbol_key}:{(candidate.get('triggers') or {}).get('trigger_key', 'none')}"
+        symbol_ts = self.runtime_state.setdefault("last_symbol_trade_ts", {}).get(symbol_key)
+        trigger_ts = self.runtime_state.setdefault("last_trigger_trade_ts", {}).get(trigger_key)
+        if symbol_ts and (now - symbol_ts).total_seconds() < 60 * 60:
+            logger.info("Rejected trade %s: symbol cooldown active", symbol_key)
+            return False
+        if trigger_ts and (now - trigger_ts).total_seconds() < 15 * 60:
+            logger.info("Rejected trade %s: trigger cooldown active", symbol_key)
+            return False
+        return True
+
+    def _mark_trade_cooldown(self, candidate):
+        now = datetime.now()
+        symbol_key = str(candidate.get("symbol"))
+        trigger_key = f"{symbol_key}:{(candidate.get('triggers') or {}).get('trigger_key', 'none')}"
+        self.runtime_state.setdefault("last_symbol_trade_ts", {})[symbol_key] = now
+        self.runtime_state.setdefault("last_trigger_trade_ts", {})[trigger_key] = now
+
+    def place_limit_order(self, candidate, price):
+        order_method = getattr(self.dhan, "place_order", None)
+        order_payload = dict((candidate or {}).get("order_payload") or {})
+        if not callable(order_method) or not order_payload:
+            return f"PAPER-{int(time.time() * 1000)}"
+        order_payload.update({
+            "price": round(float(price), 2),
+            "order_type": "LIMIT",
+            "transaction_type": "BUY",
+        })
+        return order_method(**order_payload)
+
+    def check_order_status(self, order_id):
+        status_method = getattr(self.dhan, "order_status", None)
+        if not callable(status_method):
+            return "FILLED"
+        response = status_method(order_id)
+        if isinstance(response, dict):
+            status = str(response.get("status") or response.get("orderStatus") or "").upper()
+        else:
+            status = str(response).upper()
+        return "FILLED" if status in {"FILLED", "TRADED", "COMPLETE", "COMPLETED"} else status
+
+    def cancel_order(self, order_id):
+        cancel_method = getattr(self.dhan, "cancel_order", None)
+        if callable(cancel_method):
+            return cancel_method(order_id)
+        return None
+
+    def _place_limit_with_retry(self, candidate, ask_price):
+        order_id = self.place_limit_order(candidate, price=ask_price)
+        status = None
+        start_time = time.time()
+        while time.time() - start_time < 10:
+            status = self.check_order_status(order_id)
+            if status == "FILLED":
+                return order_id, status
+            time.sleep(1)
+
+        self.cancel_order(order_id)
+        retry_order_id = self.place_limit_order(candidate, price=ask_price * 1.01)
+        retry_status = self.check_order_status(retry_order_id)
+        return retry_order_id, retry_status
+
+    def execute_trade(self, candidate):
+        """Persist a paper/live-ready trade record after global risk checks."""
+        stats = self._daily_trade_stats()
+        capital = self._capital()
+        if stats["pnl"] <= -(capital * 0.03):
+            logger.warning("Rejected trade %s: daily loss limit reached", candidate.get("symbol"))
+            return None
+        if stats["count"] >= 5:
+            logger.warning("Rejected trade %s: max trades per day reached", candidate.get("symbol"))
+            return None
+        if candidate.get("spread", 1.0) > 0.10:
+            logger.info("Rejected trade %s: spread > 10%%", candidate.get("symbol"))
+            return None
+
+        entry = native_number(candidate.get("entry")) or 0.0
+        if entry <= 0:
+            logger.info("Rejected trade %s: invalid entry", candidate.get("symbol"))
+            return None
+        if candidate.get("combined"):
+            order_ids = []
+            for leg in candidate.get("legs") or []:
+                leg_price = native_number(leg.get("ask")) or 0.0
+                if leg_price <= 0:
+                    logger.info("Rejected straddle %s: invalid leg price", candidate.get("symbol"))
+                    return None
+                leg_candidate = dict(candidate)
+                leg_candidate.update(leg)
+                order_id, order_status = self._place_limit_with_retry(leg_candidate, leg_price)
+                if order_status != "FILLED":
+                    logger.info("Rejected straddle %s: leg limit order not filled", candidate.get("symbol"))
+                    return None
+                order_ids.append(str(order_id))
+            order_id = ",".join(order_ids)
+        else:
+            order_id, order_status = self._place_limit_with_retry(candidate, entry)
+            if order_status != "FILLED":
+                logger.info("Rejected trade %s: limit order not filled", candidate.get("symbol"))
+                return None
+        stop_loss = round(entry * 0.70, 2)
+        target = round(entry * 1.70, 2)
+        risk_per_unit = max(entry - stop_loss, 0.01)
+        lot_size = self._lot_size(candidate)
+        allowed_units = int((capital * 0.015) / risk_per_unit)
+        if allowed_units < lot_size:
+            logger.info("Rejected trade %s: one lot exceeds 1.5%% risk budget", candidate.get("symbol"))
+            return None
+        lots = max(1, min(2, allowed_units // lot_size if lot_size else allowed_units))
+        quantity = lots * lot_size
+        risk_amount = round(risk_per_unit * quantity, 2)
+
+        if candidate.get("combined"):
+            option_type = "STRADDLE"
+        elif candidate.get("direction") == "bullish":
+            option_type = "CALL"
+        elif candidate.get("direction") == "bearish":
+            option_type = "PUT"
+        else:
+            option_type = "STRADDLE" if candidate.get("iv_percentile", 100) < 15 else candidate.get("type")
+
+        trade = dict(candidate)
+        trade.update({
+            "type": option_type,
+            "entry": round(entry, 2),
+            "stop_loss": stop_loss,
+            "target": target,
+            "lots": lots,
+            "quantity": quantity,
+            "risk_amount": risk_amount,
+            "order_id": order_id,
+            "created_at": datetime.now().isoformat(sep=" "),
+        })
+
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            ensure_strategy_schema(cursor)
+            cursor.execute("""
+            INSERT INTO trades (
+                symbol, security_id, expiry, strike, option_type, direction,
+                score, entry, stop_loss, target, lots, quantity, risk_amount, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                trade.get("symbol"),
+                str(trade.get("security_id")),
+                trade.get("expiry"),
+                native_number(trade.get("strike")),
+                trade.get("type"),
+                trade.get("direction"),
+                native_number(trade.get("score")),
+                trade.get("entry"),
+                trade.get("stop_loss"),
+                trade.get("target"),
+                trade.get("lots"),
+                trade.get("quantity"),
+                trade.get("risk_amount"),
+                trade.get("created_at"),
+            ))
+            conn.commit()
+            trade["trade_id"] = cursor.lastrowid
+            self._mark_trade_cooldown(candidate)
+            logger.info("Executed trade %s %s score=%.2f entry=%.2f", trade.get("symbol"), trade.get("type"), trade.get("score"), entry)
+            self.send_trade_alert(trade)
+            return trade
+        except Exception:
+            logger.exception("Failed to persist executed trade for %s", candidate.get("symbol"))
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def send_trade_alert(self, candidate):
+        if not self.telegram_bot_token or not self.telegram_chat_id:
+            logger.info("Trade Telegram alert skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing")
+            return
+        strike = int(float(candidate.get("strike") or 0))
+        opt_suffix = "CE" if candidate.get("type") == "CALL" else "PE" if candidate.get("type") == "PUT" else "STRADDLE"
+        line1 = f"{candidate.get('symbol')} {strike}{opt_suffix} | Score: {int(round(candidate.get('score') or 0))}"
+        line2 = f"Entry: {candidate.get('entry')} | SL: {candidate.get('stop_loss')} | Target: {candidate.get('target')}"
+        message = f"{line1}\n{line2}"[:3990]
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage",
+                json={"chat_id": self.telegram_chat_id, "text": message},
+                timeout=15,
+            )
+            if not response.ok:
+                logger.error("Telegram trade alert rejected: %s", response.text)
+            response.raise_for_status()
+        except Exception:
+            logger.exception("Failed to send trade alert")
+
+    def run_active_scanner(self):
+        """Run one active 5-minute automated scan and execute up to three trades."""
+        watchlist = self._read_latest_watchlist(limit=20)
+        if not watchlist:
+            logger.info("Active scanner skipped: watchlist is empty")
+            return []
+
+        all_candidates = []
+        for row in watchlist:
+            symbol = row["symbol"]
+            security_id = row["security_id"]
+            segment = self._strategy_segment(symbol)
+            try:
+                historical_ivs = self.fetch_historical_iv(security_id, segment, lookback_days=252)
+                if len(historical_ivs) < 2:
+                    logger.info("Rejected %s: insufficient daily IV history", symbol)
+                    continue
+                iv_percentile = self.calculate_iv_percentile(historical_ivs[-1], historical_ivs)
+                if iv_percentile is None or iv_percentile >= 25:
+                    logger.info("Rejected %s: daily IV percentile %.2f >= 25", symbol, iv_percentile or -1)
+                    continue
+
+                expiry = self._latest_expiry(security_id, segment)
+                if not expiry:
+                    continue
+                chain_response = self.get_option_chain_active(security_id, segment, expiry, retry=2, cache_ttl_seconds=300)
+                if chain_response.get("status") != "success":
+                    continue
+                chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
+                spot_price = chain_data.get("last_price")
+                option_chain = chain_data.get("oc")
+                if spot_price is None or not isinstance(option_chain, dict):
+                    continue
+
+                intraday_data = self.fetch_intraday_prices(security_id, segment, minutes=160)
+                triggers = self.compute_triggers(symbol, option_chain, intraday_data)
+                flags = triggers.get("flags") or {}
+                actionable_trigger = (
+                    flags.get("valid_breakout") or
+                    flags.get("oi_shift") or
+                    flags.get("oi_wall_proximity") or
+                    flags.get("pcr_trend")
+                )
+                if not actionable_trigger and iv_percentile >= 15:
+                    logger.info("Rejected %s: no trigger and IV percentile is not straddle-low", symbol)
+                    continue
+                all_candidates.extend(
+                    self._build_candidate_rows(symbol, security_id, expiry, spot_price, option_chain, triggers, iv_percentile)
+                )
+            except Exception:
+                logger.exception("Active scanner failed for %s", symbol)
+
+        ranked = sorted(all_candidates, key=lambda item: item.get("score", 0), reverse=True)
+        selected = []
+        selected_symbols = set()
+        selected_triggers = set()
+        for candidate in ranked:
+            if len(selected) >= 3:
+                break
+            symbol_key = str(candidate.get("symbol"))
+            trigger_key = f"{symbol_key}:{(candidate.get('triggers') or {}).get('trigger_key', 'none')}"
+            if symbol_key in selected_symbols or trigger_key in selected_triggers:
+                logger.info("Rejected trade %s: duplicate symbol/trigger in this cycle", symbol_key)
+                continue
+            if not self._passes_trade_cooldown(candidate):
+                continue
+            selected.append(candidate)
+            selected_symbols.add(symbol_key)
+            selected_triggers.add(trigger_key)
+
+        executed = []
+        for candidate in selected:
+            trade = self.execute_trade(candidate)
+            if trade:
+                executed.append(trade)
+        logger.info("Active scanner selected=%s executed=%s candidates=%s", len(selected), len(executed), len(ranked))
+        return executed
+
+    def backtest_strategy(self, days=20):
+        """Lightweight replay using stored daily IV and historical prices; intended as a sanity backtest."""
+        results = []
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=int(days) + 10)
+        for security_id, symbol in self.fno_stocks.items():
+            segment = self._strategy_segment(symbol)
+            try:
+                ivs = self.fetch_historical_iv(security_id, segment, lookback_days=max(30, int(days) + 30))
+                if len(ivs) < 5:
+                    continue
+                price_df = self.fetch_historical_prices(
+                    security_id,
+                    segment,
+                    start_date.strftime("%Y-%m-%d"),
+                    end_date.strftime("%Y-%m-%d"),
+                )
+                if price_df.empty:
+                    continue
+                close_col = next((col for col in ("close", "Close", "CLOSE") if col in price_df.columns), None)
+                if not close_col:
+                    continue
+                closes = pd.to_numeric(price_df[close_col], errors="coerce").dropna().tail(int(days) + 1).tolist()
+                if len(closes) < 2:
+                    continue
+                rolling_ivs = ivs[:-1]
+                for i in range(1, len(closes)):
+                    iv_ref = ivs[min(i, len(ivs) - 1)]
+                    iv_pct = self.calculate_iv_percentile(iv_ref, rolling_ivs + [iv_ref])
+                    if iv_pct is None or iv_pct >= 25:
+                        continue
+                    ret = (closes[i] - closes[i - 1]) / closes[i - 1]
+                    simulated_r = 1.7 if abs(ret) > 0.012 else -1.0
+                    results.append({"symbol": symbol, "r": simulated_r})
+                    rolling_ivs.append(iv_ref)
+            except Exception:
+                logger.exception("Backtest replay failed for %s", symbol)
+
+        if not results:
+            summary = {"trades": 0, "win_rate": 0.0, "avg_rr": 0.0, "total_return": 0.0}
+        else:
+            r_values = [row["r"] for row in results]
+            wins = [value for value in r_values if value > 0]
+            summary = {
+                "trades": len(r_values),
+                "win_rate": round(len(wins) / len(r_values) * 100.0, 2),
+                "avg_rr": round(float(np.mean(r_values)), 3),
+                "total_return": round(float(np.sum(r_values)) * 1.5, 2),
+            }
+        logger.info("Automated strategy backtest summary: %s", summary)
+        return summary
 
     def log_option_rejection(self, strike_price, option_type, reason, **details):
         """Emit readable filter diagnostics for rejected options."""
@@ -2692,7 +3632,14 @@ class DiscountedPremiumScanner:
             if not expiries:
                 logger.warning("No expiries found for %s (%s)", security_name, security_segment)
                 return []
-            expiry = expiries[0]
+            valid_expiries = [
+                exp for exp in expiries
+                if self.days_to_expiry(exp) >= 3
+            ]
+            expiry = valid_expiries[0] if valid_expiries else None
+            if expiry is None:
+                logger.info("Skipping %s - no expiry with DTE >= 3", security_name)
+                return []
 
         dte = get_trading_days_to_expiry(expiry)
         logger.info(f"Selected expiry: {expiry} (DTE: {dte})")
@@ -3019,8 +3966,12 @@ class DiscountedPremiumScanner:
                     segment = "NSE_FNO"
 
                 expiries = [expiry] if expiry else self.get_expiry_list(sec_id, segment)
+                expiries = [
+                    exp for exp in expiries
+                    if self.days_to_expiry(exp) >= 3
+                ]
                 if not expiries:
-                    logger.warning("No expiries found for %s (%s)", sec_name, segment)
+                    logger.warning("No expiries with DTE >= 3 found for %s (%s)", sec_name, segment)
                     continue
 
                 for current_expiry in expiries:

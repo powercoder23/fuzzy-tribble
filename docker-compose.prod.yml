@@ -14,4 +14,4 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./data/tokens:/app/data/tokens
-    command: python main.py
+    command: python main.py --auto-loop
