@@ -19,6 +19,7 @@ from config import Config
 from token_manager import TokenManager
 from discount import (
     DiscountedPremiumScanner,
+    MIN_DISCOUNT_SCORE,
     get_trading_days_to_expiry,
     init_iv_db,
     migrate_csv_to_sqlite,
@@ -194,7 +195,7 @@ class StrategySchedulerApp:
                 client_id=Config.DHAN_CLIENT_ID,
             )
 
-            opportunities = scanner.scan_all_fno_stocks(min_discount_score=40)
+            opportunities = scanner.scan_all_fno_stocks(min_discount_score=MIN_DISCOUNT_SCORE)
             scanner.generate_report(opportunities)
 
             if not opportunities.empty:

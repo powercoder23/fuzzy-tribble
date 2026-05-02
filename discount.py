@@ -316,6 +316,28 @@ def split_message(msg, chunk_size=4000):
 
 
 NEAR_WALL_STRIKE_DISTANCE = 50.0
+# ── Strategy thresholds ──────────────────────────────────────────────
+# All numeric trading constants are centralised here so they can be
+# tuned without hunting through method bodies.
+
+# IV percentile gates
+IV_PCT_ACTIVE_SCAN_MAX      = 35    # run_active_scanner: reject above this
+IV_PCT_STRADDLE_MAX         = 20    # _build_candidate_rows: straddle only below this
+IV_PCT_NO_TRIGGER_MAX       = 20    # run_active_scanner: no-trigger straddle gate
+
+# Watchlist filters
+WATCHLIST_MIN_AVG_VOLUME    = 300   # build_watchlist_eod: minimum avg option volume
+WATCHLIST_MIN_RANGE_PCT     = 1.5   # build_watchlist_eod: minimum 5-day price range %
+
+# Spread limits
+MAX_SPREAD_RATIO            = 0.15  # _build_candidate_rows: hard reject above this
+
+# Scoring
+MIN_DISCOUNT_SCORE          = 38    # scan_all_fno_stocks / run_discount_scan
+
+# Volume spike
+VOLUME_SPIKE_MULTIPLIER     = 2.5   # compute_triggers + detect_volume_spike threshold
+VOLUME_SPIKE_SCALE          = 2.5   # denominator for strength scaling above threshold
 
 class DiscountedPremiumScanner:
     """
@@ -1792,7 +1814,7 @@ class DiscountedPremiumScanner:
             direction = "neutral"
 
         return {
-            "spike": bool(ratio is not None and ratio > 1.5),
+            "spike": bool(ratio is not None and ratio > VOLUME_SPIKE_MULTIPLIER),
             "ratio": round(ratio, 2) if ratio is not None else None,
             "direction": direction,
         }
@@ -2036,7 +2058,7 @@ class DiscountedPremiumScanner:
                 )
                 range_pct = self._five_day_price_range_pct(price_df)
 
-                if avg_volume <= 500 or iv_percentile is None or iv_percentile >= 40 or range_pct <= 2.0:
+                if avg_volume <= WATCHLIST_MIN_AVG_VOLUME or iv_percentile is None or iv_percentile >= 40 or range_pct <= WATCHLIST_MIN_RANGE_PCT:
                     logger.info(
                         "Watchlist rejected %s | avg_volume=%.1f | iv_pct=%s | range_pct=%.2f",
                         symbol,
@@ -2235,9 +2257,10 @@ class DiscountedPremiumScanner:
             if "volume" in df.columns and len(df) >= 20:
                 latest_volume = native_number(latest.get("volume")) or 0.0
                 avg_volume = pd.to_numeric(df.iloc[-20:-1]["volume"], errors="coerce").dropna().mean()
-                if pd.notna(avg_volume) and avg_volume > 0 and latest_volume > 1.5 * avg_volume:
+                if pd.notna(avg_volume) and avg_volume > 0 and latest_volume > VOLUME_SPIKE_MULTIPLIER * avg_volume:
                     flags["volume_spike"] = True
-                    strengths["volume_spike"] = min(1.0, latest_volume / (1.5 * avg_volume) - 1.0)
+                    ratio = latest_volume / avg_volume
+                    strengths["volume_spike"] = min(1.0, (ratio - VOLUME_SPIKE_MULTIPLIER) / VOLUME_SPIKE_SCALE)
 
             flags["valid_breakout"] = bool(
                 flags["price_breakout"] and flags.get("volume_spike") and flags.get("retest_hold")
@@ -2330,7 +2353,7 @@ class DiscountedPremiumScanner:
         strike_data = option_chain.get(str(atm_strike), option_chain.get(atm_strike, {})) or {}
         direction = triggers.get("direction", "neutral")
         option_sides = []
-        if iv_percentile is not None and iv_percentile < 15 and direction == "neutral":
+        if iv_percentile is not None and iv_percentile < IV_PCT_STRADDLE_MAX and direction == "neutral":
             call_opt = strike_data.get("ce") or {}
             put_opt = strike_data.get("pe") or {}
             call_prices = self.get_execution_prices(call_opt)
@@ -2381,8 +2404,8 @@ class DiscountedPremiumScanner:
             ask = prices["ask"]
             bid = prices["bid"]
             spread = self._spread_ratio(bid, ask)
-            if spread > 0.10:
-                logger.info("Rejected trade %s %s: spread %.2f%% > 10%%", symbol, option_type, spread * 100)
+            if spread > MAX_SPREAD_RATIO:
+                logger.info("Rejected trade %s %s: spread %.2f%% > %.0f%%", symbol, option_type, spread * 100, MAX_SPREAD_RATIO * 100)
                 continue
             delta = native_number(pd.to_numeric(opt.get("delta"), errors="coerce")) or (0.5 if option_type == "CALL" else -0.5)
             scored = self.score_candidate(opt, triggers, iv_percentile, spread, delta)
@@ -2654,8 +2677,8 @@ class DiscountedPremiumScanner:
                     logger.info("Rejected %s: insufficient daily IV history", symbol)
                     continue
                 iv_percentile = self.calculate_iv_percentile(historical_ivs[-1], historical_ivs)
-                if iv_percentile is None or iv_percentile >= 25:
-                    logger.info("Rejected %s: daily IV percentile %.2f >= 25", symbol, iv_percentile or -1)
+                if iv_percentile is None or iv_percentile >= IV_PCT_ACTIVE_SCAN_MAX:
+                    logger.info("Rejected %s: daily IV percentile %.2f >= %s", symbol, iv_percentile or -1, IV_PCT_ACTIVE_SCAN_MAX)
                     continue
 
                 expiry = self._latest_expiry(security_id, segment)
@@ -2670,6 +2693,20 @@ class DiscountedPremiumScanner:
                 if spot_price is None or not isinstance(option_chain, dict):
                     continue
 
+                atm_context_daily = self.extract_atm_reference_ivs(option_chain, spot_price)
+                chain_metrics_daily = self.extract_chain_metrics(option_chain)
+                self.persist_iv_snapshot(
+                    security_id=security_id,
+                    exchange_segment=segment,
+                    security_name=symbol,
+                    expiry=expiry,
+                    spot_price=spot_price,
+                    atm_context=atm_context_daily,
+                    chain_metrics=chain_metrics_daily,
+                    store_intraday=False,
+                    data_type="daily",
+                )
+
                 intraday_data = self.fetch_intraday_prices(security_id, segment, minutes=160)
                 triggers = self.compute_triggers(symbol, option_chain, intraday_data)
                 flags = triggers.get("flags") or {}
@@ -2679,7 +2716,7 @@ class DiscountedPremiumScanner:
                     flags.get("oi_wall_proximity") or
                     flags.get("pcr_trend")
                 )
-                if not actionable_trigger and iv_percentile >= 15:
+                if not actionable_trigger and iv_percentile >= IV_PCT_NO_TRIGGER_MAX:
                     logger.info("Rejected %s: no trigger and IV percentile is not straddle-low", symbol)
                     continue
                 all_candidates.extend(
