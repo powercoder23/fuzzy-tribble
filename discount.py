@@ -2693,19 +2693,37 @@ class DiscountedPremiumScanner:
                 if spot_price is None or not isinstance(option_chain, dict):
                     continue
 
-                atm_context_daily = self.extract_atm_reference_ivs(option_chain, spot_price)
-                chain_metrics_daily = self.extract_chain_metrics(option_chain)
-                self.persist_iv_snapshot(
-                    security_id=security_id,
-                    exchange_segment=segment,
-                    security_name=symbol,
-                    expiry=expiry,
-                    spot_price=spot_price,
-                    atm_context=atm_context_daily,
-                    chain_metrics=chain_metrics_daily,
-                    store_intraday=False,
-                    data_type="daily",
-                )
+                _today_str = datetime.now().date().isoformat()
+                _already_stored_today = False
+                try:
+                    _iv_conn = sqlite3.connect(DB_PATH)
+                    _iv_cur = _iv_conn.execute(
+                        "SELECT 1 FROM iv_history WHERE security_id = ? AND data_type = 'daily' AND DATE(timestamp) = ? LIMIT 1",
+                        (str(security_id), _today_str),
+                    )
+                    _already_stored_today = _iv_cur.fetchone() is not None
+                except Exception:
+                    _already_stored_today = False
+                finally:
+                    try:
+                        _iv_conn.close()
+                    except Exception:
+                        pass
+
+                if not _already_stored_today:
+                    atm_context_daily = self.extract_atm_reference_ivs(option_chain, spot_price)
+                    chain_metrics_daily = self.extract_chain_metrics(option_chain)
+                    self.persist_iv_snapshot(
+                        security_id=security_id,
+                        exchange_segment=segment,
+                        security_name=symbol,
+                        expiry=expiry,
+                        spot_price=spot_price,
+                        atm_context=atm_context_daily,
+                        chain_metrics=chain_metrics_daily,
+                        store_intraday=False,
+                        data_type="daily",
+                    )
 
                 intraday_data = self.fetch_intraday_prices(security_id, segment, minutes=160)
                 triggers = self.compute_triggers(symbol, option_chain, intraday_data)
