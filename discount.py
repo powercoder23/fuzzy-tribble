@@ -700,6 +700,10 @@ class DiscountedPremiumScanner:
         cache_key = (str(underlying_security_id), underlying_segment)
         cache_label = f"{underlying_security_id} expiry list"
 
+        def short_response(value, limit=500):
+            text = str(value)
+            return text[:limit] + "...truncated" if len(text) > limit else text
+
         def fetcher():
             return self.dhan.expiry_list(
                 under_security_id=underlying_security_id,
@@ -747,9 +751,31 @@ class DiscountedPremiumScanner:
         def validator(response):
             return isinstance(response, dict) and "data" in response
 
+        diagnostics = self.runtime_state.setdefault("expiry_diagnostics", {
+            "validated_symbols": set(),
+            "manual_test_done": False,
+            "segment_checks": set(),
+        })
+        if not diagnostics.get("manual_test_done"):
+            diagnostics["manual_test_done"] = True
+            try:
+                manual_response = self.dhan.expiry_list(
+                    under_security_id=13,
+                    under_exchange_segment="IDX_I",
+                )
+                logger.info("EXPIRY MANUAL TEST | security_id=13 | segment=IDX_I | response=%s", short_response(manual_response))
+            except Exception:
+                logger.exception("EXPIRY MANUAL TEST failed | security_id=13 | segment=IDX_I")
+
+        expiry_cache = self.runtime_state["expiries"]
+        cached_before = expiry_cache.get(cache_key)
+        if cache_key in expiry_cache:
+            logger.info("EXPIRY CACHE HIT | security_id=%s | segment=%s", underlying_security_id, underlying_segment)
+            logger.info("CACHE VALUE: %s", short_response(cached_before))
+
         try:
             response = self.get_cached_or_fetch(
-                self.runtime_state["expiries"],
+                expiry_cache,
                 cache_key,
                 fetcher,
                 cache_label,
@@ -763,9 +789,105 @@ class DiscountedPremiumScanner:
             )
             return []
 
+        logger.info(
+            "EXPIRY RAW RESPONSE | security_id=%s | segment=%s | response=%s",
+            underlying_security_id,
+            underlying_segment,
+            short_response(response),
+        )
+        if not isinstance(response, dict):
+            logger.warning(
+                "EXPIRY INVALID RESPONSE TYPE | security_id=%s | segment=%s | type=%s",
+                underlying_security_id,
+                underlying_segment,
+                type(response).__name__,
+            )
+        elif response.get("status") != "success":
+            logger.warning(
+                "EXPIRY API STATUS NOT SUCCESS | security_id=%s | segment=%s | status=%s | response=%s",
+                underlying_security_id,
+                underlying_segment,
+                response.get("status"),
+                short_response(response),
+            )
+        raw_data = response.get("data") if isinstance(response, dict) else None
+        if raw_data is None or raw_data == "" or raw_data == [] or raw_data == {}:
+            logger.warning(
+                "EXPIRY API DATA EMPTY | security_id=%s | segment=%s | data=%s",
+                underlying_security_id,
+                underlying_segment,
+                short_response(raw_data),
+            )
+
+        validation_key = (str(underlying_security_id), underlying_segment)
+        if len(diagnostics["validated_symbols"]) < 5 and validation_key not in diagnostics["validated_symbols"]:
+            diagnostics["validated_symbols"].add(validation_key)
+            try:
+                fresh_response = fetcher()
+                logger.info(
+                    "EXPIRY FRESH VALIDATION | security_id=%s | segment=%s | fresh_response=%s",
+                    underlying_security_id,
+                    underlying_segment,
+                    short_response(fresh_response),
+                )
+                compare_value = cached_before if cached_before is not None else response
+                if str(compare_value) != str(fresh_response):
+                    logger.warning(
+                        "EXPIRY CACHE/FRESH MISMATCH | security_id=%s | segment=%s | cached_or_returned=%s | fresh=%s",
+                        underlying_security_id,
+                        underlying_segment,
+                        short_response(compare_value),
+                        short_response(fresh_response),
+                    )
+            except Exception:
+                logger.exception(
+                    "EXPIRY FRESH VALIDATION failed | security_id=%s | segment=%s",
+                    underlying_security_id,
+                    underlying_segment,
+                )
+
+        if underlying_segment == "NSE_FNO":
+            logger.info("EXPIRY SEGMENT CHECK | security_id=%s requested with NSE_FNO", underlying_security_id)
+            segment_key = str(underlying_security_id)
+            if segment_key not in diagnostics["segment_checks"]:
+                diagnostics["segment_checks"].add(segment_key)
+                for alternate_segment in ("NSE_EQ", "IDX_I"):
+                    try:
+                        alternate_response = self.dhan.expiry_list(
+                            under_security_id=underlying_security_id,
+                            under_exchange_segment=alternate_segment,
+                        )
+                        alternate_expiries = parse_expiries(alternate_response) if isinstance(alternate_response, dict) else []
+                        logger.info(
+                            "EXPIRY SEGMENT PROBE | security_id=%s | segment=%s | parsed_len=%s | response=%s",
+                            underlying_security_id,
+                            alternate_segment,
+                            len(alternate_expiries),
+                            short_response(alternate_response),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "EXPIRY SEGMENT PROBE failed | security_id=%s | segment=%s",
+                            underlying_security_id,
+                            alternate_segment,
+                        )
+
         expiries = parse_expiries(response)
+        logger.info(
+            "EXPIRY PARSED | security_id=%s | segment=%s | count=%s | expiries=%s",
+            underlying_security_id,
+            underlying_segment,
+            len(expiries),
+            expiries,
+        )
         if not expiries:
             logger.info(f"No active expiries for {underlying_security_id} ({underlying_segment})")
+            logger.warning(
+                "EXPIRY PARSED EMPTY | security_id=%s | segment=%s | raw_response=%s",
+                underlying_security_id,
+                underlying_segment,
+                short_response(response),
+            )
             return []
         logger.info(
             "Available expiries for %s (%s): %s",
@@ -2139,19 +2261,26 @@ class DiscountedPremiumScanner:
 
         snapshot_dt = self._floor_to_five_minutes()
         persisted = []
+        warmup_valid_expiries = 0
+        warmup_empty_expiries = 0
+        warmup_api_failures = 0
         for security_id, symbol in all_symbols:
             segment = self._strategy_segment(symbol)
             try:
                 expiry = self._latest_expiry(security_id, segment)
                 if not expiry:
+                    warmup_empty_expiries += 1
                     continue
+                warmup_valid_expiries += 1
                 chain_response = self.get_option_chain_active(security_id, segment, expiry, retry=2)
                 if chain_response.get("status") != "success":
+                    warmup_api_failures += 1
                     continue
                 chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
                 spot_price = chain_data.get("last_price")
                 option_chain = chain_data.get("oc")
                 if spot_price is None or not isinstance(option_chain, dict):
+                    warmup_api_failures += 1
                     continue
                 atm_context = self.extract_atm_reference_ivs(option_chain, spot_price)
                 chain_metrics = self.extract_chain_metrics(option_chain)
@@ -2201,7 +2330,15 @@ class DiscountedPremiumScanner:
                 persisted.append(symbol)
                 logger.debug("Warmup IV snapshot persisted for %s at %s", symbol, snapshot_dt)
             except Exception:
+                warmup_api_failures += 1
                 logger.exception("Warmup cycle failed for %s", symbol)
+        logger.info(
+            "Warmup expiry/API summary | total_symbols=%s | valid_expiries=%s | empty_expiries=%s | api_failures=%s",
+            len(all_symbols),
+            warmup_valid_expiries,
+            warmup_empty_expiries,
+            warmup_api_failures,
+        )
         logger.info("Warmup pass complete | persisted=%s / %s symbols", len(persisted), len(all_symbols))
         return persisted
 
