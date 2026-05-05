@@ -260,23 +260,55 @@ class StrategySchedulerApp:
             return []
 
     def run_auto_loop(self, exit_after_one_cycle=False):
-        """Clock-aware automated loop: watchlist before 09:15, warmup until 09:50, active scan until 15:20."""
+        """
+        Clock-aware automated loop.
+
+        Before 09:15  : rebuild EOD watchlist, sleep 60s between runs.
+        09:15 - 09:50 : continuous warmup over ALL F&O stocks with no
+                        artificial sleep. rate_limited_call() is the only brake.
+                        At the moment 09:50 is first crossed,
+                        run_morning_warmup_and_select() fires once to score
+                        all stocks, pick the top 40, and send a Telegram alert.
+                        That top-40 list becomes the active watchlist.
+        09:50 - 15:20 : active scanner every 5 minutes on the top-40 list.
+        After 15:20   : idle, sleep 60s.
+        """
         self.warm_up_token()
         logger.info("Automated strategy loop started")
+        _morning_selection_done_today = None
+
         while True:
             now = datetime.now().time()
+            today = datetime.now().date().isoformat()
+
             if now < dt_time(9, 15):
                 self.run_auto_watchlist_eod()
+                _morning_selection_done_today = None
+                if exit_after_one_cycle:
+                    return
+                time.sleep(60)
+
             elif dt_time(9, 15) <= now < dt_time(9, 50):
                 self.run_auto_warmup_cycle()
+                if exit_after_one_cycle:
+                    return
+
             elif dt_time(9, 50) <= now <= dt_time(15, 20):
+                if _morning_selection_done_today != today:
+                    logger.info("Running morning warmup selection at 09:50")
+                    scanner = self.build_discount_scanner()
+                    scanner.run_morning_warmup_and_select()
+                    _morning_selection_done_today = today
                 self.run_auto_active_scanner()
+                if exit_after_one_cycle:
+                    return
+                time.sleep(300)
+
             else:
                 logger.info("Automated loop idle outside trading window")
-
-            if exit_after_one_cycle:
-                return
-            time.sleep(300)
+                if exit_after_one_cycle:
+                    return
+                time.sleep(60)
 
     def run_premarket_warmup(self, ignore_time_window=False, max_cycles=None):
         """Collect premarket ATM IV snapshots without running the scanner."""

@@ -326,6 +326,7 @@ IV_PCT_STRADDLE_MAX         = 20    # _build_candidate_rows: straddle only below
 IV_PCT_NO_TRIGGER_MAX       = 20    # run_active_scanner: no-trigger straddle gate
 
 # Watchlist filters
+WATCHLIST_MAX_SYMBOLS      = 40
 WATCHLIST_MIN_AVG_VOLUME    = 300   # build_watchlist_eod: minimum avg option volume
 WATCHLIST_MIN_RANGE_PCT     = 1.5   # build_watchlist_eod: minimum 5-day price range %
 
@@ -338,6 +339,10 @@ MIN_DISCOUNT_SCORE          = 38    # scan_all_fno_stocks / run_discount_scan
 # Volume spike
 VOLUME_SPIKE_MULTIPLIER     = 2.5   # compute_triggers + detect_volume_spike threshold
 VOLUME_SPIKE_SCALE          = 2.5   # denominator for strength scaling above threshold
+
+# Warmup morning scan
+WARMUP_MORNING_TOP_N        = 40    # number of stocks selected at 9:50 for active scan
+EVENT_FILTER_ENABLED        = True  # set False to allow event-risk stocks through all filters
 
 class DiscountedPremiumScanner:
     """
@@ -382,6 +387,7 @@ class DiscountedPremiumScanner:
                 "fno_symbols": None,
                 "fno_symbols_day": None,
                 "expiries": {},
+                "segment_expiries": {},
                 "option_chain": {},
                 "option_chain_ts": {},
                 "last_symbol_trade_ts": {},
@@ -402,6 +408,7 @@ class DiscountedPremiumScanner:
             state["fno_symbols"] = None
             state["fno_symbols_day"] = None
             state["expiries"] = {}
+            state["segment_expiries"] = {}
             state["option_chain"] = {}
             state["option_chain_ts"] = {}
             state["last_symbol_trade_ts"] = {}
@@ -1947,14 +1954,20 @@ class DiscountedPremiumScanner:
         return value.replace(minute=(value.minute // 5) * 5, second=0, microsecond=0)
 
     def _latest_expiry(self, security_id, security_segment):
-        expiries = self.get_expiry_list(security_id, security_segment)
+        segment_expiry_cache = self.runtime_state.setdefault("segment_expiries", {})
+        if security_segment in segment_expiry_cache:
+            expiries = segment_expiry_cache[security_segment]
+        else:
+            expiries = self.get_expiry_list(security_id, security_segment)
+            if expiries:
+                segment_expiry_cache[security_segment] = expiries
         valid_expiries = [
             exp for exp in expiries
             if self.days_to_expiry(exp) >= 3
         ]
         return valid_expiries[0] if valid_expiries else None
 
-    def _read_latest_watchlist(self, limit=20):
+    def _read_latest_watchlist(self, limit=WATCHLIST_MAX_SYMBOLS):
         try:
             conn = sqlite3.connect(DB_PATH)
             ensure_strategy_schema(conn.cursor())
@@ -2036,15 +2049,39 @@ class DiscountedPremiumScanner:
         for security_id, symbol in self.fno_stocks.items():
             try:
                 segment = self._strategy_segment(symbol)
-                expiry = self._latest_expiry(security_id, segment)
+                valid_expiries = [
+                    exp for exp in self.get_expiry_list(security_id, segment)
+                    if self.days_to_expiry(exp) >= 4
+                ]
+                expiry = valid_expiries[0] if valid_expiries else None
                 if not expiry:
                     logger.info("Watchlist rejected %s: no expiry", symbol)
                     continue
 
                 chain_response = self.get_option_chain(security_id, segment, expiry)
                 chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
+                spot_price = chain_data.get("last_price") if isinstance(chain_data, dict) else None
                 option_chain = chain_data.get("oc") if isinstance(chain_data, dict) else {}
                 avg_volume = self._extract_avg_option_volume(option_chain)
+                atm_context = self.extract_atm_reference_ivs(option_chain, spot_price) if spot_price is not None and isinstance(option_chain, dict) else {}
+                expiry_1_iv = atm_context.get("atm_iv")
+                expiry_2_iv = None
+                if len(valid_expiries) > 1:
+                    next_cache_key = (str(security_id), segment, valid_expiries[1])
+                    next_chain_response = self.runtime_state.setdefault("option_chain", {}).get(next_cache_key)
+                    next_chain_data = unwrap_dhan_payload((next_chain_response or {}).get("data") or {})
+                    next_option_chain = next_chain_data.get("oc") if isinstance(next_chain_data, dict) else {}
+                    next_spot_price = next_chain_data.get("last_price") if isinstance(next_chain_data, dict) else spot_price
+                    if next_spot_price is not None and isinstance(next_option_chain, dict) and next_option_chain:
+                        expiry_2_iv = self.extract_atm_reference_ivs(next_option_chain, next_spot_price).get("atm_iv")
+                event_flag = False
+                if expiry_1_iv and expiry_2_iv:
+                    if expiry_1_iv > expiry_2_iv * 1.3:
+                        event_flag = True
+
+                if event_flag:
+                    logger.info("Watchlist rejected %s: event risk detected via IV term structure", symbol)
+                    continue
 
                 historical_ivs = self.fetch_historical_iv(security_id, segment, lookback_days=20)
                 current_iv = historical_ivs[-1] if historical_ivs else None
@@ -2056,6 +2093,8 @@ class DiscountedPremiumScanner:
                     start_date.strftime("%Y-%m-%d"),
                     end_date.strftime("%Y-%m-%d"),
                 )
+                trend_ctx = self.determine_trend_context(price_df)
+                trend = trend_ctx.get("trend")
                 range_pct = self._five_day_price_range_pct(price_df)
 
                 if avg_volume <= WATCHLIST_MIN_AVG_VOLUME or iv_percentile is None or iv_percentile >= 40 or range_pct <= WATCHLIST_MIN_RANGE_PCT:
@@ -2076,27 +2115,31 @@ class DiscountedPremiumScanner:
                     "iv_percentile": native_number(iv_percentile),
                     "avg_volume": native_number(avg_volume),
                     "range_pct": native_number(range_pct),
+                    "trend": trend,
+                    "event_flag": event_flag,
                 })
             except Exception:
                 logger.exception("Watchlist evaluation failed for %s", symbol)
 
-        rows = sorted(rows, key=lambda item: item["score"], reverse=True)[:20]
+        rows = sorted(rows, key=lambda item: item["score"], reverse=True)[:WATCHLIST_MAX_SYMBOLS]
         self._persist_watchlist(rows)
         logger.info("Automated watchlist built with %s symbols", len(rows))
         return rows
 
     def run_warmup_cycle(self):
-        """Collect one 5-minute ATM intraday IV snapshot for each current watchlist symbol."""
-        watchlist = self._read_latest_watchlist(limit=20)
-        if not watchlist:
-            logger.info("Warmup skipped: watchlist is empty")
+        """
+        Collect one ATM intraday IV snapshot for every F&O stock.
+        Loops 0 to N over self.fno_stocks. Called continuously from
+        run_auto_loop with no sleep between calls during 9:15-9:50.
+        """
+        all_symbols = list(self.fno_stocks.items())
+        if not all_symbols:
+            logger.info("Warmup skipped: no F&O symbols available")
             return []
 
         snapshot_dt = self._floor_to_five_minutes()
         persisted = []
-        for row in watchlist:
-            symbol = row["symbol"]
-            security_id = row["security_id"]
+        for security_id, symbol in all_symbols:
             segment = self._strategy_segment(symbol)
             try:
                 expiry = self._latest_expiry(security_id, segment)
@@ -2124,11 +2167,230 @@ class DiscountedPremiumScanner:
                     data_type="intraday",
                     snapshot_dt=snapshot_dt,
                 )
+
+                _today_str = datetime.now().date().isoformat()
+                _already_stored_today = False
+                try:
+                    _iv_conn = sqlite3.connect(DB_PATH)
+                    _iv_cur = _iv_conn.execute(
+                        "SELECT 1 FROM iv_history WHERE security_id = ? AND data_type = 'daily' AND DATE(timestamp) = ? LIMIT 1",
+                        (str(security_id), _today_str),
+                    )
+                    _already_stored_today = _iv_cur.fetchone() is not None
+                except Exception:
+                    _already_stored_today = False
+                finally:
+                    try:
+                        _iv_conn.close()
+                    except Exception:
+                        pass
+
+                if not _already_stored_today:
+                    self.persist_iv_snapshot(
+                        security_id=security_id,
+                        exchange_segment=segment,
+                        security_name=symbol,
+                        expiry=expiry,
+                        spot_price=spot_price,
+                        atm_context=atm_context,
+                        chain_metrics=chain_metrics,
+                        store_intraday=False,
+                        data_type="daily",
+                    )
+
                 persisted.append(symbol)
-                logger.info("Warmup IV snapshot persisted for %s at %s", symbol, snapshot_dt)
+                logger.debug("Warmup IV snapshot persisted for %s at %s", symbol, snapshot_dt)
             except Exception:
                 logger.exception("Warmup cycle failed for %s", symbol)
+        logger.info("Warmup pass complete | persisted=%s / %s symbols", len(persisted), len(all_symbols))
         return persisted
+
+    def _score_warmup_stock(self, security_id):
+        """
+        Score a stock on intraday signals collected during warmup.
+        Returns a float score 0-100. Higher = better candidate for active scan.
+        Weights: IV slope 30%, PCR trend 25%, OI shift 25%, volume spike 20%.
+        """
+        score = 0.0
+
+        premarket_ctx = self.build_premarket_context(security_id)
+        if premarket_ctx is not None:
+            iv_trend = premarket_ctx.get("iv_trend")
+            if iv_trend is not None:
+                if iv_trend < -0.5:
+                    score += 30.0
+                elif iv_trend < 0:
+                    score += 20.0
+                elif iv_trend < 0.5:
+                    score += 10.0
+                else:
+                    score += 0.0
+
+        pcr = self.get_pcr_trend(security_id)
+        pcr_trend = pcr.get("trend")
+        if pcr_trend == "bullish":
+            score += 25.0
+        elif pcr_trend == "neutral":
+            score += 12.0
+        else:
+            score += 0.0
+
+        oi_shift = self.detect_oi_shift(security_id)
+        call_shift = oi_shift.get("call_shift")
+        put_shift = oi_shift.get("put_shift")
+        oi_shift_score = 0.0
+        if put_shift == "up":
+            oi_shift_score += 12.5
+        elif put_shift == "down":
+            oi_shift_score -= 6.0
+        if call_shift == "down":
+            oi_shift_score += 12.5
+        elif call_shift == "up":
+            oi_shift_score -= 6.0
+        score += max(0.0, oi_shift_score)
+
+        vol_spike = self.detect_volume_spike(security_id)
+        if vol_spike.get("spike"):
+            score += 20.0
+        else:
+            ratio = vol_spike.get("ratio")
+            if ratio is not None and ratio > 1.0:
+                score += min(10.0, (ratio - 1.0) * 10.0)
+
+        return round(min(score, 100.0), 2)
+
+    def run_morning_warmup_and_select(self):
+        """
+        Called once at 9:50 after continuous warmup passes.
+        Scores all F&O stocks on intraday signals collected during warmup.
+        Selects top WARMUP_MORNING_TOP_N stocks and saves them as the
+        active watchlist for the day. Sends a Telegram summary.
+        Also applies event filter if EVENT_FILTER_ENABLED is True.
+        """
+        all_symbols = list(self.fno_stocks.items())
+        if not all_symbols:
+            logger.info("Morning selection skipped: no F&O symbols available")
+            return []
+
+        scored_rows = []
+        for security_id, symbol in all_symbols:
+            try:
+                snapshots = self.get_intraday_snapshots(security_id, limit=12)
+                if snapshots.empty:
+                    logger.debug("Morning selection skipped %s: no intraday snapshots", symbol)
+                    continue
+
+                if EVENT_FILTER_ENABLED:
+                    segment = self._strategy_segment(symbol)
+                    expiries = self.runtime_state.get("segment_expiries", {}).get(segment) or []
+                    expiry_1_iv = None
+                    expiry_2_iv = None
+                    if len(expiries) >= 1:
+                        cache_key_1 = (str(security_id), segment, expiries[0])
+                        chain_1 = self.runtime_state.get("option_chain", {}).get(cache_key_1)
+                        if chain_1:
+                            chain_data_1 = unwrap_dhan_payload(chain_1.get("data") or {})
+                            spot_1 = chain_data_1.get("last_price")
+                            oc_1 = chain_data_1.get("oc")
+                            if spot_1 and isinstance(oc_1, dict) and oc_1:
+                                expiry_1_iv = self.extract_atm_reference_ivs(oc_1, spot_1).get("atm_iv")
+                    if len(expiries) >= 2:
+                        cache_key_2 = (str(security_id), segment, expiries[1])
+                        chain_2 = self.runtime_state.get("option_chain", {}).get(cache_key_2)
+                        if chain_2:
+                            chain_data_2 = unwrap_dhan_payload(chain_2.get("data") or {})
+                            spot_2 = chain_data_2.get("last_price")
+                            oc_2 = chain_data_2.get("oc")
+                            if spot_2 and isinstance(oc_2, dict) and oc_2:
+                                expiry_2_iv = self.extract_atm_reference_ivs(oc_2, spot_2).get("atm_iv")
+                    if expiry_1_iv and expiry_2_iv and expiry_1_iv > expiry_2_iv * 1.3:
+                        logger.info("Morning selection rejected %s: event risk detected", symbol)
+                        continue
+
+                warmup_score = self._score_warmup_stock(security_id)
+                premarket_ctx = self.build_premarket_context(security_id) or {}
+                pcr = self.get_pcr_trend(security_id)
+                oi_shift = self.detect_oi_shift(security_id)
+                vol_spike = self.detect_volume_spike(security_id)
+
+                scored_rows.append({
+                    "symbol": symbol,
+                    "security_id": str(security_id),
+                    "score": warmup_score,
+                    "iv_trend": native_number(premarket_ctx.get("iv_trend")),
+                    "iv_change": native_number(premarket_ctx.get("iv_change")),
+                    "pcr_trend": pcr.get("trend", "neutral"),
+                    "current_pcr": native_number(pcr.get("current_pcr")),
+                    "call_shift": oi_shift.get("call_shift", "same"),
+                    "put_shift": oi_shift.get("put_shift", "same"),
+                    "volume_spike": bool(vol_spike.get("spike")),
+                    "volume_ratio": native_number(vol_spike.get("ratio")),
+                })
+            except Exception:
+                logger.exception("Morning selection scoring failed for %s", symbol)
+
+        scored_rows = sorted(scored_rows, key=lambda item: item["score"], reverse=True)
+        top_rows = scored_rows[:WARMUP_MORNING_TOP_N]
+
+        self._persist_watchlist(top_rows)
+        logger.info(
+            "Morning selection complete | scored=%s | selected=%s",
+            len(scored_rows),
+            len(top_rows),
+        )
+
+        self._send_morning_selection_telegram(top_rows)
+        return top_rows
+
+    def _send_morning_selection_telegram(self, rows):
+        """Send Telegram alert with top stocks selected at 9:50 after warmup."""
+        if not self.telegram_bot_token or not self.telegram_chat_id:
+            logger.info("Morning selection Telegram alert skipped: credentials missing")
+            return
+
+        if not rows:
+            message = "Morning Scan 9:50\n\nNo stocks qualified for active scan today."
+        else:
+            lines = ["Morning Scan 9:50 — Active Watchlist", ""]
+            for i, row in enumerate(rows[:40], start=1):
+                symbol = row.get("symbol", "")
+                score = row.get("score", 0)
+                iv_trend = row.get("iv_trend")
+                pcr_trend = row.get("pcr_trend", "neutral")
+                call_shift = row.get("call_shift", "same")
+                put_shift = row.get("put_shift", "same")
+                vol_spike = row.get("volume_spike", False)
+
+                iv_label = "IV-" if iv_trend is not None and iv_trend < 0 else "IV+" if iv_trend is not None and iv_trend > 0 else "IV~"
+                pcr_label = "PCR+" if pcr_trend == "bullish" else "PCR-" if pcr_trend == "bearish" else "PCR~"
+                oi_label = f"OI call={call_shift} put={put_shift}"
+                vol_label = "VOL-SPIKE" if vol_spike else ""
+
+                signal_parts = [iv_label, pcr_label, oi_label]
+                if vol_label:
+                    signal_parts.append(vol_label)
+                signal_str = " | ".join(signal_parts)
+
+                lines.append(f"{i}. {symbol} | Score:{int(score)} | {signal_str}")
+
+            message = "\n".join(lines)
+            if len(message) > 3800:
+                message = message[:3800] + "\n...truncated"
+
+        try:
+            chunks = split_message(message)
+            for chunk in chunks:
+                response = requests.post(
+                    f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage",
+                    json={"chat_id": self.telegram_chat_id, "text": chunk},
+                    timeout=15,
+                )
+                if not response.ok:
+                    logger.error("Morning selection Telegram rejected: %s", response.text)
+                response.raise_for_status()
+            logger.info("Morning selection Telegram alert sent | stocks=%s", len(rows))
+        except Exception:
+            logger.exception("Failed to send morning selection Telegram alert")
 
     def fetch_intraday_prices(self, security_id, exchange_segment, minutes=120):
         """Fetch recent 5-minute underlying candles, falling back to IV spot snapshots."""
@@ -2661,7 +2923,7 @@ class DiscountedPremiumScanner:
 
     def run_active_scanner(self):
         """Run one active 5-minute automated scan and execute up to three trades."""
-        watchlist = self._read_latest_watchlist(limit=20)
+        watchlist = self._read_latest_watchlist(limit=WATCHLIST_MAX_SYMBOLS)
         if not watchlist:
             logger.info("Active scanner skipped: watchlist is empty")
             return []
@@ -3101,6 +3363,7 @@ class DiscountedPremiumScanner:
         market_direction = market_signal.get("direction", "neutral")
         market_components = market_signal.get("components") or {}
         buildup = market_components.get("buildup") or {}
+        event_flag = bool(market_components.get("event_flag") or (atm_context or {}).get("event_flag"))
         pcr_signal = market_components.get("pcr_trend") or {}
         oi_shift = market_components.get("oi_shift") or {}
         volume_spike = market_components.get("volume_spike") or {}
@@ -3465,7 +3728,22 @@ class DiscountedPremiumScanner:
             if market_strength == "STRONG_BEARISH" and option_label == "PUT":
                 score_adjustment += 6.0
 
-            score = round(clip_score(score + score_adjustment, floor=0.0, ceiling=95.0), 2)
+            if trend == "bullish" and option_type == "ce":
+                score_adjustment += 5.0
+            elif trend == "bearish" and option_type == "pe":
+                score_adjustment += 5.0
+            elif trend != "neutral":
+                score_adjustment -= 3.0
+
+            if event_flag:
+                score_adjustment -= 8.0
+
+            if trend == "bullish" and buildup.get("type") in ["LONG_BUILDUP", "SHORT_COVERING"]:
+                score_adjustment += 6.0
+            elif trend == "bearish" and buildup.get("type") in ["SHORT_BUILDUP", "LONG_UNWINDING"]:
+                score_adjustment += 6.0
+
+            score = round(max(0.0, min(score + score_adjustment, 100.0)), 2)
             score_breakdown = {
                 "base": native_number(round(base_discount_score, 2)),
                 "context": native_number(round(context_adjustment, 2)),
@@ -3645,6 +3923,7 @@ class DiscountedPremiumScanner:
                 "oi_shift_put": oi_shift.get("put_shift", "same"),
                 "volume_spike": bool(volume_spike.get("spike")),
                 "volume_spike_ratio": native_number(volume_spike.get("ratio")),
+                "event_flag": event_flag,
                 "market_direction": market_direction,
                 "market_strength": market_strength,
                 "market_confidence": native_number(market_signal.get("confidence")),
@@ -4026,7 +4305,7 @@ class DiscountedPremiumScanner:
                     if self.days_to_expiry(exp) >= 3
                 ]
                 if not expiries:
-                    logger.warning("No expiries with DTE >= 3 found for %s (%s)", sec_name, segment)
+                    logger.warning("No expiries with DTE >= 5 found for %s (%s)", sec_name, segment)
                     continue
 
                 for current_expiry in expiries:
