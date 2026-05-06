@@ -18,26 +18,9 @@ class TokenManager:
         self.pin = Config.DHAN_PIN
         self.totp_secret = Config.DHAN_TOTP_SECRET
         
-    def get_valid_token(self):
+    def get_valid_token(self, force_refresh=False):
         """Get valid token - either from file or generate new one"""
-        
-        # Try to load existing token
-        token_data = self._load_token()
-        
-        if token_data and self._is_token_valid(token_data):
-            logger.info("Using existing valid token")
-            # Check different possible key names
-            if 'accessToken' in token_data:
-                return token_data['accessToken']
-            elif 'access_token' in token_data:
-                return token_data['access_token']
-            else:
-                logger.error("No access token key found in saved data")
-                return self._generate_new_token()
-        
-        # Generate new token
-        logger.info("Generating new access token...")
-        return self._generate_new_token()
+        return self.refresh_if_needed(force_refresh=force_refresh)
     
     def _load_token(self):
         """Load token from file if exists"""
@@ -67,20 +50,22 @@ class TokenManager:
         except Exception as e:
             logger.error(f"Error saving token: {e}")
     
-    def _is_token_valid(self, token_data):
+    def _is_token_valid(self, token_data, min_remaining_seconds=300):
         """Check if token is still valid"""
         if not token_data or 'expires_at' not in token_data:
             return False
-        
-        # Check if token expires at midnight
+        if 'accessToken' not in token_data and 'access_token' not in token_data:
+            logger.info("Saved token data missing access token")
+            return False
+
         expires_at = datetime.fromtimestamp(token_data['expires_at'])
         now = datetime.now()
-        
-        # Token is valid if not expired and not within 5 minutes of expiry
-        if now < expires_at and (expires_at - now).seconds > 300:
+        remaining = (expires_at - now).total_seconds()
+
+        if now < expires_at and remaining > min_remaining_seconds:
             return True
-        
-        logger.info("Token expired or expiring soon")
+
+        logger.info("Token expired or expiring soon (%s seconds remaining)", int(remaining))
         return False
     
     def _generate_new_token(self):
@@ -124,19 +109,39 @@ class TokenManager:
             logger.error(f"Failed to generate token: {e}")
             raise
     
-    def refresh_if_needed(self):
-        """Force refresh if token is near expiry"""
+    def refresh_if_needed(self, force_refresh=False):
+        """Force refresh if token is near expiry or refresh is explicitly requested"""
         token_data = self._load_token()
-        if not token_data or not self._is_token_valid(token_data):
-            logger.info("No reusable token found for scheduled run; generating a new token")
-            return self._generate_new_token()
-        
-        if 'accessToken' in token_data:
+
+        if token_data and self._is_token_valid(token_data):
             logger.info("Reusing saved token for scheduled run")
-            return token_data['accessToken']
-        elif 'access_token' in token_data:
-            logger.info("Reusing saved token for scheduled run")
-            return token_data['access_token']
-        else:
-            logger.info("Saved token file is missing token value; generating a new token")
+            return token_data.get('accessToken') or token_data.get('access_token')
+
+        if force_refresh:
+            logger.info("Forced token refresh requested")
+            try:
+                return self._generate_new_token()
+            except Exception as exc:
+                logger.warning(
+                    "Forced token refresh failed; falling back to existing token if still valid: %s",
+                    exc,
+                )
+                if token_data and self._is_token_valid(token_data, min_remaining_seconds=10):
+                    return token_data.get('accessToken') or token_data.get('access_token')
+                raise
+
+        if token_data and self._is_token_valid(token_data, min_remaining_seconds=10):
+            logger.info("Using saved token even though it is expiring soon")
+            return token_data.get('accessToken') or token_data.get('access_token')
+
+        logger.info("No reusable token found for scheduled run; generating a new token")
+        try:
             return self._generate_new_token()
+        except Exception as exc:
+            logger.warning(
+                "Token generation failed; using existing saved token if still valid: %s",
+                exc,
+            )
+            if token_data and self._is_token_valid(token_data, min_remaining_seconds=10):
+                return token_data.get('accessToken') or token_data.get('access_token')
+            raise
