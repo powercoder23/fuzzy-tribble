@@ -441,9 +441,7 @@ class DiscountedPremiumScanner:
             try:
                 response = self.rate_limited_call(operation_name, fetcher)
                 if validator and not validator(response):
-                    if isinstance(response, dict) and "data" in response:
-                        return response
-                    raise ValueError(f"{operation_name} returned invalid data")
+                    raise ValueError(f"{operation_name} returned invalid data: {response}")
                 return response
             except Exception as exc:
                 last_error = exc
@@ -626,7 +624,11 @@ class DiscountedPremiumScanner:
             )
 
         def validator(response):
-            return isinstance(response, dict) and "data" in response
+            return (
+                isinstance(response, dict)
+                and response.get("status") == "success"
+                and "data" in response
+            )
 
         try:
             response = self.get_cached_or_fetch(
@@ -667,7 +669,11 @@ class DiscountedPremiumScanner:
                     under_exchange_segment=underlying_segment,
                     expiry=expiry,
                 ),
-                validator=lambda item: isinstance(item, dict) and "data" in item,
+                validator=lambda item: (
+                    isinstance(item, dict)
+                    and item.get("status") == "success"
+                    and "data" in item
+                ),
                 max_attempts=max(1, int(retry)),
             )
             cache[cache_key] = response
@@ -749,7 +755,11 @@ class DiscountedPremiumScanner:
             return sorted(set(expiries))
 
         def validator(response):
-            return isinstance(response, dict) and "data" in response
+            return (
+                isinstance(response, dict)
+                and response.get("status") == "success"
+                and "data" in response
+            )
 
         diagnostics = self.runtime_state.setdefault("expiry_diagnostics", {
             "validated_symbols": set(),
