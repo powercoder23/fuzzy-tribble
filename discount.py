@@ -435,12 +435,16 @@ class DiscountedPremiumScanner:
         logger.debug("API call completed for %s", operation_name)
         return response
 
-    def fetch_with_retry(self, operation_name, fetcher, validator=None, max_attempts=5):
+    def fetch_with_retry(self, operation_name, fetcher, validator=None, max_attempts=5, retry_on_invalid=True):
         last_error = None
         for attempt in range(max_attempts):
             try:
                 response = self.rate_limited_call(operation_name, fetcher)
                 if validator and not validator(response):
+                    if isinstance(response, dict) and response.get("status") == "failure":
+                        raise RuntimeError(f"{operation_name} returned failure status: {response}")
+                    if not retry_on_invalid:
+                        raise ValueError(f"{operation_name} returned invalid data: {response}")
                     raise ValueError(f"{operation_name} returned invalid data: {response}")
                 return response
             except Exception as exc:
@@ -462,14 +466,19 @@ class DiscountedPremiumScanner:
     def get_previous_state_store(self):
         return self.runtime_state.setdefault("previous_state", {})
 
-    def get_cached_or_fetch(self, cache, key, fetcher, cache_label, validator=None):
+    def get_cached_or_fetch(self, cache, key, fetcher, cache_label, validator=None, retry_on_invalid=True):
         if key in cache:
             self.runtime_state["metrics"]["cache_hits"] += 1
             logger.info("Cache hit for %s", cache_label)
             return cache[key]
 
         logger.info("Cache miss for %s; calling API", cache_label)
-        value = self.fetch_with_retry(cache_label, fetcher, validator=validator)
+        value = self.fetch_with_retry(
+            cache_label,
+            fetcher,
+            validator=validator,
+            retry_on_invalid=retry_on_invalid,
+        )
         cache[key] = value
         return value
 
@@ -790,6 +799,7 @@ class DiscountedPremiumScanner:
                 fetcher,
                 cache_label,
                 validator=validator,
+                retry_on_invalid=False,
             )
         except Exception:
             logger.exception(

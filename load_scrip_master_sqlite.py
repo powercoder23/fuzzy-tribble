@@ -264,8 +264,8 @@ def update_scrip_master():
             print("Scrip master already updated today. Skipping download.")
             return
 
-    # If not updated today → update now
-    df = load_scrip_master()
+    # If not updated today → download a fresh copy and update the DB.
+    df = download_scrip_master()
     save_to_sqlite(df)
 
     with open(LAST_UPDATED_FILE, "w") as f:
