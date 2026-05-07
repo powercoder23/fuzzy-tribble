@@ -631,12 +631,14 @@ class DiscountedPremiumScanner:
                 headers={
                     "access-token": self.access_token,
                     "client-id": self.client_id,
-                    "Content-Type": "application/json",
+                    "Content-type": "application/json",
+                    "Accept": "application/json",
                 },
                 json={
                     "UnderlyingScrip": underlying_security_id,
                     "UnderlyingSeg": underlying_segment,
                     "Expiry": expiry,
+                    "dhanClientId": self.client_id,
                 },
                 timeout=10,
             )
@@ -688,12 +690,14 @@ class DiscountedPremiumScanner:
                     headers={
                         "access-token": self.access_token,
                         "client-id": self.client_id,
-                        "Content-Type": "application/json",
+                        "Content-type": "application/json",
+                        "Accept": "application/json",
                     },
                     json={
                         "UnderlyingScrip": underlying_security_id,
                         "UnderlyingSeg": underlying_segment,
                         "Expiry": expiry,
+                        "dhanClientId": self.client_id,
                     },
                     timeout=10,
                 ).json(),
@@ -744,11 +748,13 @@ class DiscountedPremiumScanner:
                 headers={
                     "access-token": self.access_token,
                     "client-id": self.client_id,
-                    "Content-Type": "application/json",
+                    "Content-type": "application/json",
+                    "Accept": "application/json",
                 },
                 json={
                     "UnderlyingScrip": underlying_security_id,
                     "UnderlyingSeg": underlying_segment,
+                    "dhanClientId": self.client_id,
                 },
                 timeout=10,
             )
