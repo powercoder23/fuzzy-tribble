@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import time
 from scipy import stats
 import warnings
+from config import Config
 from f_o_stocks_list import get_stock_futures
 from load_scrip_master_sqlite import update_scrip_master, get_security_id_symbol_map
 warnings.filterwarnings('ignore')
@@ -381,106 +382,31 @@ class DiscountedPremiumScanner:
 
     def _ensure_runtime_state(self):
         today = datetime.now().date().isoformat()
+
         if DiscountedPremiumScanner._shared_runtime_state is None:
             DiscountedPremiumScanner._shared_runtime_state = {
                 "cache_day": today,
-                "fno_symbols": None,
-                "fno_symbols_day": None,
-                "expiries": {},
-                "segment_expiries": {},
-                "option_chain": {},
-                "option_chain_ts": {},
                 "last_symbol_trade_ts": {},
                 "last_trigger_trade_ts": {},
                 "metrics": {
                     "total_calls": 0,
-                    "cache_hits": 0,
                     "failures": 0,
                     "iv_snapshots": 0,
                 },
-                "last_api_call_ts": 0.0,
                 "previous_state": {},
             }
 
-        state = DiscountedPremiumScanner._shared_runtime_state
-        if state.get("cache_day") != today:
-            state["cache_day"] = today
-            state["fno_symbols"] = None
-            state["fno_symbols_day"] = None
-            state["expiries"] = {}
-            state["segment_expiries"] = {}
-            state["option_chain"] = {}
-            state["option_chain_ts"] = {}
-            state["last_symbol_trade_ts"] = {}
-            state["last_trigger_trade_ts"] = {}
-            state["metrics"] = {
-                "total_calls": 0,
-                "cache_hits": 0,
-                "failures": 0,
-                "iv_snapshots": 0,
-            }
-            state["last_api_call_ts"] = 0.0
-            state["previous_state"] = {}
-            logger.info("Reset scanner runtime caches for %s", today)
-        return state
+        return DiscountedPremiumScanner._shared_runtime_state
 
-    def rate_limited_call(self, operation_name, func, *args, **kwargs):
-        min_interval = 3.0  # API docs: one unique request every 3 seconds
-        elapsed = time.monotonic() - self.runtime_state["last_api_call_ts"]
-        if elapsed < min_interval:
-            time.sleep(min_interval - elapsed)
-        response = func(*args, **kwargs)
-        self.runtime_state["last_api_call_ts"] = time.monotonic()
-        self.runtime_state["metrics"]["total_calls"] += 1
-        logger.debug("API call completed for %s", operation_name)
-        return response
-
-    def fetch_with_retry(self, operation_name, fetcher, validator=None, max_attempts=5, retry_on_invalid=True):
-        last_error = None
-        for attempt in range(max_attempts):
-            try:
-                response = self.rate_limited_call(operation_name, fetcher)
-                if validator and not validator(response):
-                    if isinstance(response, dict) and response.get("status") == "failure":
-                        raise RuntimeError(f"{operation_name} returned failure status: {response}")
-                    if not retry_on_invalid:
-                        raise ValueError(f"{operation_name} returned invalid data: {response}")
-                    raise ValueError(f"{operation_name} returned invalid data: {response}")
-                return response
-            except Exception as exc:
-                last_error = exc
-                self.runtime_state["metrics"]["failures"] += 1
-                if attempt < max_attempts - 1:
-                    backoff = 2 ** attempt
-                    logger.warning(
-                        "Retry %s for %s after error: %s",
-                        attempt + 1,
-                        operation_name,
-                        exc,
-                    )
-                    time.sleep(backoff)
-                else:
-                    logger.warning("Exhausted retries for %s: %s", operation_name, exc)
-        raise RuntimeError(f"{operation_name} failed after {max_attempts} attempts") from last_error
+    def _dhan_headers(self):
+        return {
+            "Content-Type": "application/json",
+            "access-token": self.access_token,
+            "client-id": Config.DHAN_CLIENT_ID,
+        }
 
     def get_previous_state_store(self):
         return self.runtime_state.setdefault("previous_state", {})
-
-    def get_cached_or_fetch(self, cache, key, fetcher, cache_label, validator=None, retry_on_invalid=True):
-        if key in cache:
-            self.runtime_state["metrics"]["cache_hits"] += 1
-            logger.info("Cache hit for %s", cache_label)
-            return cache[key]
-
-        logger.info("Cache miss for %s; calling API", cache_label)
-        value = self.fetch_with_retry(
-            cache_label,
-            fetcher,
-            validator=validator,
-            retry_on_invalid=retry_on_invalid,
-        )
-        cache[key] = value
-        return value
 
     def get_warmup_metrics(self):
         return dict(self.runtime_state["metrics"])
@@ -493,19 +419,12 @@ class DiscountedPremiumScanner:
         1. NSE's live stock-futures symbols
         2. Dhan scrip-master security-id resolution
         """
-        if (
-            self.runtime_state.get("fno_symbols") is not None
-            and self.runtime_state.get("fno_symbols_day") == self.runtime_state.get("cache_day")
-        ):
-            self.runtime_state["metrics"]["cache_hits"] += 1
-            logger.info("Cache hit for F&O universe")
-            return dict(self.runtime_state["fno_symbols"])
+        resolved = {}
 
         reserved_indices = {
             13: "NIFTY",
             14: "BANKNIFTY",
         }
-        resolved = {}
 
         try:
             update_scrip_master()
@@ -539,8 +458,6 @@ class DiscountedPremiumScanner:
         }
         resolved.update(fallback_missing)
         ordered = dict(sorted(resolved.items(), key=lambda item: item[1]))
-        self.runtime_state["fno_symbols"] = ordered
-        self.runtime_state["fno_symbols_day"] = self.runtime_state["cache_day"]
         return dict(ordered)
 
     def send_clean_telegram(self, df):
@@ -609,349 +526,129 @@ class DiscountedPremiumScanner:
     def send_telegram_summary(self, opportunities_df):
         """Backward-compatible wrapper for the clean Telegram sender."""
         self.send_clean_telegram(opportunities_df)
-    
+
     def get_option_chain(self, underlying_security_id, underlying_segment, expiry):
         """
         Fetch real-time option chain for a specific expiry
-        
-        Args:
-            underlying_security_id: Security ID (e.g., 13 for NIFTY)
-            underlying_segment: "IDX_I" for indices, "NSE_FNO" for stocks
-            expiry: Expiry date in "YYYY-MM-DD" format
-        
-        Returns:
-            dict: Option chain data
         """
-        cache_key = (str(underlying_security_id), underlying_segment, expiry)
-        cache_label = f"{underlying_security_id} option chain {expiry}"
 
-        def fetcher():
+        try:
             response = requests.post(
                 "https://api.dhan.co/v2/optionchain",
-                headers={
-                    "access-token": self.access_token,
-                    "client-id": self.client_id,
-                    "Content-type": "application/json",
-                    "Accept": "application/json",
-                },
+                headers=self._dhan_headers(),
                 json={
-                    "UnderlyingScrip": underlying_security_id,
-                    "UnderlyingSeg": underlying_segment,
+                    "UnderlyingScrip": int(underlying_security_id),
+                    "UnderlyingSeg": "NSE_FNO",
                     "Expiry": expiry,
-                    "dhanClientId": self.client_id,
                 },
                 timeout=10,
             )
-            return response.json()
 
-        def validator(response):
-            return (
-                isinstance(response, dict)
-                and response.get("status") == "success"
-                and "data" in response
-            )
+            data = response.json()
 
-        try:
-            response = self.get_cached_or_fetch(
-                self.runtime_state["option_chain"],
-                cache_key,
-                fetcher,
-                cache_label,
-                validator=validator,
-            )
-            self.runtime_state.setdefault("option_chain_ts", {}).setdefault(cache_key, time.monotonic())
-            return response
-        except Exception:
-            logger.exception(
-                "Failed to fetch option chain for %s (%s), expiry %s",
+            logger.info(
+                "OPTION CHAIN API | id=%s | expiry=%s | status=%s",
                 underlying_security_id,
-                underlying_segment,
                 expiry,
+                data.get("status"),
             )
+
+            if (
+                isinstance(data, dict)
+                and data.get("status") == "success"
+                and isinstance(data.get("data"), dict)
+            ):
+                return data
+
+            logger.warning(
+                "Invalid option chain response | id=%s | expiry=%s | response=%s",
+                underlying_security_id,
+                expiry,
+                str(data)[:500],
+            )
+
             return {"status": "failure", "data": {}}
 
-    def get_option_chain_active(self, underlying_security_id, underlying_segment, expiry, retry=2, cache_ttl_seconds=300):
-        """
-        Fetch a fresh option chain for the active scanner, falling back to a recent cached chain.
-        Dhan's SDK does not expose per-call timeout consistently, so retry and cache age are enforced here.
-        """
-        cache_key = (str(underlying_security_id), underlying_segment, expiry)
-        cache = self.runtime_state.setdefault("option_chain", {})
-        cache_ts = self.runtime_state.setdefault("option_chain_ts", {})
-        previous_cached = cache.get(cache_key)
-        previous_ts = cache_ts.get(cache_key)
-
-        cache.pop(cache_key, None)
-        try:
-            response = self.fetch_with_retry(
-                f"{underlying_security_id} active option chain {expiry}",
-                lambda: requests.post(
-                    "https://api.dhan.co/v2/optionchain",
-                    headers={
-                        "access-token": self.access_token,
-                        "client-id": self.client_id,
-                        "Content-type": "application/json",
-                        "Accept": "application/json",
-                    },
-                    json={
-                        "UnderlyingScrip": underlying_security_id,
-                        "UnderlyingSeg": underlying_segment,
-                        "Expiry": expiry,
-                        "dhanClientId": self.client_id,
-                    },
-                    timeout=10,
-                ).json(),
-                validator=lambda item: (
-                    isinstance(item, dict)
-                    and item.get("status") == "success"
-                    and "data" in item
-                ),
-                max_attempts=max(1, int(retry)),
+        except Exception as e:
+            logger.error(
+                "Option chain fetch failed | id=%s | expiry=%s | error=%s",
+                underlying_security_id,
+                expiry,
+                str(e),
             )
-            cache[cache_key] = response
-            cache_ts[cache_key] = time.monotonic()
-            return response
-        except Exception as exc:
-            if previous_cached is not None and previous_ts is not None and (time.monotonic() - previous_ts) <= cache_ttl_seconds:
-                self.runtime_state["metrics"]["cache_hits"] += 1
-                logger.warning(
-                    "Using cached option chain for %s after active fetch failure: %s",
-                    underlying_security_id,
-                    exc,
-                )
-                cache[cache_key] = previous_cached
-                return previous_cached
-            logger.warning("No usable cached chain for %s after active fetch failure: %s", underlying_security_id, exc)
+
             return {"status": "failure", "data": {}}
     
+    def get_option_chain_active(
+        self,
+        underlying_security_id,
+        underlying_segment,
+        expiry,
+        retry=2,
+        cache_ttl_seconds=300
+    ):
+        """
+        Active scanner wrapper
+        """
+        return self.get_option_chain(
+            underlying_security_id,
+            underlying_segment,
+            expiry,
+        )
+    def get_expiry_segment(self, security_id, symbol=None):
+        index_ids = {13, 14, 25}
+
+        if int(security_id) in index_ids:
+            return "IDX_I"
+
+        return "NSE_EQ"
     def get_expiry_list(self, underlying_security_id, underlying_segment):
-        """
-        Get all available expiries for an underlying
-        
-        Args:
-            underlying_security_id: Security ID
-            underlying_segment: "IDX_I" or "NSE_FNO"
-        
-        Returns:
-            list: List of expiry dates
-        """
-        cache_key = (str(underlying_security_id), underlying_segment)
-        cache_label = f"{underlying_security_id} expiry list"
 
-        def short_response(value, limit=500):
-            text = str(value)
-            return text[:limit] + "...truncated" if len(text) > limit else text
-
-        def fetcher():
+        try:
             response = requests.post(
                 "https://api.dhan.co/v2/optionchain/expirylist",
-                headers={
-                    "access-token": self.access_token,
-                    "client-id": self.client_id,
-                    "Content-type": "application/json",
-                    "Accept": "application/json",
-                },
+                headers=self._dhan_headers(),
                 json={
-                    "UnderlyingScrip": underlying_security_id,
+                    "UnderlyingScrip": int(underlying_security_id),
                     "UnderlyingSeg": underlying_segment,
-                    "dhanClientId": self.client_id,
                 },
                 timeout=10,
             )
-            return response.json()
 
-        def parse_expiries(response):
-            raw_data = response.get("data", [])
+            data = response.json()
+
+            logger.info(
+                "EXPIRY API | id=%s | seg=%s | response=%s",
+                underlying_security_id,
+                underlying_segment,
+                str(data)[:500]
+            )
+
+            if data.get("status") != "success":
+                return []
+
+            raw = data.get("data", {})
+
+            if isinstance(raw, dict):
+                raw = raw.get("data", [])
+
             expiries = []
 
-            if isinstance(raw_data, list):
-                for item in raw_data:
-                    normalized = normalize_expiry_value(item)
-                    if normalized:
-                        expiries.append(normalized)
-                    elif isinstance(item, dict):
-                        for value in item.values():
-                            normalized = normalize_expiry_value(value)
-                            if normalized:
-                                expiries.append(normalized)
-                                break
-            elif isinstance(raw_data, dict):
-                for key in ("data", "expiryList", "expiries", "results", "result"):
-                    value = raw_data.get(key)
-                    if isinstance(value, list):
-                        for item in value:
-                            normalized = normalize_expiry_value(item)
-                            if normalized:
-                                expiries.append(normalized)
-                            elif isinstance(item, dict):
-                                for nested_value in item.values():
-                                    normalized = normalize_expiry_value(nested_value)
-                                    if normalized:
-                                        expiries.append(normalized)
-                                        break
-                        break
-                if not expiries:
-                    for value in raw_data.values():
-                        normalized = normalize_expiry_value(value)
-                        if normalized:
-                            expiries.append(normalized)
+            for item in raw:
+                normalized = normalize_expiry_value(item)
+                if normalized:
+                    expiries.append(normalized)
 
             return sorted(set(expiries))
 
-        def validator(response):
-            return (
-                isinstance(response, dict)
-                and response.get("status") == "success"
-                and "data" in response
-            )
-
-        diagnostics = self.runtime_state.setdefault("expiry_diagnostics", {
-            "validated_symbols": set(),
-            "manual_test_done": False,
-            "segment_checks": set(),
-        })
-        if not diagnostics.get("manual_test_done"):
-            diagnostics["manual_test_done"] = True
-            try:
-                manual_response = self.dhan.expiry_list(
-                    under_security_id=13,
-                    under_exchange_segment="IDX_I",
-                )
-                logger.info("EXPIRY MANUAL TEST | security_id=13 | segment=IDX_I | response=%s", short_response(manual_response))
-            except Exception:
-                logger.exception("EXPIRY MANUAL TEST failed | security_id=13 | segment=IDX_I")
-
-        expiry_cache = self.runtime_state["expiries"]
-        cached_before = expiry_cache.get(cache_key)
-        if cache_key in expiry_cache:
-            logger.info("EXPIRY CACHE HIT | security_id=%s | segment=%s", underlying_security_id, underlying_segment)
-            logger.info("CACHE VALUE: %s", short_response(cached_before))
-
-        try:
-            response = self.get_cached_or_fetch(
-                expiry_cache,
-                cache_key,
-                fetcher,
-                cache_label,
-                validator=validator,
-                retry_on_invalid=False,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to fetch expiries for %s (%s)",
+        except Exception as e:
+            logger.error(
+                "Expiry fetch failed | id=%s | seg=%s | error=%s",
                 underlying_security_id,
                 underlying_segment,
+                str(e)
             )
             return []
-
-        logger.info(
-            "EXPIRY RAW RESPONSE | security_id=%s | segment=%s | response=%s",
-            underlying_security_id,
-            underlying_segment,
-            short_response(response),
-        )
-        if not isinstance(response, dict):
-            logger.warning(
-                "EXPIRY INVALID RESPONSE TYPE | security_id=%s | segment=%s | type=%s",
-                underlying_security_id,
-                underlying_segment,
-                type(response).__name__,
-            )
-        elif response.get("status") != "success":
-            logger.warning(
-                "EXPIRY API STATUS NOT SUCCESS | security_id=%s | segment=%s | status=%s | response=%s",
-                underlying_security_id,
-                underlying_segment,
-                response.get("status"),
-                short_response(response),
-            )
-        raw_data = response.get("data") if isinstance(response, dict) else None
-        if raw_data is None or raw_data == "" or raw_data == [] or raw_data == {}:
-            logger.warning(
-                "EXPIRY API DATA EMPTY | security_id=%s | segment=%s | data=%s",
-                underlying_security_id,
-                underlying_segment,
-                short_response(raw_data),
-            )
-
-        validation_key = (str(underlying_security_id), underlying_segment)
-        if len(diagnostics["validated_symbols"]) < 5 and validation_key not in diagnostics["validated_symbols"]:
-            diagnostics["validated_symbols"].add(validation_key)
-            try:
-                fresh_response = fetcher()
-                logger.info(
-                    "EXPIRY FRESH VALIDATION | security_id=%s | segment=%s | fresh_response=%s",
-                    underlying_security_id,
-                    underlying_segment,
-                    short_response(fresh_response),
-                )
-                compare_value = cached_before if cached_before is not None else response
-                if str(compare_value) != str(fresh_response):
-                    logger.warning(
-                        "EXPIRY CACHE/FRESH MISMATCH | security_id=%s | segment=%s | cached_or_returned=%s | fresh=%s",
-                        underlying_security_id,
-                        underlying_segment,
-                        short_response(compare_value),
-                        short_response(fresh_response),
-                    )
-            except Exception:
-                logger.exception(
-                    "EXPIRY FRESH VALIDATION failed | security_id=%s | segment=%s",
-                    underlying_security_id,
-                    underlying_segment,
-                )
-
-        if underlying_segment == "NSE_FNO":
-            logger.info("EXPIRY SEGMENT CHECK | security_id=%s requested with NSE_FNO", underlying_security_id)
-            segment_key = str(underlying_security_id)
-            if segment_key not in diagnostics["segment_checks"]:
-                diagnostics["segment_checks"].add(segment_key)
-                for alternate_segment in ("NSE_EQ", "IDX_I"):
-                    try:
-                        alternate_response = self.dhan.expiry_list(
-                            under_security_id=underlying_security_id,
-                            under_exchange_segment=alternate_segment,
-                        )
-                        alternate_expiries = parse_expiries(alternate_response) if isinstance(alternate_response, dict) else []
-                        logger.info(
-                            "EXPIRY SEGMENT PROBE | security_id=%s | segment=%s | parsed_len=%s | response=%s",
-                            underlying_security_id,
-                            alternate_segment,
-                            len(alternate_expiries),
-                            short_response(alternate_response),
-                        )
-                    except Exception:
-                        logger.exception(
-                            "EXPIRY SEGMENT PROBE failed | security_id=%s | segment=%s",
-                            underlying_security_id,
-                            alternate_segment,
-                        )
-
-        expiries = parse_expiries(response)
-        logger.info(
-            "EXPIRY PARSED | security_id=%s | segment=%s | count=%s | expiries=%s",
-            underlying_security_id,
-            underlying_segment,
-            len(expiries),
-            expiries,
-        )
-        if not expiries:
-            logger.info(f"No active expiries for {underlying_security_id} ({underlying_segment})")
-            logger.warning(
-                "EXPIRY PARSED EMPTY | security_id=%s | segment=%s | raw_response=%s",
-                underlying_security_id,
-                underlying_segment,
-                short_response(response),
-            )
-            return []
-        logger.info(
-            "Available expiries for %s (%s): %s",
-            underlying_security_id,
-            underlying_segment,
-            expiries,
-        )
-        return expiries
-    
     def fetch_historical_prices(self, security_id, exchange_segment, from_date, to_date):
         """
         Fetch historical OHLC data for HV calculation
@@ -1158,115 +855,123 @@ class DiscountedPremiumScanner:
         to_date=None
     ):
         """
-        Fetch expired/rolling ATM option data to evaluate how similar low-IV regimes behaved.
+        Fetch expired/rolling ATM option data
         """
-        end_date = pd.to_datetime(to_date).date() if to_date else datetime.now().date()
-        start_date = pd.to_datetime(from_date).date() if from_date else (end_date - timedelta(days=30))
-        cache_key = (
-            str(security_id),
-            exchange_segment,
-            option_type,
-            strike,
-            start_date.isoformat(),
-            end_date.isoformat(),
+
+        end_date = (
+            pd.to_datetime(to_date).date()
+            if to_date
+            else datetime.now().date()
         )
-        if cache_key in self.expired_data_cache:
-            logger.info(
-                "Using cached expired option data for %s (%s) %s %s",
-                security_id,
-                exchange_segment,
-                option_type,
-                strike,
-            )
-            return self.expired_data_cache[cache_key].copy()
 
-        cache_path = self._expired_options_cache_path(security_id, exchange_segment, option_type, strike)
-        persisted_df = self._load_expired_option_cache(cache_path)
-        if not persisted_df.empty:
-            logger.info(
-                "Loaded persisted expired option cache for %s (%s) %s %s: %s rows",
-                security_id,
-                exchange_segment,
-                option_type,
-                strike,
-                len(persisted_df),
-            )
+        start_date = (
+            pd.to_datetime(from_date).date()
+            if from_date
+            else (end_date - timedelta(days=30))
+        )
 
-        fetch_from_date = start_date
-        if not persisted_df.empty:
-            last_cached_timestamp = persisted_df["timestamp"].max()
-            if pd.notna(last_cached_timestamp):
-                fetch_from_date = max(start_date, last_cached_timestamp.date())
+        instrument_type = (
+            "OPTIDX"
+            if exchange_segment == "IDX_I"
+            else "OPTSTK"
+        )
 
-        if not persisted_df.empty and fetch_from_date >= end_date:
-            filtered_df = persisted_df[
-                (persisted_df["timestamp"].dt.date >= start_date) &
-                (persisted_df["timestamp"].dt.date <= end_date)
-            ].reset_index(drop=True)
-            self.expired_data_cache[cache_key] = filtered_df.copy()
-            logger.info(
-                "Using persisted expired option cache without API call for %s (%s) %s %s",
-                security_id,
-                exchange_segment,
-                option_type,
-                strike,
-            )
-            return filtered_df.copy()
-
-        instrument_type = "OPTIDX" if exchange_segment == "IDX_I" else "OPTSTK"
         required_data = ["close", "iv", "volume", "spot"]
 
         try:
-            expired_method = getattr(self.dhan, "expired_options_data", None)
-            if callable(expired_method):
-                response = expired_method(
-                    security_id=security_id,
-                    exchange_segment=exchange_segment,
-                    instrument_type=instrument_type,
-                    expiry_flag="MONTH",
-                    expiry_code=1,
-                    strike=strike,
-                    drv_option_type=option_type,
-                    required_data=required_data,
-                    from_date=fetch_from_date.isoformat(),
-                    to_date=end_date.isoformat(),
-                    interval=15,
-                )
+            response = requests.post(
+                "https://api.dhan.co/v2/charts/rollingoption",
+                headers=self._dhan_headers(),
+                json={
+                    "securityId": security_id,
+                    "exchangeSegment": exchange_segment,
+                    "instrument": instrument_type,
+                    "expiryFlag": "MONTH",
+                    "expiryCode": 1,
+                    "strike": strike,
+                    "drvOptionType": option_type,
+                    "requiredData": required_data,
+                    "fromDate": start_date.isoformat(),
+                    "toDate": end_date.isoformat(),
+                    "interval": 15,
+                },
+                timeout=20,
+            )
+
+            data = response.json()
+
+            logger.info(
+                "ROLLING OPTION API | id=%s | status=%s",
+                security_id,
+                data.get("status"),
+            )
+
+            if data.get("status") != "success":
+                return pd.DataFrame()
+
+            payload = unwrap_dhan_payload(data.get("data") or {})
+
+            side_key = "ce" if option_type == "CALL" else "pe"
+
+            option_payload = (
+                payload.get(side_key)
+                if isinstance(payload, dict)
+                else None
+            )
+
+            if isinstance(option_payload, dict):
+                df = pd.DataFrame(option_payload)
             else:
-                response = requests.post(
-                    "https://api.dhan.co/v2/charts/rollingoption",
-                    headers={
-                        "access-token": self.access_token,
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "securityId": security_id,
-                        "exchangeSegment": exchange_segment,
-                        "instrument": instrument_type,
-                        "expiryFlag": "MONTH",
-                        "expiryCode": 1,
-                        "strike": strike,
-                        "drvOptionType": option_type,
-                        "requiredData": required_data,
-                        "fromDate": fetch_from_date.isoformat(),
-                        "toDate": end_date.isoformat(),
-                        "interval": 15,
-                    },
-                    timeout=20,
-                ).json()
+                df = pd.DataFrame()
+
+            if df.empty:
+                return df
+
+            timestamp_col = None
+
+            for candidate in (
+                "timestamp",
+                "start_Time",
+                "start_time",
+                "date",
+                "Date",
+            ):
+                if candidate in df.columns:
+                    timestamp_col = candidate
+                    break
+
+            if timestamp_col:
+                series = df[timestamp_col]
+
+                if pd.api.types.is_numeric_dtype(series):
+                    df["timestamp"] = pd.to_datetime(
+                        series,
+                        unit="s",
+                        errors="coerce",
+                    )
+                else:
+                    df["timestamp"] = pd.to_datetime(
+                        series,
+                        errors="coerce",
+                    )
+
+            for column in ("iv", "close", "volume", "spot"):
+                df[column] = pd.to_numeric(
+                    df.get(column),
+                    errors="coerce",
+                )
+
+            df = df.dropna(subset=["timestamp"])
+
+            return df.reset_index(drop=True)
+
         except Exception:
             logger.exception(
-                "Failed to fetch expired option data for %s (%s) %s",
+                "Failed expired option fetch for %s",
                 security_id,
-                exchange_segment,
-                option_type,
             )
-            fallback_df = persisted_df[
-                (persisted_df["timestamp"].dt.date >= start_date) &
-                (persisted_df["timestamp"].dt.date <= end_date)
-            ].reset_index(drop=True) if not persisted_df.empty else pd.DataFrame(columns=["timestamp", "iv", "close", "volume", "spot"])
-            self.expired_data_cache[cache_key] = fallback_df.copy()
-            return fallback_df
+
+            return pd.DataFrame()
 
         if response.get("status") != "success":
             logger.warning(
@@ -2131,13 +1836,12 @@ class DiscountedPremiumScanner:
         return value.replace(minute=(value.minute // 5) * 5, second=0, microsecond=0)
 
     def _latest_expiry(self, security_id, security_segment):
-        segment_expiry_cache = self.runtime_state.setdefault("segment_expiries", {})
-        if security_segment in segment_expiry_cache:
-            expiries = segment_expiry_cache[security_segment]
-        else:
-            expiries = self.get_expiry_list(security_id, security_segment)
-            if expiries:
-                segment_expiry_cache[security_segment] = expiries
+        expiry_segment = self.get_expiry_segment(security_id)
+
+        expiries = self.get_expiry_list(
+            security_id,
+            expiry_segment,
+        )
         valid_expiries = [
             exp for exp in expiries
             if self.days_to_expiry(exp) >= 3
@@ -2224,10 +1928,13 @@ class DiscountedPremiumScanner:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=10)
         for security_id, symbol in self.fno_stocks.items():
+            time.sleep(0.25)
             try:
                 segment = self._strategy_segment(symbol)
+                expiry_segment = self.get_expiry_segment(security_id)
+
                 valid_expiries = [
-                    exp for exp in self.get_expiry_list(security_id, segment)
+                    exp for exp in self.get_expiry_list(security_id, expiry_segment)
                     if self.days_to_expiry(exp) >= 4
                 ]
                 expiry = valid_expiries[0] if valid_expiries else None
@@ -3229,6 +2936,7 @@ class DiscountedPremiumScanner:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=int(days) + 10)
         for security_id, symbol in self.fno_stocks.items():
+            time.sleep(0.25)
             segment = self._strategy_segment(symbol)
             try:
                 ivs = self.fetch_historical_iv(security_id, segment, lookback_days=max(30, int(days) + 30))
@@ -4154,9 +3862,11 @@ class DiscountedPremiumScanner:
         
         # Get expiry list if not specified
         if expiry is None:
-            expiries = self.get_expiry_list(security_id, security_segment)
+            expiry_segment = self.get_expiry_segment(security_id)
+
+            expiries = self.get_expiry_list(security_id, expiry_segment)
             if not expiries:
-                logger.warning("No expiries found for %s (%s)", security_name, security_segment)
+                logger.warning("No expiries found for %s (%s)", security_name, expiry_segment)
                 return []
             valid_expiries = [
                 exp for exp in expiries

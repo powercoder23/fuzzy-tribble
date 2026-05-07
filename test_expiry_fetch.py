@@ -90,14 +90,76 @@ def main():
     print_saved_token_info()
     token = generate_token(force_refresh=args.force_refresh)
 
-    if not args.sdk_only:
-        print("\n=== RAW HTTP EXPIRY LIST TEST ===")
-        fetch_expiry_raw(args.security_id, args.segment, token)
+    # if not args.sdk_only:
+    #     print("\n=== RAW HTTP EXPIRY LIST TEST ===")
+    expiry_result = fetch_expiry_raw(args.security_id, args.segment, token)
 
-    if not args.raw_only:
-        print("\n=== SDK EXPIRY LIST TEST ===")
-        fetch_expiry_sdk(args.security_id, args.segment, token)
+    
+    if expiry_result.status_code == 200:
+        data = expiry_result.json()
 
+        expiries = data.get("data", [])
+
+        if not expiries:
+            print("[WARN] No expiries found")
+            return
+
+        first_expiry = expiries[0]
+
+        print("[INFO] Using expiry:", first_expiry)
+
+        print("\n=== OPTION CHAIN TEST ===")
+
+        fetch_option_chain_raw(
+            args.security_id,
+            first_expiry,
+            token,
+        )
+
+def fetch_option_chain_raw(security_id, expiry, token):
+    url = "https://api.dhan.co/v2/optionchain"
+
+    headers = {
+        "Content-Type": "application/json",
+        "access-token": token,
+        "client-id": Config.DHAN_CLIENT_ID,
+    }
+
+    payload = {
+        "UnderlyingScrip": int(security_id),
+        "UnderlyingSeg": "NSE_FNO",
+        "Expiry": expiry,
+    }
+
+    print("[INFO] Option chain payload:", payload)
+
+    response = requests.post(
+        url,
+        json=payload,
+        headers=headers,
+        timeout=30,
+    )
+
+    print("[INFO] HTTP status:", response.status_code)
+    print("[INFO] Response text:", response.text)
+
+    return response
+
+def fetch_option_chain_sdk(security_id, expiry, token):
+    print("[INFO] Calling Dhan SDK option_chain()")
+
+    ctx = DhanContext(Config.DHAN_CLIENT_ID, token)
+    client = dhanhq(ctx)
+
+    result = client.option_chain(
+        under_security_id=int(security_id),
+        under_exchange_segment="NSE_FNO",
+        expiry=expiry,
+    )
+
+    print("[INFO] SDK result:", result)
+
+    return result
 
 if __name__ == "__main__":
     main()
