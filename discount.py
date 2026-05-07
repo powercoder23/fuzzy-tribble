@@ -425,7 +425,7 @@ class DiscountedPremiumScanner:
         return state
 
     def rate_limited_call(self, operation_name, func, *args, **kwargs):
-        min_interval = 1.5
+        min_interval = 3.0  # API docs: one unique request every 3 seconds
         elapsed = time.monotonic() - self.runtime_state["last_api_call_ts"]
         if elapsed < min_interval:
             time.sleep(min_interval - elapsed)
@@ -3103,7 +3103,7 @@ class DiscountedPremiumScanner:
                 expiry = self._latest_expiry(security_id, segment)
                 if not expiry:
                     continue
-                chain_response = self.get_option_chain_active(security_id, segment, expiry, retry=2, cache_ttl_seconds=300)
+                chain_response = self.get_option_chain_active(security_id, segment, expiry, retry=3, cache_ttl_seconds=300)
                 if chain_response.get("status") != "success":
                     continue
                 chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
