@@ -626,11 +626,21 @@ class DiscountedPremiumScanner:
         cache_label = f"{underlying_security_id} option chain {expiry}"
 
         def fetcher():
-            return self.dhan.option_chain(
-                under_security_id=underlying_security_id,
-                under_exchange_segment=underlying_segment,
-                expiry=expiry,
+            response = requests.post(
+                "https://api.dhan.co/v2/optionchain",
+                headers={
+                    "access-token": self.access_token,
+                    "client-id": self.client_id,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "UnderlyingScrip": underlying_security_id,
+                    "UnderlyingSeg": underlying_segment,
+                    "Expiry": expiry,
+                },
+                timeout=10,
             )
+            return response.json()
 
         def validator(response):
             return (
@@ -673,11 +683,20 @@ class DiscountedPremiumScanner:
         try:
             response = self.fetch_with_retry(
                 f"{underlying_security_id} active option chain {expiry}",
-                lambda: self.dhan.option_chain(
-                    under_security_id=underlying_security_id,
-                    under_exchange_segment=underlying_segment,
-                    expiry=expiry,
-                ),
+                lambda: requests.post(
+                    "https://api.dhan.co/v2/optionchain",
+                    headers={
+                        "access-token": self.access_token,
+                        "client-id": self.client_id,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "UnderlyingScrip": underlying_security_id,
+                        "UnderlyingSeg": underlying_segment,
+                        "Expiry": expiry,
+                    },
+                    timeout=10,
+                ).json(),
                 validator=lambda item: (
                     isinstance(item, dict)
                     and item.get("status") == "success"
@@ -720,10 +739,20 @@ class DiscountedPremiumScanner:
             return text[:limit] + "...truncated" if len(text) > limit else text
 
         def fetcher():
-            return self.dhan.expiry_list(
-                under_security_id=underlying_security_id,
-                under_exchange_segment=underlying_segment,
+            response = requests.post(
+                "https://api.dhan.co/v2/optionchain/expirylist",
+                headers={
+                    "access-token": self.access_token,
+                    "client-id": self.client_id,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "UnderlyingScrip": underlying_security_id,
+                    "UnderlyingSeg": underlying_segment,
+                },
+                timeout=10,
             )
+            return response.json()
 
         def parse_expiries(response):
             raw_data = response.get("data", [])
