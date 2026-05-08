@@ -9,7 +9,7 @@ echo ""
 echo "============================"
 echo "Building Docker Image"
 echo "============================"
-docker compose -f docker-compose.prod.yml build --no-cache
+docker compose -f docker-compose.prod.yml build
 
 echo ""
 echo "============================"

@@ -2409,8 +2409,8 @@ class DiscountedPremiumScanner:
     def _spread_ratio(self, bid, ask):
         bid = native_number(bid) or 0.0
         ask = native_number(ask) or 0.0
-        if ask <= 0:
-            return 1.0
+        if ask <= 0 or bid <= 0:
+            return 0.05  # Assume 5% spread if data missing (more realistic than 100%)
         return max(0.0, (ask - bid) / ask)
 
     def _build_candidate_rows(self, symbol, security_id, expiry, spot_price, option_chain, triggers, iv_percentile):
@@ -2473,7 +2473,7 @@ class DiscountedPremiumScanner:
             bid = prices["bid"]
             spread = self._spread_ratio(bid, ask)
             if spread > MAX_SPREAD_RATIO:
-                logger.info("Rejected trade %s %s: spread %.2f%% > %.0f%%", symbol, option_type, spread * 100, MAX_SPREAD_RATIO * 100)
+                logger.info("Rejected trade %s %s: spread %.2f%% > %.0f%% (bid=%s, ask=%s, last_price=%s)", symbol, option_type, spread * 100, MAX_SPREAD_RATIO * 100, prices.get("bid"), prices.get("ask"), opt.get("last_price"))
                 continue
             delta = native_number(pd.to_numeric(opt.get("delta"), errors="coerce")) or (0.5 if option_type == "CALL" else -0.5)
             scored = self.score_candidate(opt, triggers, iv_percentile, spread, delta)
@@ -2745,7 +2745,7 @@ class DiscountedPremiumScanner:
                     logger.info("Rejected %s: insufficient daily IV history", symbol)
                     continue
 
-                time.sleep(1)
+                time.sleep(1.5)
 
                 iv_percentile = self.calculate_iv_percentile(historical_ivs[-1], historical_ivs)
                 if iv_percentile is None or iv_percentile >= IV_PCT_ACTIVE_SCAN_MAX:
@@ -2843,6 +2843,64 @@ class DiscountedPremiumScanner:
             if trade:
                 executed.append(trade)
         logger.info("Active scanner selected=%s executed=%s candidates=%s", len(selected), len(executed), len(ranked))
+
+        try:
+            if self.telegram_bot_token and self.telegram_chat_id:
+
+                lines = [
+                    "📊 Active Scanner Summary",
+                    f"Selected: {len(selected)}",
+                    f"Executed: {len(executed)}",
+                    f"Candidates: {len(ranked)}",
+                    "",
+                    "🎯 Selected Trades:",
+                ]
+
+                if not selected:
+                    lines.append("None")
+
+                for idx, candidate in enumerate(selected, start=1):
+
+                    symbol = candidate.get("symbol", "NA")
+                    strike = candidate.get("strike", "NA")
+                    option_type = candidate.get("type", "NA")
+                    expiry = candidate.get("expiry", "NA")
+                    score = candidate.get("score", 0)
+
+                    direction = (
+                        (candidate.get("triggers") or {}).get("direction")
+                        or "neutral"
+                    )
+
+                    lines.append(
+                        f"{idx}. {symbol} "
+                        f"{strike}{option_type[:1]} "
+                        f"{direction.upper()} "
+                        f"| Score={score:.1f} "
+                        f"| Expiry={expiry}"
+                    )
+
+                summary_msg = "\n".join(lines)
+
+                response = requests.post(
+                    f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage",
+                    json={
+                        "chat_id": self.telegram_chat_id,
+                        "text": summary_msg,
+                    },
+                    timeout=10,
+                )
+
+                logger.info(
+                    "Telegram response | status=%s | body=%s",
+                    response.status_code,
+                    response.text,
+                )
+
+                response.raise_for_status()
+
+        except Exception:
+            logger.exception("Failed to send active scanner summary telegram")
         return executed
 
     def backtest_strategy(self, days=20):
@@ -2924,26 +2982,30 @@ class DiscountedPremiumScanner:
         raw_bid = native_number(opt.get("top_bid_price", 0))
         raw_ask = native_number(opt.get("top_ask_price", 0))
 
-        bid = raw_bid if raw_bid and raw_bid > 0 else None
-        ask = raw_ask if raw_ask and raw_ask > 0 else None
-        entry_price = ask if ask is not None else last_price
-        exit_price = bid if bid is not None else last_price
-
-        if ask is not None and bid is not None:
-            mid_price = (ask * 0.7) + (bid * 0.3)
-        elif ask is not None:
-            mid_price = ask
-        elif bid is not None:
-            mid_price = bid
-        else:
-            mid_price = last_price
+        # Use last_price as fallback if bid/ask are missing
+        bid = raw_bid if raw_bid and raw_bid > 0 else last_price
+        ask = raw_ask if raw_ask and raw_ask > 0 else last_price
+        
+        # If both bid and ask are zero/None, use last_price * 0.98 and * 1.02 as synthetic spread
+        if bid <= 0 and ask <= 0 and last_price > 0:
+            bid = last_price * 0.98
+            ask = last_price * 1.02
+        elif bid <= 0 and ask > 0:
+            bid = ask * 0.98
+        elif ask <= 0 and bid > 0:
+            ask = bid * 1.02
+        
+        entry_price = ask
+        exit_price = bid
+        mid_price = (ask + bid) / 2
+        logger.debug("Option data: last_price=%s, bid=%s, ask=%s", opt.get("last_price"), opt.get("top_bid_price"), opt.get("top_ask_price"))
 
         return {
-            "bid": bid if bid is not None else last_price,
-            "ask": ask if ask is not None else last_price,
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-            "mid_price": mid_price,
+            "bid": round(bid, 2),
+            "ask": round(ask, 2),
+            "entry_price": round(entry_price, 2),
+            "exit_price": round(exit_price, 2),
+            "mid_price": round(mid_price, 2),
         }
 
     def get_neighboring_ivs(self, option_chain, strike_price, option_type):
