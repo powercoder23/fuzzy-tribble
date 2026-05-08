@@ -531,7 +531,7 @@ class DiscountedPremiumScanner:
         """
         Fetch real-time option chain for a specific expiry
         """
-
+        time.sleep(0.5)  # brief pause to avoid hitting API rate limits in loops
         try:
             response = requests.post(
                 "https://api.dhan.co/v2/optionchain",
@@ -877,7 +877,7 @@ class DiscountedPremiumScanner:
         )
 
         required_data = ["close", "iv", "volume", "spot"]
-
+        time.sleep(0.5)  # brief pause to avoid hitting API rate limits in loops
         try:
             response = requests.post(
                 "https://api.dhan.co/v2/charts/rollingoption",
@@ -972,104 +972,6 @@ class DiscountedPremiumScanner:
             )
 
             return pd.DataFrame()
-
-        if response.get("status") != "success":
-            logger.warning(
-                "Expired option data fetch failed for %s (%s) %s: %s",
-                security_id,
-                exchange_segment,
-                option_type,
-                response,
-            )
-            fallback_df = persisted_df[
-                (persisted_df["timestamp"].dt.date >= start_date) &
-                (persisted_df["timestamp"].dt.date <= end_date)
-            ].reset_index(drop=True) if not persisted_df.empty else pd.DataFrame(columns=["timestamp", "iv", "close", "volume", "spot"])
-            self.expired_data_cache[cache_key] = fallback_df.copy()
-            return fallback_df
-
-        payload = unwrap_dhan_payload(response.get("data") or {})
-        side_key = "ce" if option_type == "CALL" else "pe"
-        option_payload = payload.get(side_key) if isinstance(payload, dict) else None
-
-        if isinstance(option_payload, dict):
-            target_columns = ["timestamp", "iv", "close", "volume", "spot"]
-            normalized_payload = {
-                column: option_payload.get(column, [])
-                for column in target_columns
-                if isinstance(option_payload.get(column, []), list) and len(option_payload.get(column, [])) > 0
-            }
-            df = pd.DataFrame(normalized_payload)
-        elif isinstance(payload, dict):
-            df = pd.DataFrame(payload)
-        elif isinstance(response.get("data"), list):
-            df = pd.DataFrame(response.get("data"))
-        else:
-            df = pd.DataFrame()
-
-        if df.empty:
-            merged_df = persisted_df.copy()
-            filtered_df = merged_df[
-                (merged_df["timestamp"].dt.date >= start_date) &
-                (merged_df["timestamp"].dt.date <= end_date)
-            ].reset_index(drop=True) if not merged_df.empty else pd.DataFrame(columns=["timestamp", "iv", "close", "volume", "spot"])
-            self.expired_data_cache[cache_key] = filtered_df.copy()
-            if filtered_df.empty:
-                logger.info(
-                    "Expired option data returned no rows for %s (%s) %s",
-                    security_id,
-                    exchange_segment,
-                    option_type,
-                )
-            else:
-                logger.info(
-                    "API returned no new rows; using persisted expired option cache for %s (%s) %s: %s rows",
-                    security_id,
-                    exchange_segment,
-                    option_type,
-                    len(filtered_df),
-                )
-            return filtered_df
-
-        timestamp_col = None
-        for candidate in ("timestamp", "start_Time", "start_time", "date", "Date"):
-            if candidate in df.columns:
-                timestamp_col = candidate
-                break
-
-        if timestamp_col:
-            series = df[timestamp_col]
-            if pd.api.types.is_numeric_dtype(series):
-                df["timestamp"] = pd.to_datetime(series, unit="s", errors="coerce")
-            else:
-                df["timestamp"] = pd.to_datetime(series, errors="coerce")
-        else:
-            df["timestamp"] = pd.NaT
-
-        for column in ("iv", "close", "volume", "spot"):
-            df[column] = pd.to_numeric(df.get(column), errors="coerce")
-
-        df = df[["timestamp", "iv", "close", "volume", "spot"]]
-        df = df.dropna(subset=["timestamp", "iv", "close"]).sort_values("timestamp").reset_index(drop=True)
-        merged_df = self._merge_expired_option_frames(persisted_df, df)
-        self._save_expired_option_cache(cache_path, merged_df)
-        filtered_df = merged_df[
-            (merged_df["timestamp"].dt.date >= start_date) &
-            (merged_df["timestamp"].dt.date <= end_date)
-        ].reset_index(drop=True)
-        self.expired_data_cache[cache_key] = filtered_df.copy()
-        logger.info(
-            "Fetched expired option data for %s (%s) %s: %s new rows | %s cached rows from %s to %s",
-            security_id,
-            exchange_segment,
-            option_type,
-            len(df),
-            len(filtered_df),
-            start_date.isoformat(),
-            end_date.isoformat(),
-        )
-        return filtered_df
-
     def compute_iv_behavior_metrics(self, df):
         """
         Measure whether similar low-IV states historically led to expansion in option prices.
@@ -1928,7 +1830,7 @@ class DiscountedPremiumScanner:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=10)
         for security_id, symbol in self.fno_stocks.items():
-            time.sleep(0.25)
+            time.sleep(0.5)
             try:
                 segment = self._strategy_segment(symbol)
                 expiry_segment = self.get_expiry_segment(security_id)
@@ -2027,6 +1929,7 @@ class DiscountedPremiumScanner:
         warmup_empty_expiries = 0
         warmup_api_failures = 0
         for security_id, symbol in all_symbols:
+            time.sleep(0.5)
             segment = self._strategy_segment(symbol)
             try:
                 expiry = self._latest_expiry(security_id, segment)
@@ -2173,6 +2076,7 @@ class DiscountedPremiumScanner:
 
         scored_rows = []
         for security_id, symbol in all_symbols:
+            time.sleep(0.5)
             try:
                 snapshots = self.get_intraday_snapshots(security_id, limit=12)
                 if snapshots.empty:
@@ -2300,9 +2204,7 @@ class DiscountedPremiumScanner:
         try:
             fetcher = getattr(self.dhan, "intraday_minute_data", None)
             if fetcher is not None:
-                response = self.rate_limited_call(
-                    f"{security_id} intraday prices",
-                    fetcher,
+                response = fetcher(
                     security_id=security_id,
                     exchange_segment=history_exchange_segment,
                     instrument_type=instrument_type,
@@ -2310,8 +2212,13 @@ class DiscountedPremiumScanner:
                     to_date=end_dt.strftime("%Y-%m-%d %H:%M:%S"),
                     interval=5,
                 )
-                payload = unwrap_dhan_payload(response.get("data") or {}) if isinstance(response, dict) else {}
-                candles = payload if isinstance(payload, list) else response.get("data") if isinstance(response, dict) else []
+                payload = response.get("data", {}) if isinstance(response, dict) else {}
+
+                if isinstance(payload, dict):
+                    candles = payload.get("candles", payload)
+                else:
+                    candles = payload
+
                 df = pd.DataFrame(candles)
                 if not df.empty:
                     return df
@@ -2680,7 +2587,7 @@ class DiscountedPremiumScanner:
             status = self.check_order_status(order_id)
             if status == "FILLED":
                 return order_id, status
-            time.sleep(1)
+            time.sleep(0.5)
 
         self.cancel_order(order_id)
         retry_order_id = self.place_limit_order(candidate, price=ask_price * 1.01)
@@ -2837,6 +2744,9 @@ class DiscountedPremiumScanner:
                 if len(historical_ivs) < 2:
                     logger.info("Rejected %s: insufficient daily IV history", symbol)
                     continue
+
+                time.sleep(1)
+
                 iv_percentile = self.calculate_iv_percentile(historical_ivs[-1], historical_ivs)
                 if iv_percentile is None or iv_percentile >= IV_PCT_ACTIVE_SCAN_MAX:
                     logger.info("Rejected %s: daily IV percentile %.2f >= %s", symbol, iv_percentile or -1, IV_PCT_ACTIVE_SCAN_MAX)
@@ -2845,6 +2755,9 @@ class DiscountedPremiumScanner:
                 expiry = self._latest_expiry(security_id, segment)
                 if not expiry:
                     continue
+
+                time.sleep(1)
+
                 chain_response = self.get_option_chain_active(security_id, segment, expiry, retry=3, cache_ttl_seconds=300)
                 if chain_response.get("status") != "success":
                     continue
@@ -2888,6 +2801,8 @@ class DiscountedPremiumScanner:
 
                 intraday_data = self.fetch_intraday_prices(security_id, segment, minutes=160)
                 triggers = self.compute_triggers(symbol, option_chain, intraday_data)
+
+                time.sleep(1)
                 flags = triggers.get("flags") or {}
                 actionable_trigger = (
                     flags.get("valid_breakout") or
@@ -2936,12 +2851,15 @@ class DiscountedPremiumScanner:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=int(days) + 10)
         for security_id, symbol in self.fno_stocks.items():
-            time.sleep(0.25)
+            time.sleep(0.5)
             segment = self._strategy_segment(symbol)
             try:
                 ivs = self.fetch_historical_iv(security_id, segment, lookback_days=max(30, int(days) + 30))
                 if len(ivs) < 5:
                     continue
+
+                time.sleep(1)
+
                 price_df = self.fetch_historical_prices(
                     security_id,
                     segment,
@@ -3877,6 +3795,8 @@ class DiscountedPremiumScanner:
                 logger.info("Skipping %s - no expiry with DTE >= 3", security_name)
                 return []
 
+            time.sleep(1)
+
         dte = get_trading_days_to_expiry(expiry)
         logger.info(f"Selected expiry: {expiry} (DTE: {dte})")
         
@@ -3885,6 +3805,8 @@ class DiscountedPremiumScanner:
         
         if chain_response.get('status') != 'success':
             return []
+
+        time.sleep(1)
 
         chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
         spot_price = chain_data.get("last_price")
@@ -3965,6 +3887,8 @@ class DiscountedPremiumScanner:
         premarket_ctx = self.build_premarket_context(security_id)
         historical_ivs = self.fetch_historical_iv(security_id, security_segment)
         has_iv_history = len(historical_ivs) >= MIN_IV_SAMPLES
+
+        time.sleep(1)
         iv_rank_atm = self.calculate_iv_rank(atm_context.get("atm_iv") or 0, historical_ivs) if atm_context.get("atm_iv") and has_iv_history else None
         iv_percentile_atm = self.calculate_iv_percentile(atm_context.get("atm_iv") or 0, historical_ivs) if atm_context.get("atm_iv") and has_iv_history else None
         self.persist_iv_snapshot(security_id, security_segment, security_name, expiry, spot_price, atm_context, chain_metrics=chain_metrics)
@@ -3994,6 +3918,8 @@ class DiscountedPremiumScanner:
                     iv_behavior["avg_move_after_low_iv"] if iv_behavior["avg_move_after_low_iv"] is not None else float("nan"),
                     iv_behavior["low_iv_threshold"],
                 )
+
+        time.sleep(1)
         logger.info("Volatility Mode: %s", "IV_HISTORY" if has_iv_history else "SKEW")
         logger.info("IV Samples Available: %s", len(historical_ivs))
         if atm_context.get("atm_iv"):
@@ -4051,6 +3977,8 @@ class DiscountedPremiumScanner:
                     logger.warning("Historical volatility calculation returned no usable value")
             else:
                 logger.warning("Could not calculate HV for %s", security_name)
+
+            time.sleep(1)
         elif hist_prices.empty:
             historical_ivs = self.fetch_historical_iv(security_id, security_segment)
 
@@ -4228,7 +4156,7 @@ class DiscountedPremiumScanner:
                             all_opportunities.append(opt)
 
                     # Rate limiting
-                    time.sleep(1)
+                    time.sleep(0.5)
                 
             except Exception:
                 logger.exception("Error scanning %s", sec_name)
