@@ -247,6 +247,9 @@ class StrategySchedulerApp:
         logger.info("%s", "=" * 70)
         logger.info("Running strategy: auto_active_scanner")
         logger.info("%s", "=" * 70)
+        today = datetime.now().date().isoformat()
+        if not hasattr(self, "_morning_selection_done"):
+            self._morning_selection_done = None
         try:
             token = self.token_manager.refresh_if_needed()
             scanner = DiscountedPremiumScanner(
@@ -254,6 +257,12 @@ class StrategySchedulerApp:
                 client_id=Config.DHAN_CLIENT_ID,
                 store_intraday=True,
             )
+            now = datetime.now().time()
+            if (dt_time(9, 50) <= now <= dt_time(10, 5) and
+                    self._morning_selection_done != today):
+                scanner.run_morning_warmup_and_select()
+                self._morning_selection_done = today
+                logger.info("Morning warmup selection completed for %s", today)
             return scanner.run_active_scanner()
         except Exception:
             logger.exception("Automated active scanner failed")
@@ -386,6 +395,32 @@ class StrategySchedulerApp:
                 for run_time in job["times"]:
                     getattr(schedule.every(), day).at(run_time).do(job["runner"])
                     logger.info("Scheduled %s on %s at %s", job["name"], day, run_time)
+
+        # EOD watchlist rebuild — runs before market open
+        for day in WEEKDAYS:
+            getattr(schedule.every(), day).at("08:45").do(self.run_auto_watchlist_eod)
+        logger.info("Scheduled auto_watchlist_eod on weekdays at 08:45")
+
+        # Active scanner — every 5 min 09:50–15:20
+        _active_times = [
+            "09:50", "09:55",
+            "10:00", "10:05", "10:10", "10:15", "10:20", "10:25", "10:30",
+            "10:35", "10:40", "10:45", "10:50", "10:55",
+            "11:00", "11:05", "11:10", "11:15", "11:20", "11:25", "11:30",
+            "11:35", "11:40", "11:45", "11:50", "11:55",
+            "12:00", "12:05", "12:10", "12:15", "12:20", "12:25", "12:30",
+            "12:35", "12:40", "12:45", "12:50", "12:55",
+            "13:00", "13:05", "13:10", "13:15", "13:20", "13:25", "13:30",
+            "13:35", "13:40", "13:45", "13:50", "13:55",
+            "14:00", "14:05", "14:10", "14:15", "14:20", "14:25", "14:30",
+            "14:35", "14:40", "14:45", "14:50", "14:55",
+            "15:00", "15:05", "15:10", "15:15", "15:20",
+        ]
+        for day in WEEKDAYS:
+            for t in _active_times:
+                getattr(schedule.every(), day).at(t).do(self.run_auto_active_scanner)
+        logger.info("Scheduled auto_active_scanner on weekdays at %d time slots (09:50–15:20)",
+                    len(_active_times))
 
     def run(self, run_now=False, exit_after_run=False):
         """Start the scheduler loop, with optional immediate execution."""
