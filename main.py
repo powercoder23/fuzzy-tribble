@@ -93,17 +93,18 @@ class StrategySchedulerApp:
         symbol_key = str(security_id)
         security_segment = self._warmup_security_segment(security_name)
 
-        expiry = expiry_cache.get(symbol_key)
+        # Share one expiry lookup across all NSE_FNO stocks (same expiry dates).
+        _segment_cache_key = f"_seg_{security_segment}"
+        expiry = expiry_cache.get(symbol_key) or expiry_cache.get(_segment_cache_key)
         if expiry is None:
             expiries = scanner.get_expiry_list(security_id, security_segment)
             if not expiries:
-                logger.info("Skipping %s - no expiries available", security_name)
-                return False
+                logger.info("Skipping %s - no expiries available (permanent)", security_name)
+                return None  # permanent: don't re-queue
             selected_expiry = None
 
-            for i, exp in enumerate(expiries):
+            for exp in expiries:
                 dte = get_trading_days_to_expiry(exp)
-
                 if dte >= 7:
                     selected_expiry = exp
                     break
@@ -113,6 +114,7 @@ class StrategySchedulerApp:
 
             expiry = selected_expiry
             expiry_cache[symbol_key] = expiry
+            expiry_cache[_segment_cache_key] = expiry  # shared for same segment
 
         dte = get_trading_days_to_expiry(expiry)
         logger.info(f"Selected expiry: {expiry} (DTE: {dte})")
@@ -156,7 +158,9 @@ class StrategySchedulerApp:
                     exc,
                 )
                 if attempt < max_retries - 1:
-                    time.sleep(min(3.0, 1.5 + (attempt * 0.75)))
+                    is_rate_limit = "too many requests" in str(exc).lower() or "805" in str(exc)
+                    backoff = (5.0 + attempt * 5.0) if is_rate_limit else min(3.0, 1.5 + attempt * 0.75)
+                    time.sleep(backoff)
 
         logger.warning("Warmup retries exhausted for %s: %s", security_name, last_error)
         return False
@@ -362,8 +366,10 @@ class StrategySchedulerApp:
                         security_name=security_name,
                         expiry_cache=expiry_cache,
                     )
-                    if success:
+                    if success is True:
                         logger.info("Warmup completed for %s | remaining=%s", security_name, len(symbols_queue))
+                    elif success is None:
+                        pass  # permanent skip (no expiry) — don't re-queue
                     else:
                         symbols_queue.append((security_id, security_name))
                 except Exception:

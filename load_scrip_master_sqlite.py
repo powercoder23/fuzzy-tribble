@@ -224,19 +224,22 @@ def get_security_id_symbol_map(stock_names: List[str], exchange: str = "NSE") ->
     placeholders = ",".join("?" for _ in stock_names)
 
     if exchange == "NSE":
+        # MIN() picks the lowest (most canonical) security ID when a symbol has duplicates.
         query = f"""
-            SELECT DISTINCT SEM_TRADING_SYMBOL, SEM_SMST_SECURITY_ID
+            SELECT SEM_TRADING_SYMBOL, MIN(CAST(SEM_SMST_SECURITY_ID AS INTEGER))
             FROM {TABLE_NAME}
             WHERE SEM_TRADING_SYMBOL IN ({placeholders})
               AND SEM_EXM_EXCH_ID = 'NSE'
               AND SEM_SEGMENT = 'E'
+            GROUP BY SEM_TRADING_SYMBOL
         """
         params = stock_names
     else:
         query = f"""
-            SELECT DISTINCT SEM_TRADING_SYMBOL, SEM_SMST_SECURITY_ID
+            SELECT SEM_TRADING_SYMBOL, MIN(CAST(SEM_SMST_SECURITY_ID AS INTEGER))
             FROM {TABLE_NAME}
             WHERE SEM_TRADING_SYMBOL IN ({placeholders})
+            GROUP BY SEM_TRADING_SYMBOL
         """
         params = stock_names
 
