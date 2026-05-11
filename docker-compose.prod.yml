@@ -1,11 +1,14 @@
 services:
-  scanner-dev:
+
+  # ── Service 1: IV Collector ────────────────────────────────────────────────
+  # Must start first. Feeds IV data to both strategy services.
+  iv-collector:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: discount-scanner
-    env_file:
-      - .env
+      dockerfile: Dockerfile.iv-collector
+    container_name: iv-collector
+    restart: unless-stopped
+    env_file: .env
     environment:
       TZ: Asia/Kolkata
       APP_TIMEZONE: Asia/Kolkata
@@ -13,6 +16,42 @@ services:
       - .:/app
       - ./data:/app/data
       - ./logs:/app/logs
-      - ./data/tokens:/app/data/tokens
+    command: python iv_collector_service.py
+
+  # ── Service 2: Momentum Strategy ──────────────────────────────────────────
+  momentum:
+    build:
+      context: .
+      dockerfile: Dockerfile.momentum
+    container_name: momentum-strategy
     restart: unless-stopped
-    command: python main.py
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python momentum_runner.py
+
+  # ── Service 3: Discount/Premium Strategy ──────────────────────────────────
+  discount:
+    build:
+      context: .
+      dockerfile: Dockerfile.discount
+    container_name: discount-strategy
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python main.py --auto-loop

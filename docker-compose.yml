@@ -1,17 +1,64 @@
+volumes:
+  shared-data:   # iv_history.db, scrip master, tokens — shared across all services
+
 services:
-  scanner-dev:
+
+  # ── Service 1: IV Collector ────────────────────────────────────────────────
+  # Owns ALL option chain API calls.
+  # Saves IV snapshots to shared-data volume.
+  # No trading logic, no order placement.
+  iv-collector:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: discount-scanner-dev
-    env_file:
-      - .env
+      dockerfile: Dockerfile.iv-collector
+    container_name: iv-collector
+    restart: unless-stopped
+    env_file: .env
     environment:
       TZ: Asia/Kolkata
       APP_TIMEZONE: Asia/Kolkata
     volumes:
-      - .:/app
-      - ./data:/app/data
+      - shared-data:/app/data
       - ./logs:/app/logs
-      - ./data/tokens:/app/data/tokens
-    command: python main.py --auto-once
+    command: python iv_collector_service.py
+
+  # ── Service 2: Momentum Strategy ──────────────────────────────────────────
+  # Reads IV from shared-data (written by iv-collector).
+  # Calls Dhan API only for: regime detection (daily candles) and
+  # option chain at signal execution time.
+  momentum:
+    build:
+      context: .
+      dockerfile: Dockerfile.momentum
+    container_name: momentum-strategy
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - shared-data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python momentum_runner.py
+
+  # ── Service 3: Discount/Premium Strategy ──────────────────────────────────
+  # Reads IV from shared-data for IV rank/percentile.
+  # Calls Dhan API for active scanner chain fetches and order placement.
+  discount:
+    build:
+      context: .
+      dockerfile: Dockerfile.discount
+    container_name: discount-strategy
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - shared-data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python main.py --auto-loop

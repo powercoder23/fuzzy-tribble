@@ -61,5 +61,4 @@ data/fno_cache/nse_fo_symbols_10042026.csv
 data/fno_cache/NSE_FO_contract_10042026.csv.gz
 data/fno_cache/*
 data/premarket_warmup_state.json
-.claude/settings.local.json
-.claude/settings.json
+.claude/*

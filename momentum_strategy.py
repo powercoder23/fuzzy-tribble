@@ -21,6 +21,7 @@ from discount import (
 )
 from token_manager import TokenManager
 from config import Config
+import iv_store
 from momentum_config import (
     CAPITAL, RISK_CONFIG, REGIME, ORB, LIQUIDITY, STRIKE,
     SCRIP_MASTER_DB, IV_HISTORY_DB, TRADE_LOG_PATH, LOT_SIZE_FALLBACK,
@@ -554,44 +555,20 @@ class AffordabilityFilter:
         self.risk_manager = risk_manager
 
     def estimate_atm_premiums_bulk(self, fno_stocks: dict) -> dict:
-        """Query iv_history.db once. Returns {security_id(int): estimated_premium(float)}."""
+        """Read latest IV snapshots from iv_store. Returns {security_id(int): estimated_premium}."""
         DTE = 7
-        try:
-            conn = sqlite3.connect(IV_HISTORY_DB)
-            df   = pd.read_sql("""
-                SELECT security_id, atm_iv, spot_price
-                FROM   iv_history
-                WHERE  data_type = 'intraday'
-                  AND  timestamp = (
-                         SELECT MAX(timestamp) FROM iv_history i2
-                         WHERE  i2.security_id = iv_history.security_id
-                           AND  i2.data_type   = 'intraday'
-                       )
-            """, conn)
-            conn.close()
-
-            result = {}
-            for _, row in df.iterrows():
-                try:
-                    sec_id  = int(row["security_id"])
-                    iv      = float(row["atm_iv"])    if pd.notna(row["atm_iv"])    else 30.0
-                    spot    = float(row["spot_price"]) if pd.notna(row["spot_price"]) else 0.0
-                    if spot <= 0:
-                        result[sec_id] = 100.0
-                        continue
-                    premium = spot * (iv / 100) * math.sqrt(DTE / 365) * 0.4
-                    result[sec_id] = max(1.0, round(premium, 2))
-                except Exception:
-                    continue
-
-            for sec_id in fno_stocks:
-                if sec_id not in result:
-                    result[sec_id] = 100.0
-
-            return result
-        except Exception:
-            logger.exception("estimate_atm_premiums_bulk failed")
-            return {sec_id: 100.0 for sec_id in fno_stocks}
+        snapshots = iv_store.get_bulk_latest_snapshots(list(fno_stocks.keys()))
+        result = {}
+        for sec_id in fno_stocks:
+            snap = snapshots.get(sec_id, {})
+            iv   = snap.get("atm_iv")   or 30.0
+            spot = snap.get("spot_price") or 0.0
+            if spot <= 0:
+                result[sec_id] = 100.0
+                continue
+            premium = spot * (iv / 100) * math.sqrt(DTE / 365) * 0.4
+            result[sec_id] = max(1.0, round(premium, 2))
+        return result
 
     def get_affordable_universe(self, fno_stocks: dict) -> dict:
         """Filter fno_stocks to only those where calculate_lots() >= 1."""
