@@ -90,6 +90,13 @@ def main():
         next_run = min(j.next_run for j in schedule.jobs if j.next_run)
         logger.info("Next run: %s", next_run.strftime("%Y-%m-%d %H:%M:%S"))
 
+    # If we started late (after 9:00 AM), premarket slot is already gone.
+    # Run it immediately so intraday scans have affordability + regime data.
+    now = datetime.now().time()
+    if dt_time(9, 0) <= now <= dt_time(11, 30) and datetime.now().weekday() < 5:
+        logger.info("Service started mid-session — running premarket immediately")
+        _premarket()
+
     while True:
         schedule.run_pending()
         time.sleep(15)
