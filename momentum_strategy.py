@@ -389,27 +389,55 @@ class MomentumScanner:
 
     def get_intraday_candles(self, security_id, exchange_segment,
                              interval_minutes: int = 15) -> pd.DataFrame:
-        """Fetch 1-min candles from Dhan, resample to interval_minutes."""
+        """Fetch intraday candles from Dhan at the requested interval."""
         empty = pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume", "vwap"])
+        today = date.today().isoformat()
         try:
             response = self.dhan.intraday_minute_data(
                 security_id      = str(security_id),
                 exchange_segment = exchange_segment,
                 instrument_type  = "INDEX" if exchange_segment == "IDX_I" else "EQUITY",
+                from_date        = today,
+                to_date          = today,
+                interval         = interval_minutes,
             )
-            data = response.get("data", []) if isinstance(response, dict) else []
-
-            if not isinstance(data, list) or not data:
+            if not isinstance(response, dict):
+                logger.debug("intraday candles: non-dict response | sec_id=%s", security_id)
                 return empty
 
-            df = pd.DataFrame(data)
+            status = response.get("status", "")
+            if status != "success":
+                logger.debug("intraday candles: status=%s | sec_id=%s | remarks=%s",
+                             status, security_id, str(response.get("remarks", ""))[:150])
+                return empty
+
+            data = response.get("data", {})
+
+            # Dhan returns columnar dict: {"open":[...],"high":[...],"timestamp":[epoch_ints]}
+            if isinstance(data, dict) and "open" in data and "close" in data:
+                df = pd.DataFrame(data)
+            elif isinstance(data, list) and data:
+                df = pd.DataFrame(data)
+            else:
+                logger.debug("intraday candles: empty/unrecognised data | sec_id=%s", security_id)
+                return empty
+
             df.columns = [c.lower() for c in df.columns]
 
-            dt_col = next((c for c in df.columns if c in ("timestamp", "datetime", "start_time", "time", "date")), None)
-            if not dt_col:
+            ts_col = next((c for c in df.columns
+                           if c in ("timestamp", "start_time", "datetime", "time", "date")), None)
+            if ts_col:
+                # Dhan returns epoch integers (Unix seconds)
+                parsed = pd.to_datetime(df[ts_col], unit="s", errors="coerce")
+                if parsed.isna().all():
+                    # Fallback: plain string datetime (forward-compatibility)
+                    parsed = pd.to_datetime(df[ts_col], errors="coerce")
+                    df["datetime"] = parsed
+                else:
+                    df["datetime"] = parsed.dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata")
+            elif "datetime" not in df.columns:
                 return empty
 
-            df["datetime"] = pd.to_datetime(df[dt_col], errors="coerce")
             df = df.dropna(subset=["datetime"])
 
             for col in ("open", "high", "low", "close", "volume"):
@@ -417,18 +445,13 @@ class MomentumScanner:
                     df[col] = 0.0
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
-            df = df.set_index("datetime").sort_index()
+            df = df.sort_values("datetime").reset_index(drop=True)
 
-            resampled = df.resample(f"{interval_minutes}min").agg({
-                "open": "first", "high": "max", "low": "min",
-                "close": "last", "volume": "sum",
-            }).dropna(subset=["close"])
+            tp = (df["high"] + df["low"] + df["close"]) / 3
+            df["vwap"] = (tp * df["volume"]).cumsum() / df["volume"].replace(0, np.nan).cumsum()
+            df["vwap"] = df["vwap"].fillna(df["close"])
 
-            tp   = (resampled["high"] + resampled["low"] + resampled["close"]) / 3
-            vwap = (tp * resampled["volume"]).cumsum() / resampled["volume"].replace(0, np.nan).cumsum()
-            resampled["vwap"] = vwap.fillna(resampled["close"])
-
-            return resampled.reset_index()
+            return df[["datetime", "open", "high", "low", "close", "volume", "vwap"]]
         except Exception:
             logger.exception("get_intraday_candles failed | security_id=%s", security_id)
             return empty
