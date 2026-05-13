@@ -34,7 +34,6 @@ from momentum_strategy import (
     ScripMasterLotSizer,
     MomentumRegimeFilter,
     MomentumScanner,
-    AffordabilityFilter,
     MomentumTradeJournal,
 )
 from break_bounce_config import (
@@ -137,14 +136,27 @@ class BreakBounceScanner:
     def get_yesterday_levels(self, security_id, exchange_segment) -> dict:
         """Return yesterday's daily candle high and low."""
         empty = {"yesterday_high": 0.0, "yesterday_low": 0.0, "date": ""}
-        df = self._daily_fetcher.get_daily_candles(security_id, exchange_segment, days=5)
+        df = self._daily_fetcher.get_daily_candles(security_id, exchange_segment, days=10)
         if df is None or df.empty:
+            logger.debug("get_yesterday_levels: empty df | sec_id=%s seg=%s",
+                         security_id, exchange_segment)
             return empty
+        logger.debug("get_yesterday_levels: %d rows | sec_id=%s | last_date=%s high=%.2f low=%.2f",
+                     len(df), security_id,
+                     df.iloc[-1].get("date", "?"),
+                     float(df.iloc[-1]["high"]),
+                     float(df.iloc[-1]["low"]))
         # df sorted ascending; iloc[-1] = most recent complete daily candle = yesterday
         yesterday = df.iloc[-1]
+        yh = float(yesterday["high"])
+        yl = float(yesterday["low"])
+        if yh <= 0 or yl <= 0:
+            logger.warning("get_yesterday_levels: zero high/low | sec_id=%s date=%s",
+                           security_id, yesterday.get("date", "?"))
+            return empty
         return {
-            "yesterday_high": float(yesterday["high"]),
-            "yesterday_low":  float(yesterday["low"]),
+            "yesterday_high": yh,
+            "yesterday_low":  yl,
             "date":           str(yesterday["date"]),
         }
 
@@ -228,11 +240,13 @@ class BreakBounceScanner:
         """
         After breakout confirmed, look for reversal pattern at retest on 5-min.
 
-        BULLISH breakout → expect price to pull back to breakout level (support).
-                           Look for Hammer or Bullish Engulfing → signal CE.
+        BULLISH breakout → price pulls back to yesterday's high (now support).
+          Hammer:            preceded by ≥2 red candles coming down to the level.
+          Bullish Engulfing: curr fully engulfs prev (low < prev.low, high > prev.high).
 
-        BEARISH breakout → expect price to bounce back to breakout level (resistance).
-                           Look for Inverted Hammer or Bearish Engulfing → signal PE.
+        BEARISH breakout → price bounces back to yesterday's low (now resistance).
+          Inverted Hammer:   preceded by ≥2 green candles coming up to the level.
+          Bearish Engulfing: curr fully engulfs prev (low < prev.low, high > prev.high).
         """
         no_signal = {
             "signal": "NONE", "pattern": "", "symbol": symbol,
@@ -241,26 +255,29 @@ class BreakBounceScanner:
         try:
             df = self._intraday_fetcher.get_intraday_candles(
                 security_id, exchange_segment, interval_minutes=5)
-            if df is None or df.empty or len(df) < 3:
+            if df is None or df.empty or len(df) < 5:
                 return {**no_signal, "reason": "insufficient_candles"}
 
             today_str = date.today().isoformat()
             df["_date"] = pd.to_datetime(df["datetime"]).dt.date.astype(str)
             today_df = df[df["_date"] == today_str]
-            if len(today_df) < 3:
+            # Need: 3 prior + 1 pattern + 1 live (in-progress) = 5 minimum
+            if len(today_df) < 5:
                 return {**no_signal, "reason": "insufficient_today_candles"}
 
-            last = today_df.iloc[-2]   # most recent completed 5-min candle
-            prev = today_df.iloc[-3]   # candle before that
+            last  = today_df.iloc[-2]       # most recent completed 5-min candle (pattern)
+            prev  = today_df.iloc[-3]       # candle immediately before pattern
+            prior = today_df.iloc[-5:-2]    # 3 candles before pattern — for prior-move check
 
             tol   = BB_BREAKOUT["retest_tol_pct"]
             level = breakout_level
 
             if breakout_direction == "BULLISH":
-                # Price retests level from above — low of candle touches level
+                # Price retests yesterday's high from above — low of candle touches the level
                 at_level = abs(float(last["low"]) - level) / max(level, 1e-6) <= tol
                 if at_level:
-                    if self._is_hammer(last):
+                    # Hammer: must be preceded by ≥2 red candles falling into the level
+                    if self._is_hammer(last, prior):
                         return {
                             "signal":      "CE",
                             "pattern":     "HAMMER",
@@ -271,13 +288,14 @@ class BreakBounceScanner:
                             "candle_time": str(last["datetime"]),
                             "reason":      "hammer_at_retest",
                         }
+                    # Bullish engulfing: curr low < prev low AND curr high > prev high
                     if self._is_bullish_engulfing(prev, last):
                         return {
                             "signal":      "CE",
                             "pattern":     "BULLISH_ENGULFING",
                             "symbol":      symbol,
                             "security_id": security_id,
-                            # Enter at high of previous (bearish) candle
+                            # Enter at high of the previous candle (before engulfing closes)
                             "entry_price": round(float(prev["high"]), 2),
                             "sl_level":    round(float(last["low"]), 2),
                             "candle_time": str(last["datetime"]),
@@ -285,10 +303,11 @@ class BreakBounceScanner:
                         }
 
             elif breakout_direction == "BEARISH":
-                # Price retests level from below — high of candle touches level
+                # Price retests yesterday's low from below — high of candle touches the level
                 at_level = abs(float(last["high"]) - level) / max(level, 1e-6) <= tol
                 if at_level:
-                    if self._is_inverted_hammer(last):
+                    # Inverted hammer: must be preceded by ≥2 green candles rising to the level
+                    if self._is_inverted_hammer(last, prior):
                         return {
                             "signal":      "PE",
                             "pattern":     "INVERTED_HAMMER",
@@ -299,13 +318,14 @@ class BreakBounceScanner:
                             "candle_time": str(last["datetime"]),
                             "reason":      "inverted_hammer_at_retest",
                         }
+                    # Bearish engulfing: curr low < prev low AND curr high > prev high
                     if self._is_bearish_engulfing(prev, last):
                         return {
                             "signal":      "PE",
                             "pattern":     "BEARISH_ENGULFING",
                             "symbol":      symbol,
                             "security_id": security_id,
-                            # Enter at low of previous (bullish) candle
+                            # Enter at low of the previous candle (before engulfing closes)
                             "entry_price": round(float(prev["low"]), 2),
                             "sl_level":    round(float(last["high"]), 2),
                             "candle_time": str(last["datetime"]),
@@ -321,8 +341,30 @@ class BreakBounceScanner:
     # ---- Candle pattern helpers ------------------------------------------------
 
     @staticmethod
-    def _is_hammer(candle: pd.Series) -> bool:
-        """Long lower wick, small body. Bullish reversal at support."""
+    def _has_prior_red_candles(candles: pd.DataFrame, min_count: int = 2) -> bool:
+        """≥ min_count of the prior candles are bearish (close < open)."""
+        if len(candles) < min_count:
+            return False
+        red = sum(1 for _, c in candles.iterrows() if float(c["close"]) < float(c["open"]))
+        return red >= min_count
+
+    @staticmethod
+    def _has_prior_green_candles(candles: pd.DataFrame, min_count: int = 2) -> bool:
+        """≥ min_count of the prior candles are bullish (close > open)."""
+        if len(candles) < min_count:
+            return False
+        green = sum(1 for _, c in candles.iterrows() if float(c["close"]) > float(c["open"]))
+        return green >= min_count
+
+    @staticmethod
+    def _is_hammer(candle: pd.Series, prior_candles: pd.DataFrame) -> bool:
+        """
+        Hammer at support: long lower wick, small body.
+        Rule: must be preceded by ≥2 red candles falling down to the level.
+        """
+        # Prior movement check — red candles coming DOWN to the retest level
+        if not BreakBounceScanner._has_prior_red_candles(prior_candles):
+            return False
         open_ = float(candle["open"])
         close = float(candle["close"])
         high  = float(candle["high"])
@@ -337,8 +379,14 @@ class BreakBounceScanner:
         return lower_wick >= wr * body and upper_wick <= mc * body
 
     @staticmethod
-    def _is_inverted_hammer(candle: pd.Series) -> bool:
-        """Long upper wick, small body. Bearish reversal at resistance (shooting star)."""
+    def _is_inverted_hammer(candle: pd.Series, prior_candles: pd.DataFrame) -> bool:
+        """
+        Inverted hammer / shooting star at resistance: long upper wick, small body.
+        Rule: must be preceded by ≥2 green candles rising UP to the level.
+        """
+        # Prior movement check — green candles coming UP to the retest level
+        if not BreakBounceScanner._has_prior_green_candles(prior_candles):
+            return False
         open_ = float(candle["open"])
         close = float(candle["close"])
         high  = float(candle["high"])
@@ -354,29 +402,25 @@ class BreakBounceScanner:
 
     @staticmethod
     def _is_bullish_engulfing(prev: pd.Series, curr: pd.Series) -> bool:
-        """curr bullish candle fully engulfs prev bearish candle body."""
-        prev_open  = float(prev["open"])
-        prev_close = float(prev["close"])
-        curr_open  = float(curr["open"])
-        curr_close = float(curr["close"])
-        if prev_close >= prev_open:   # prev must be bearish
+        """
+        Bullish engulfing: curr must be bullish AND fully engulf prev including wicks.
+        curr.low < prev.low  AND  curr.high > prev.high
+        """
+        if float(curr["close"]) <= float(curr["open"]):   # curr must be bullish
             return False
-        if curr_close <= curr_open:   # curr must be bullish
-            return False
-        return curr_open <= prev_close and curr_close >= prev_open
+        return (float(curr["low"])  < float(prev["low"]) and
+                float(curr["high"]) > float(prev["high"]))
 
     @staticmethod
     def _is_bearish_engulfing(prev: pd.Series, curr: pd.Series) -> bool:
-        """curr bearish candle fully engulfs prev bullish candle body."""
-        prev_open  = float(prev["open"])
-        prev_close = float(prev["close"])
-        curr_open  = float(curr["open"])
-        curr_close = float(curr["close"])
-        if prev_close <= prev_open:   # prev must be bullish
+        """
+        Bearish engulfing: curr must be bearish AND fully engulf prev including wicks.
+        curr.low < prev.low  AND  curr.high > prev.high
+        """
+        if float(curr["close"]) >= float(curr["open"]):   # curr must be bearish
             return False
-        if curr_close >= curr_open:   # curr must be bearish
-            return False
-        return curr_open >= prev_close and curr_close <= prev_open
+        return (float(curr["low"])  < float(prev["low"]) and
+                float(curr["high"]) > float(prev["high"]))
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +546,6 @@ class BreakBounceStrategyRunner:
         self.lot_sizer     = ScripMasterLotSizer()
         self._scanner_obj  = None
         self._bb_scanner   = None
-        self._affordability = None
         self._notifier     = None
         self._journal      = MomentumTradeJournal(filepath=TRADE_LOG_PATH)
         # {security_id: {symbol, breakout_direction, breakout_level, trade_placed, setup_voided}}
@@ -519,11 +562,9 @@ class BreakBounceStrategyRunner:
     def _ensure_components(self) -> None:
         if self._scanner_obj is not None:
             return
-        self._scanner_obj   = self._build_scanner()
-        self._bb_scanner    = BreakBounceScanner(self._scanner_obj)
-        # AffordabilityFilter accepts any object with is_affordable(); BB risk manager qualifies
-        self._affordability = AffordabilityFilter(self.lot_sizer, self.risk_manager)
-        self._notifier      = BreakBounceTelegramNotifier(
+        self._scanner_obj = self._build_scanner()
+        self._bb_scanner  = BreakBounceScanner(self._scanner_obj)
+        self._notifier    = BreakBounceTelegramNotifier(
             self._scanner_obj.telegram_bot_token,
             self._scanner_obj.telegram_chat_id,
         )
@@ -643,18 +684,20 @@ class BreakBounceStrategyRunner:
 
     def run_premarket(self) -> dict:
         """
-        Called at 9:00 AM. Fetches yesterday's daily levels for all affordable
-        stocks and initialises per-stock state for the day.
+        Called at 9:00 AM (or lazily on first intraday scan if started mid-session).
+
+        Tracks ALL F&O stocks — no affordability pre-filter.
+        Affordability is checked at execution time when a signal fires.
         """
         try:
             self._ensure_components()
-            affordable = self._affordability.get_affordable_universe(
-                self._scanner_obj.fno_stocks)
 
+            all_stocks = self._scanner_obj.fno_stocks   # {security_id: symbol} — full universe
             self._daily_levels = {}
             self._stock_states = {}
 
-            for sec_id, symbol in affordable.items():
+            failed = 0
+            for sec_id, symbol in all_stocks.items():
                 seg    = self._exchange_segment(symbol)
                 levels = self._bb_scanner.get_yesterday_levels(sec_id, seg)
                 if levels.get("yesterday_high", 0) > 0:
@@ -667,12 +710,23 @@ class BreakBounceStrategyRunner:
                         "trade_placed":       False,
                         "setup_voided":       False,
                     }
+                else:
+                    failed += 1
                 time.sleep(0.3)
 
             count = len(self._daily_levels)
-            logger.info("B&B premarket: %d stocks with valid daily levels", count)
+            logger.info(
+                "B&B premarket: %d/%d stocks with valid daily levels (%d failed/empty API)",
+                count, len(all_stocks), failed,
+            )
+            if count == 0:
+                logger.warning(
+                    "B&B premarket: ALL daily level fetches returned empty. "
+                    "Check if Dhan historical_daily_data is working — "
+                    "enable DEBUG logging to see per-stock API responses."
+                )
             self._notifier.send_premarket_report(count, self.risk_manager.summary())
-            return {"levels_loaded": count}
+            return {"levels_loaded": count, "total": len(all_stocks), "failed": failed}
 
         except Exception:
             logger.exception("run_premarket failed")
@@ -700,7 +754,10 @@ class BreakBounceStrategyRunner:
                 return []
 
             if not self._daily_levels:
-                logger.warning("B&B: no daily levels — run_premarket() may not have run")
+                logger.warning("B&B: no daily levels cached — retrying premarket now")
+                self.run_premarket()
+            if not self._daily_levels:
+                logger.error("B&B: still no daily levels after retry — skipping scan")
                 return []
 
             signals_placed = []

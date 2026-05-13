@@ -31,14 +31,19 @@ if hasattr(time, "tzset"):
     time.tzset()
 
 Config.ensure_dirs()
+
+# Set DEBUG for break_bounce_strategy to expose per-stock API responses
+_log_level = logging.DEBUG if os.getenv("BB_DEBUG", "false").lower() == "true" else logging.INFO
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
         logging.FileHandler(Config.LOGS_DIR / "break_bounce.log"),
         logging.StreamHandler(),
     ],
 )
+logging.getLogger("break_bounce_strategy").setLevel(_log_level)
 logger = logging.getLogger(__name__)
 
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday"]
