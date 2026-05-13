@@ -230,6 +230,70 @@ def get_bulk_latest_snapshots(security_ids: list) -> dict:
         return {}
 
 
+def get_eod_stats(date_str: str = None) -> dict:
+    """
+    Return aggregated stats for the EOD Telegram summary.
+    Queries today's collection counts and overall history depth.
+    """
+    if date_str is None:
+        date_str = datetime.now().date().isoformat()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur  = conn.cursor()
+
+        cur.execute("""
+            SELECT COUNT(*), COUNT(DISTINCT security_id)
+            FROM   iv_history
+            WHERE  DATE(timestamp) = ? AND data_type = 'intraday'
+        """, (date_str,))
+        intraday_total, intraday_symbols = cur.fetchone()
+
+        cur.execute("""
+            SELECT COUNT(DISTINCT security_id)
+            FROM   iv_history
+            WHERE  DATE(timestamp) = ? AND data_type = 'daily'
+        """, (date_str,))
+        daily_symbols = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM iv_history WHERE data_type = 'intraday'")
+        total_intraday_rows = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM iv_history WHERE data_type = 'daily'")
+        total_daily_rows = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT security_id, symbol, COUNT(DISTINCT DATE(timestamp)) AS days
+            FROM   iv_history
+            WHERE  data_type = 'daily'
+            GROUP  BY security_id
+        """)
+        hist_rows = cur.fetchall()
+        conn.close()
+
+        days_list  = [r[2] for r in hist_rows]
+        avg_days   = round(sum(days_list) / len(days_list)) if days_list else 0
+        min_days   = min(days_list) if days_list else 0
+        min_symbol = next(
+            (r[1] or str(r[0]) for r in hist_rows if r[2] == min_days), "—"
+        )
+
+        return {
+            "date":                    date_str,
+            "intraday_snapshots_today": intraday_total  or 0,
+            "intraday_symbols_today":   intraday_symbols or 0,
+            "daily_symbols_today":      daily_symbols    or 0,
+            "total_intraday_rows":      total_intraday_rows or 0,
+            "total_daily_rows":         total_daily_rows    or 0,
+            "symbols_with_history":     len(hist_rows),
+            "avg_history_days":         avg_days,
+            "min_history_days":         min_days,
+            "min_history_symbol":       min_symbol,
+        }
+    except Exception:
+        logger.exception("iv_store.get_eod_stats failed")
+        return {}
+
+
 def daily_snapshot_exists_today(security_id: str) -> bool:
     """True if a daily snapshot has already been saved for today."""
     today = datetime.now().date().isoformat()

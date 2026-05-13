@@ -17,9 +17,11 @@ They only read from iv_store.
 import logging
 import os
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, time as dt_time
 from pathlib import Path
+
+import requests
 
 import pytz
 
@@ -65,9 +67,13 @@ EOD_SLEEP      = 0.5   # seconds between stocks during EOD watchlist build
 class IVCollector:
 
     def __init__(self):
-        self.token_manager = TokenManager()
+        self.token_manager   = TokenManager()
         self._scanner: DiscountedPremiumScanner = None
         self._expiry_cache: dict = {}
+        # EOD tracking — reset each calendar day
+        self._pass_log: list[dict]  = []   # [{kind, time, saved, total}]
+        self._fail_counts: Counter  = Counter()  # symbol → total fail count today
+        self._eod_sent: bool        = False
 
     # ── scanner lifecycle ─────────────────────────────────────────────────────
 
@@ -259,10 +265,17 @@ class IVCollector:
                 saved += 1
             else:
                 skipped += 1
+                self._fail_counts[symbol] += 1
 
             if queue:
                 time.sleep(WARMUP_SLEEP)
 
+        self._pass_log.append({
+            "kind":  "Warmup",
+            "time":  datetime.now().strftime("%H:%M"),
+            "saved": saved,
+            "total": len(all_symbols),
+        })
         logger.info("Warmup pass done | saved=%d skipped=%d", saved, skipped)
         return saved
 
@@ -291,10 +304,127 @@ class IVCollector:
                                    data_type="intraday", snapshot_dt=snapshot_dt)
             if ok:
                 saved += 1
+            else:
+                self._fail_counts[symbol] += 1
             time.sleep(INTRADAY_SLEEP)
 
+        self._pass_log.append({
+            "kind":  "Intraday",
+            "time":  snapshot_dt.strftime("%H:%M"),
+            "saved": saved,
+            "total": len(all_syms),
+        })
         logger.info("Intraday IV pass done | saved=%d / %d", saved, len(all_syms))
         return saved
+
+    # ── telegram ──────────────────────────────────────────────────────────────
+
+    def _send_telegram(self, text: str) -> bool:
+        token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+        if not token or not chat_id:
+            logger.info("Telegram not configured — EOD summary not sent")
+            return False
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=10,
+            )
+            if not resp.ok:
+                logger.warning("Telegram EOD send failed: %s", resp.text[:200])
+            return resp.ok
+        except Exception:
+            logger.exception("Telegram EOD send exception")
+            return False
+
+    def _build_eod_message(self, universe_size: int) -> str:
+        stats    = iv_store.get_eod_stats()
+        now_str  = datetime.now().strftime("%a, %d %b %Y  |  %H:%M IST")
+
+        total_snaps = stats.get("intraday_snapshots_today", 0)
+        total_fails = sum(self._fail_counts.values())
+        daily_saves = stats.get("daily_symbols_today", 0)
+        passes_run  = len(self._pass_log)
+        pass_rate   = (
+            f"{100 * total_snaps / (total_snaps + total_fails):.1f}%"
+            if (total_snaps + total_fails) else "—"
+        )
+
+        lines = [
+            "📊 <b>IV Collector — EOD Report</b>",
+            f"📅 {now_str}",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "📡 <b>Today's Collection</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"Universe        : {universe_size} FNO stocks",
+            f"Passes run      : {passes_run}",
+            "",
+            f"✅ Snapshots OK : {total_snaps:,}",
+            f"❌ Failed       : {total_fails:,}",
+            f"📋 Daily saves  : {daily_saves} / {universe_size} stocks",
+            "",
+            f"Success rate    : {pass_rate}",
+        ]
+
+        # Pass timeline — show first, last, and any with failures
+        if self._pass_log:
+            lines += ["", "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                      "🕐 <b>Pass Timeline</b>",
+                      "━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+            shown_indices = {0, len(self._pass_log) - 1}
+            for i, p in enumerate(self._pass_log):
+                if p["saved"] < p["total"]:
+                    shown_indices.add(i)
+
+            prev_shown = True
+            for i, p in enumerate(self._pass_log):
+                if i in shown_indices:
+                    icon   = "✅" if p["saved"] == p["total"] else "⚠️"
+                    label  = f"{p['time']} {p['kind']:<8}"
+                    result = f"{icon} {p['saved']:>3} / {p['total']}"
+                    suffix = "  ← last pass" if i == len(self._pass_log) - 1 else ""
+                    lines.append(f"{label}  {result}{suffix}")
+                    prev_shown = True
+                elif prev_shown:
+                    lines.append("  ...")
+                    prev_shown = False
+
+        # History DB stats
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "🗄️ <b>History DB</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"Symbols tracked      : {stats.get('symbols_with_history', 0)}",
+            f"Avg history depth    : {stats.get('avg_history_days', 0)} days",
+            f"Min history (symbol) : {stats.get('min_history_days', 0)} days"
+            f"  ({stats.get('min_history_symbol', '—')})",
+            f"Total intraday rows  : {stats.get('total_intraday_rows', 0):,}",
+            f"Total daily rows     : {stats.get('total_daily_rows', 0):,}",
+        ]
+
+        # Worst offenders (3+ failures)
+        offenders = [(sym, cnt) for sym, cnt in self._fail_counts.most_common()
+                     if cnt >= 3]
+        if offenders:
+            lines += ["", "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                      "⚠️ <b>Worst Offenders Today</b>",
+                      "━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+            for sym, cnt in offenders[:8]:
+                lines.append(f"{sym:<12} — {cnt} fails")
+
+        return "\n".join(lines)
+
+    def _send_eod_summary(self, universe_size: int) -> None:
+        try:
+            msg = self._build_eod_message(universe_size)
+            ok  = self._send_telegram(msg)
+            logger.info("EOD summary %s", "sent" if ok else "logged (Telegram not configured)")
+            logger.info("\n%s", msg)
+        except Exception:
+            logger.exception("EOD summary failed")
 
     # ── main loop ─────────────────────────────────────────────────────────────
 
@@ -314,10 +444,19 @@ class IVCollector:
 
         _intraday_last_pass: datetime = None
         INTRADAY_INTERVAL = 15 * 60  # 15 minutes between full sweeps
+        EOD_REPORT_TIME   = dt_time(15, 35)
+        _last_reset_date  = datetime.now().date()
 
         while True:
             now = datetime.now()
             t   = now.time()
+
+            # Reset daily tracking at midnight
+            if now.date() != _last_reset_date:
+                self._pass_log    = []
+                self._fail_counts = Counter()
+                self._eod_sent    = False
+                _last_reset_date  = now.date()
 
             if now.weekday() >= 5:
                 logger.info("Weekend — sleeping 10 min")
@@ -340,6 +479,11 @@ class IVCollector:
                     time.sleep(30)
 
             else:
+                if not self._eod_sent and t >= EOD_REPORT_TIME:
+                    universe_size = len(scanner.fno_stocks) if scanner else 0
+                    self._send_eod_summary(universe_size)
+                    self._eod_sent = True
+
                 logger.debug("Post-market idle | time=%s", t.strftime("%H:%M"))
                 _intraday_last_pass = None
                 time.sleep(60)
