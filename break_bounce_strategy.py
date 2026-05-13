@@ -36,6 +36,7 @@ from momentum_strategy import (
     MomentumScanner,
     MomentumTradeJournal,
 )
+from load_scrip_master_sqlite import get_security_id_symbol_map
 from break_bounce_config import (
     CAPITAL, BB_RISK, BB_BREAKOUT, BB_LIQUIDITY, BB_STRIKE,
     SCRIP_MASTER_DB, TRADE_LOG_PATH, LOT_SIZE_FALLBACK,
@@ -692,18 +693,41 @@ class BreakBounceStrategyRunner:
         try:
             self._ensure_components()
 
-            all_stocks = self._scanner_obj.fno_stocks   # {security_id: symbol} — full universe
+            all_stocks = self._scanner_obj.fno_stocks   # {fno_sec_id: symbol} — full universe
+
+            # fno_stocks has NSE_FNO segment security IDs (for option chains).
+            # historical_daily_data requires NSE_EQ segment IDs — different numbers.
+            # Look them up once from scrip master (SEM_SEGMENT='E', SEM_EXM_EXCH_ID='NSE').
+            all_symbols    = list(all_stocks.values())
+            eq_id_map      = get_security_id_symbol_map(all_symbols, exchange="NSE")
+            symbol_to_eq_id = {sym: sec_id for sec_id, sym in eq_id_map.items()}
+            logger.info("B&B: resolved NSE_EQ security IDs for %d/%d symbols",
+                        len(symbol_to_eq_id), len(all_stocks))
+
             self._daily_levels = {}
             self._stock_states = {}
 
             failed = 0
-            for sec_id, symbol in all_stocks.items():
-                seg    = self._exchange_segment(symbol)
-                levels = self._bb_scanner.get_yesterday_levels(sec_id, seg)
+            for fno_sec_id, symbol in all_stocks.items():
+                seg = self._exchange_segment(symbol)
+
+                # Indices use IDX_I segment — their fno_sec_id works directly
+                if seg == "IDX_I":
+                    candle_sec_id = fno_sec_id
+                else:
+                    candle_sec_id = symbol_to_eq_id.get(symbol)
+                    if candle_sec_id is None:
+                        logger.debug("B&B: no NSE_EQ ID for %s — skipping", symbol)
+                        failed += 1
+                        continue
+
+                levels = self._bb_scanner.get_yesterday_levels(candle_sec_id, seg)
                 if levels.get("yesterday_high", 0) > 0:
-                    self._daily_levels[sec_id] = {
-                        **levels, "symbol": symbol, "segment": seg}
-                    self._stock_states[sec_id] = {
+                    self._daily_levels[fno_sec_id] = {
+                        **levels, "symbol": symbol, "segment": seg,
+                        "candle_sec_id": candle_sec_id,
+                    }
+                    self._stock_states[fno_sec_id] = {
                         "symbol":             symbol,
                         "breakout_direction": None,
                         "breakout_level":     0.0,
@@ -716,15 +740,9 @@ class BreakBounceStrategyRunner:
 
             count = len(self._daily_levels)
             logger.info(
-                "B&B premarket: %d/%d stocks with valid daily levels (%d failed/empty API)",
+                "B&B premarket: %d/%d stocks with valid daily levels (%d failed/no NSE_EQ ID)",
                 count, len(all_stocks), failed,
             )
-            if count == 0:
-                logger.warning(
-                    "B&B premarket: ALL daily level fetches returned empty. "
-                    "Check if Dhan historical_daily_data is working — "
-                    "enable DEBUG logging to see per-stock API responses."
-                )
             self._notifier.send_premarket_report(count, self.risk_manager.summary())
             return {"levels_loaded": count, "total": len(all_stocks), "failed": failed}
 
