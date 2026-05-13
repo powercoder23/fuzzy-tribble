@@ -241,11 +241,13 @@ class MomentumRegimeFilter:
     def get_daily_candles(self, security_id, exchange_segment, days=60) -> pd.DataFrame:
         """Fetch daily OHLCV for the underlying (not the option)."""
         empty = pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+        # historical_daily_data needs equity segment for stocks — NSE_FNO is option-chain only
+        candle_segment = "IDX_I" if exchange_segment == "IDX_I" else "NSE_EQ"
         try:
             response = self.dhan.historical_daily_data(
                 security_id      = str(security_id),
-                exchange_segment = exchange_segment,
-                instrument_type  = "INDEX" if exchange_segment == "IDX_I" else "EQUITY",
+                exchange_segment = candle_segment,
+                instrument_type  = "INDEX" if candle_segment == "IDX_I" else "EQUITY",
                 expiry_code      = 0,
                 from_date        = (date.today() - timedelta(days=days + 20)).isoformat(),
                 to_date          = date.today().isoformat(),
@@ -899,10 +901,13 @@ class MomentumStrategyRunner:
         try:
             df = self._regime_filter.get_daily_candles("20", "IDX_I", days=5)
             if df.empty:
+                logger.warning("VIX fetch returned empty — security_id 20 may be wrong for Dhan. Proceeding without VIX gate.")
                 return -1.0
-            return float(df["close"].iloc[-1])
+            vix = float(df["close"].iloc[-1])
+            logger.info("India VIX: %.2f", vix)
+            return vix
         except Exception:
-            logger.warning("_get_india_vix failed")
+            logger.warning("_get_india_vix failed — proceeding without VIX gate")
             return -1.0
 
     def _select_strike(self, chain: dict, spot: float, side: str,

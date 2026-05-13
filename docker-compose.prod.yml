@@ -38,7 +38,10 @@ services:
     command: python momentum_runner.py
 
   # ── Service 3: Discount/Premium Strategy ──────────────────────────────────
+  # PAUSED — assign profile so it does NOT start with plain `docker-compose up`.
+  # To start manually: docker-compose -f docker-compose.prod.yml up --profile discount
   discount:
+    profiles: ["discount"]
     build:
       context: .
       dockerfile: Dockerfile.discount
@@ -55,3 +58,25 @@ services:
     depends_on:
       - iv-collector
     command: python main.py --auto-loop
+
+  # ── Service 4: Break and Bounce Strategy ──────────────────────────────────
+  # Step 1: Mark yesterday's daily candle high/low as key levels.
+  # Step 2: Wait for 15-min close above/below the level (9:15–11:45 window).
+  # Step 3: After breakout, enter on Hammer/Engulfing at the retest on 5-min.
+  break-bounce:
+    build:
+      context: .
+      dockerfile: Dockerfile.break-bounce
+    container_name: break-bounce-strategy
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python break_bounce_runner.py
