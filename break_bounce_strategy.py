@@ -134,26 +134,89 @@ class BreakBounceScanner:
 
     # ---- Step 1: Daily levels --------------------------------------------------
 
+    def _fetch_daily_candles(self, security_id, exchange_segment, days: int = 10) -> pd.DataFrame:
+        """
+        Fetch daily OHLCV directly from Dhan, handling its columnar dict response.
+
+        Dhan historical_daily_data returns:
+          {"status": "success", "data": {"open": [...], "high": [...], "timestamp": [...]}}
+        The shared MomentumRegimeFilter.get_daily_candles only handles list-of-rows,
+        so it silently returns empty for this format. This method handles it correctly.
+        """
+        empty = pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+        candle_seg = "IDX_I" if exchange_segment == "IDX_I" else "NSE_EQ"
+        try:
+            response = self.scanner.dhan.historical_daily_data(
+                security_id      = str(security_id),
+                exchange_segment = candle_seg,
+                instrument_type  = "INDEX" if candle_seg == "IDX_I" else "EQUITY",
+                expiry_code      = 0,
+                from_date        = (date.today() - timedelta(days=days + 20)).isoformat(),
+                to_date          = date.today().isoformat(),
+            )
+            if not isinstance(response, dict):
+                logger.debug("daily candles: non-dict response | sec_id=%s | %s",
+                             security_id, str(response)[:150])
+                return empty
+
+            status = response.get("status", "")
+            if status != "success":
+                logger.debug("daily candles: status=%s | sec_id=%s | remarks=%s",
+                             status, security_id, str(response.get("remarks", ""))[:150])
+                return empty
+
+            data = response.get("data", {})
+
+            # Columnar dict: {"open": [...], "high": [...], "low": [...],
+            #                 "close": [...], "volume": [...], "timestamp": [...]}
+            if isinstance(data, dict) and "open" in data and "close" in data:
+                df = pd.DataFrame(data)
+            elif isinstance(data, list) and data:
+                df = pd.DataFrame(data)
+            else:
+                logger.debug("daily candles: unrecognised data shape | sec_id=%s | keys=%s",
+                             security_id, list(data.keys()) if isinstance(data, dict) else type(data))
+                return empty
+
+            df.columns = [c.lower() for c in df.columns]
+            ts_col = next((c for c in df.columns
+                           if c in ("timestamp", "start_time", "date", "time")), None)
+            if ts_col:
+                # Dhan returns epoch integers (Unix seconds) — must use unit='s'
+                df["date"] = pd.to_datetime(df[ts_col], unit="s", errors="coerce") \
+                               .dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata") \
+                               .dt.date.astype(str)
+            elif "date" not in df.columns:
+                return empty
+
+            for col in ("open", "high", "low", "close", "volume"):
+                if col not in df.columns:
+                    df[col] = 0.0
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            df = df.dropna(subset=["close"])
+            df = df[df["close"] > 0].sort_values("date").reset_index(drop=True)
+            return df[["date", "open", "high", "low", "close", "volume"]]
+
+        except Exception:
+            logger.exception("_fetch_daily_candles failed | sec_id=%s", security_id)
+            return empty
+
     def get_yesterday_levels(self, security_id, exchange_segment) -> dict:
         """Return yesterday's daily candle high and low."""
         empty = {"yesterday_high": 0.0, "yesterday_low": 0.0, "date": ""}
-        df = self._daily_fetcher.get_daily_candles(security_id, exchange_segment, days=10)
+        df = self._fetch_daily_candles(security_id, exchange_segment, days=10)
         if df is None or df.empty:
             logger.debug("get_yesterday_levels: empty df | sec_id=%s seg=%s",
                          security_id, exchange_segment)
             return empty
-        logger.debug("get_yesterday_levels: %d rows | sec_id=%s | last_date=%s high=%.2f low=%.2f",
-                     len(df), security_id,
-                     df.iloc[-1].get("date", "?"),
-                     float(df.iloc[-1]["high"]),
-                     float(df.iloc[-1]["low"]))
-        # df sorted ascending; iloc[-1] = most recent complete daily candle = yesterday
         yesterday = df.iloc[-1]
         yh = float(yesterday["high"])
         yl = float(yesterday["low"])
+        logger.debug("get_yesterday_levels: %d rows | sec_id=%s | date=%s high=%.2f low=%.2f",
+                     len(df), security_id, yesterday.get("date", "?"), yh, yl)
         if yh <= 0 or yl <= 0:
-            logger.warning("get_yesterday_levels: zero high/low | sec_id=%s date=%s",
-                           security_id, yesterday.get("date", "?"))
+            logger.warning("get_yesterday_levels: zero high/low | sec_id=%s", security_id)
             return empty
         return {
             "yesterday_high": yh,
