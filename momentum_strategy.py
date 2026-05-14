@@ -21,6 +21,7 @@ from discount import (
 )
 from token_manager import TokenManager
 from config import Config
+from load_scrip_master_sqlite import get_security_id_symbol_map
 import iv_store
 from momentum_config import (
     CAPITAL, RISK_CONFIG, REGIME, ORB, LIQUIDITY, STRIKE,
@@ -392,11 +393,12 @@ class MomentumScanner:
         """Fetch intraday candles from Dhan at the requested interval."""
         empty = pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume", "vwap"])
         today = date.today().isoformat()
+        candle_segment = "IDX_I" if exchange_segment == "IDX_I" else "NSE_EQ"
         try:
             response = self.dhan.intraday_minute_data(
                 security_id      = str(security_id),
-                exchange_segment = exchange_segment,
-                instrument_type  = "INDEX" if exchange_segment == "IDX_I" else "EQUITY",
+                exchange_segment = candle_segment,
+                instrument_type  = "INDEX" if candle_segment == "IDX_I" else "EQUITY",
                 from_date        = today,
                 to_date          = today,
                 interval         = interval_minutes,
@@ -893,6 +895,7 @@ class MomentumStrategyRunner:
         self._ranker          = MomentumSignalRanker()
         self._affordable_universe: dict = {}
         self._regime_cache: dict        = {}
+        self._eq_id_map: dict           = {}   # {fno_sec_id: eq_sec_id}
 
     def _build_scanner(self) -> DiscountedPremiumScanner:
         token = self.token_manager.refresh_if_needed()
@@ -919,12 +922,38 @@ class MomentumStrategyRunner:
         INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
         return "IDX_I" if symbol in INDEX_SYMBOLS else "NSE_FNO"
 
+    def _resolve_eq_ids(self, fno_stocks: dict) -> dict:
+        """Build {fno_sec_id: eq_sec_id} for candle API calls.
+        fno_stocks uses NSE_FNO security IDs; historical/intraday candle APIs
+        require NSE_EQ IDs — different numbers for the same underlying.
+        """
+        INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
+        stock_symbols = [s for s in fno_stocks.values() if s not in INDEX_SYMBOLS]
+        try:
+            eq_map = get_security_id_symbol_map(stock_symbols, exchange="NSE")
+            sym_to_eq = {sym: sec_id for sec_id, sym in eq_map.items()}
+        except Exception:
+            logger.exception("_resolve_eq_ids: scrip master lookup failed — candles may be unavailable")
+            sym_to_eq = {}
+
+        result = {}
+        for fno_id, symbol in fno_stocks.items():
+            if symbol in INDEX_SYMBOLS:
+                result[fno_id] = fno_id
+            elif symbol in sym_to_eq:
+                result[fno_id] = sym_to_eq[symbol]
+            else:
+                result[fno_id] = fno_id  # fallback; candle call may fail
+        logger.info("_resolve_eq_ids: resolved %d/%d symbols to NSE_EQ IDs",
+                    sum(1 for fid, eid in result.items() if fid != eid), len(fno_stocks))
+        return result
+
     def _get_india_vix(self) -> float:
         """Fetch India VIX daily data. Returns last close. Returns -1.0 on failure."""
         try:
-            df = self._regime_filter.get_daily_candles("20", "IDX_I", days=5)
+            df = self._regime_filter.get_daily_candles("21", "IDX_I", days=5)
             if df.empty:
-                logger.warning("VIX fetch returned empty — security_id 20 may be wrong for Dhan. Proceeding without VIX gate.")
+                logger.warning("VIX fetch returned empty — proceeding without VIX gate")
                 return -1.0
             vix = float(df["close"].iloc[-1])
             logger.info("India VIX: %.2f", vix)
@@ -1100,11 +1129,13 @@ class MomentumStrategyRunner:
             affordable = self._affordability.get_affordable_universe(
                 self._scanner.fno_stocks)
             self._affordable_universe = affordable
+            self._eq_id_map = self._resolve_eq_ids(self._scanner.fno_stocks)
 
             candidates = dict(list(affordable.items())[:60])
             for sec_id, symbol in candidates.items():
-                segment = self._get_exchange_segment(symbol)
-                result  = self._regime_filter.detect(sec_id, segment, symbol)
+                segment   = self._get_exchange_segment(symbol)
+                eq_sec_id = self._eq_id_map.get(sec_id, sec_id)
+                result    = self._regime_filter.detect(eq_sec_id, segment, symbol)
                 self._regime_cache[sec_id] = result
                 time.sleep(0.3)
 
@@ -1161,11 +1192,13 @@ class MomentumStrategyRunner:
                 regime = self._regime_cache.get(sec_id, {})
                 if not regime.get("tradeable"):
                     continue
-                segment  = self._get_exchange_segment(symbol)
-                orb_sig  = self._mom_scanner.check_orb_signal(sec_id, segment, symbol)
-                vwap_sig = self._mom_scanner.check_vwap_signal(sec_id, segment, symbol)
+                segment   = self._get_exchange_segment(symbol)
+                eq_sec_id = self._eq_id_map.get(sec_id, sec_id)
+                orb_sig   = self._mom_scanner.check_orb_signal(eq_sec_id, segment, symbol)
+                vwap_sig  = self._mom_scanner.check_vwap_signal(eq_sec_id, segment, symbol)
                 for sig in [orb_sig, vwap_sig]:
                     if sig["signal"] != "NONE":
+                        sig["security_id"] = sec_id  # restore fno_sec_id for regime/chain lookup
                         raw_signals.append(sig)
                 time.sleep(0.3)
 
