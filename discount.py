@@ -16,6 +16,7 @@ import warnings
 from config import Config
 from f_o_stocks_list import get_stock_futures
 from load_scrip_master_sqlite import update_scrip_master, get_security_id_symbol_map
+from trader_logger import TraderLogger
 warnings.filterwarnings('ignore')
 
 logging.basicConfig(
@@ -322,28 +323,38 @@ NEAR_WALL_STRIKE_DISTANCE = 50.0
 # tuned without hunting through method bodies.
 
 # IV percentile gates
-IV_PCT_ACTIVE_SCAN_MAX      = 35    # run_active_scanner: reject above this
-IV_PCT_STRADDLE_MAX         = 20    # _build_candidate_rows: straddle only below this
-IV_PCT_NO_TRIGGER_MAX       = 20    # run_active_scanner: no-trigger straddle gate
+IV_PCT_ACTIVE_SCAN_MAX      = 30    # run_active_scanner: reject above this
+IV_PCT_STRADDLE_MAX         = 15    # _build_candidate_rows: straddle only below this
+IV_PCT_NO_TRIGGER_MAX       = 15    # run_active_scanner: no-trigger straddle gate
 
 # Watchlist filters
-WATCHLIST_MAX_SYMBOLS      = 40
-WATCHLIST_MIN_AVG_VOLUME    = 300   # build_watchlist_eod: minimum avg option volume
-WATCHLIST_MIN_RANGE_PCT     = 1.5   # build_watchlist_eod: minimum 5-day price range %
+WATCHLIST_MAX_SYMBOLS      = 25
+WATCHLIST_MIN_AVG_VOLUME    = 800   # build_watchlist_eod: minimum avg option volume
+WATCHLIST_MIN_RANGE_PCT     = 2.0   # build_watchlist_eod: minimum 5-day price range %
 
 # Spread limits
-MAX_SPREAD_RATIO            = 0.15  # _build_candidate_rows: hard reject above this
+MAX_SPREAD_RATIO            = 0.06  # _build_candidate_rows: hard reject above this
 
 # Scoring
-MIN_DISCOUNT_SCORE          = 38    # scan_all_fno_stocks / run_discount_scan
+MIN_DISCOUNT_SCORE          = 62    # scan_all_fno_stocks / run_discount_scan
 
 # Volume spike
-VOLUME_SPIKE_MULTIPLIER     = 2.5   # compute_triggers + detect_volume_spike threshold
+VOLUME_SPIKE_MULTIPLIER     = 3.0   # compute_triggers + detect_volume_spike threshold
 VOLUME_SPIKE_SCALE          = 2.5   # denominator for strength scaling above threshold
 
 # Warmup morning scan
-WARMUP_MORNING_TOP_N        = 40    # number of stocks selected at 9:50 for active scan
+WARMUP_MORNING_TOP_N        = 20    # number of stocks selected at 9:50 for active scan
 EVENT_FILTER_ENABLED        = True  # set False to allow event-risk stocks through all filters
+
+# Alert volume + quality gates (added by fix_discount.md Step 1)
+MAX_ALERTS_PER_SCAN      = 8
+MAX_ALERTS_PER_SYMBOL    = 1
+MIN_TRIGGER_STRENGTH     = 0.35
+MIN_DTE                  = 4
+MAX_DTE                  = 14
+MIN_PREMIUM_NIFTY        = 25
+MIN_PREMIUM_STOCK        = 8
+MAX_INDIA_VIX_FOR_BUYING = 20
 
 class DiscountedPremiumScanner:
     """
@@ -4062,6 +4073,22 @@ class DiscountedPremiumScanner:
         if not filtered_option_chain:
             filtered_option_chain = dict(option_chain)
         
+        if getattr(self, "trader_log", None) is not None:
+            self.trader_log.log_symbol_context(
+                symbol=security_name,
+                spot=spot_price,
+                dte=dte,
+                expiry=expiry,
+                atm_iv=atm_context.get("atm_iv"),
+                iv_rank=iv_rank_atm,
+                iv_percentile=iv_percentile_atm,
+                iv_regime=classify_iv_regime(iv_rank_atm, iv_percentile_atm),
+                weighted_hv=hv_metrics.get("weighted_hv"),
+                iv_history_samples=len(historical_ivs),
+                pcr=pcr_value,
+                sentiment_bias=sentiment_bias,
+            )
+
         # Scan each strike
         self._scan_quality_stats = {"pre_quality": 0, "post_quality": 0}
         self._score_debug_candidates = []
@@ -4165,7 +4192,68 @@ class DiscountedPremiumScanner:
         return all_discounted
     
     # ==================== 4. MULTI-STOCK SCANNER ====================
-    
+
+    def passes_quality_gates(self, candidate):
+        """Hard quality gates. Every rejection logs via trader_log."""
+        sym = candidate.get("symbol")
+        strike = candidate.get("strike")
+        opt_type = candidate.get("type")
+
+        dte = candidate.get("dte")
+        if dte is None or dte < MIN_DTE or dte > MAX_DTE:
+            self.trader_log.log_gate_reject(sym, "dte", dte, f"[{MIN_DTE},{MAX_DTE}]", strike, opt_type)
+            return False
+
+        entry = candidate.get("entry") or 0
+        floor = MIN_PREMIUM_NIFTY if sym in ("NIFTY", "BANKNIFTY", "FINNIFTY") else MIN_PREMIUM_STOCK
+        if entry < floor:
+            self.trader_log.log_gate_reject(sym, "premium_floor", entry, floor, strike, opt_type)
+            return False
+
+        spread = candidate.get("spread")
+        if spread is not None and spread > MAX_SPREAD_RATIO:
+            self.trader_log.log_gate_reject(sym, "spread", spread, MAX_SPREAD_RATIO, strike, opt_type)
+            return False
+
+        abs_delta = abs(candidate.get("delta") or 0)
+        if abs_delta < 0.20 or abs_delta > 0.55:
+            self.trader_log.log_gate_reject(sym, "delta_band", abs_delta, "[0.20, 0.55]", strike, opt_type)
+            return False
+
+        moneyness = abs(candidate.get("moneyness") or 100)
+        if moneyness > 3.0:
+            self.trader_log.log_gate_reject(sym, "moneyness", moneyness, "<3.0%", strike, opt_type)
+            return False
+
+        conviction = str(candidate.get("conviction", "LOW")).upper()
+        if conviction == "LOW":
+            self.trader_log.log_gate_reject(sym, "conviction", conviction, "MED|HIGH", strike, opt_type)
+            return False
+
+        rr = candidate.get("risk_reward")
+        if rr is None or rr < 1.8:
+            self.trader_log.log_gate_reject(sym, "rr", rr, ">=1.8", strike, opt_type)
+            return False
+
+        if candidate.get("trade_type") == "directional":
+            trig_strength = (candidate.get("triggers") or {}).get("strength_score", 0)
+            if trig_strength < MIN_TRIGGER_STRENGTH:
+                self.trader_log.log_gate_reject(sym, "trigger_strength", trig_strength, MIN_TRIGGER_STRENGTH, strike, opt_type)
+                return False
+
+        return True
+
+    def fetch_india_vix(self):
+        """Fetch current India VIX. Returns None on failure (fail-open)."""
+        try:
+            response = self.dhan.quote_data({"IDX_I": [21]})
+            data = unwrap_dhan_payload(response.get("data") or {})
+            vix = data.get("IDX_I", {}).get("21", {}).get("last_price")
+            return float(vix) if vix is not None else None
+        except Exception:
+            logger.exception("Failed to fetch India VIX")
+            return None
+
     def scan_all_fno_stocks(self, security_ids=None, expiry=None, min_discount_score=40):
         """
         Scan all FNO stocks for discounted premiums
@@ -4180,7 +4268,20 @@ class DiscountedPremiumScanner:
         """
         if security_ids is None:
             security_ids = self.fno_stocks
-        
+
+        self.trader_log = TraderLogger(scan_type="eod_discount")
+        vix = self.fetch_india_vix()
+        self.trader_log.log_scan_start(
+            vix=vix,
+            capital=self._capital(),
+            universe_size=len(security_ids),
+        )
+        if vix is not None and vix > MAX_INDIA_VIX_FOR_BUYING:
+            self.trader_log.log_scan_abort(
+                "vix_too_high", vix=vix, threshold=MAX_INDIA_VIX_FOR_BUYING
+            )
+            return pd.DataFrame()
+
         all_opportunities = []
         
         for sec_id, sec_name in security_ids.items():
@@ -4211,11 +4312,17 @@ class DiscountedPremiumScanner:
 
                     # Add stock info and filter
                     for opt in discounted:
-                        if opt['score'] >= min_discount_score:
-                            opt['symbol'] = sec_name
-                            opt['security_id'] = sec_id
-                            opt['expiry'] = opt.get('expiry') or current_expiry
-                            all_opportunities.append(opt)
+                        opt['symbol'] = sec_name
+                        opt['security_id'] = sec_id
+                        opt['expiry'] = opt.get('expiry') or current_expiry
+                        if opt['score'] < min_discount_score:
+                            self.trader_log.log_candidate(opt, decision="gated")
+                            continue
+                        if not self.passes_quality_gates(opt):
+                            self.trader_log.log_candidate(opt, decision="gated")
+                            continue
+                        self.trader_log.log_candidate(opt, decision="accepted")
+                        all_opportunities.append(opt)
 
                     # Rate limiting
                     time.sleep(0.5)
@@ -4228,10 +4335,16 @@ class DiscountedPremiumScanner:
             df = pd.DataFrame(all_opportunities)
             df = df.sort_values('score', ascending=False)
             logger.info("Global opportunities before_cap=%s", len(df))
-            df = pd.DataFrame(self.select_top_trades(df, limit=500, max_per_direction=260))
+            df = pd.DataFrame(self.select_top_trades(
+                df,
+                limit=MAX_ALERTS_PER_SCAN * 3,
+                max_per_direction=MAX_ALERTS_PER_SCAN,
+            ))
             logger.info("Global opportunities after_cap=%s", len(df))
+            self.trader_log.log_scan_summary(total_alerts=len(df))
             return df
         else:
+            self.trader_log.log_scan_summary(total_alerts=0)
             return pd.DataFrame()
     
     # ==================== 5. REPORTING ====================
@@ -4357,10 +4470,20 @@ if __name__ == "__main__":
     # Option 2: Scan all FNO stocks
     logger.info("Scanning all FNO stocks...")
     all_opportunities = scanner.scan_all_fno_stocks(
-        min_discount_score=40
+        min_discount_score=MIN_DISCOUNT_SCORE
     )
     all_opportunities = reduce_to_one_per_symbol_expiry(all_opportunities)
-    
+
+    if not all_opportunities.empty:
+        all_opportunities = (
+            all_opportunities
+            .sort_values("score", ascending=False)
+            .groupby("symbol", group_keys=False)
+            .head(MAX_ALERTS_PER_SYMBOL)
+            .head(MAX_ALERTS_PER_SCAN)
+            .reset_index(drop=True)
+        )
+
     # Generate report
     scanner.generate_report(all_opportunities)
     
