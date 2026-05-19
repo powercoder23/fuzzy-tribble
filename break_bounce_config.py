@@ -40,7 +40,7 @@ BB_STRIKE = {
 }
 
 SCRIP_MASTER_DB = str(Path("data") / "api-scrip-master.db")
-IV_HISTORY_DB   = "iv_history.db"
+IV_HISTORY_DB   = str(Path("data") / "iv_history.db")
 TRADE_LOG_PATH  = str(Path("data") / "break_bounce_trades.csv")
 
 LOT_SIZE_FALLBACK = {

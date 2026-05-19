@@ -277,13 +277,12 @@ class StrategySchedulerApp:
         Clock-aware automated loop.
 
         Before 09:15  : rebuild EOD watchlist, sleep 60s between runs.
-        09:15 - 09:50 : continuous warmup over ALL F&O stocks with no
-                        artificial sleep. rate_limited_call() is the only brake.
-                        At the moment 09:50 is first crossed,
-                        run_morning_warmup_and_select() fires once to score
-                        all stocks, pick the top 40, and send a Telegram alert.
-                        That top-40 list becomes the active watchlist.
-        09:50 - 15:20 : active scanner every 5 minutes on the top-40 list.
+        09:15 - 09:50 : idle. IV warmup is owned by the iv-collector service;
+                        the discount service is a read-only consumer of the
+                        shared iv_history. At 09:50 run_morning_warmup_and_select()
+                        fires once — scoring stocks off the collector's intraday
+                        snapshots — to pick the top-N active watchlist.
+        09:50 - 15:20 : active scanner every 5 minutes on the top-N list.
         After 15:20   : idle, sleep 60s.
         """
         self.warm_up_token()
@@ -302,9 +301,13 @@ class StrategySchedulerApp:
                 time.sleep(60)
 
             elif dt_time(9, 15) <= now < dt_time(9, 50):
-                self.run_auto_warmup_cycle()
+                # IV warmup is owned by the iv-collector service. The discount
+                # service only consumes iv_history — running its own warmup here
+                # would double the option-chain API load and trigger Dhan 805s.
+                logger.info("Warmup window — IV collection handled by iv-collector; idling")
                 if exit_after_one_cycle:
                     return
+                time.sleep(60)
 
             elif dt_time(9, 50) <= now <= dt_time(15, 20):
                 if _morning_selection_done_today != today:

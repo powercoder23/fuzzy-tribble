@@ -27,7 +27,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 IV_HISTORY_FILE = Path("iv_history.csv")
-DB_PATH = "iv_history.db"
+# Lives inside the shared Docker volume (/app/data) so iv-collector and every
+# strategy service read/write the same SQLite file.
+DB_PATH = str(Path("data") / "iv_history.db")
 EXPIRED_OPTIONS_CACHE_DIR = Path("data/expired_options_cache")
 MIN_IV_SAMPLES = 30
 DEFAULT_FNO_STOCKS = {

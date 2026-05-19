@@ -210,6 +210,14 @@ class BreakBounceScanner:
             logger.debug("get_yesterday_levels: empty df | sec_id=%s seg=%s",
                          security_id, exchange_segment)
             return empty
+        # historical_daily_data includes today's in-progress candle during market
+        # hours. Drop it so a mid-session restart still anchors to yesterday's H/L
+        # rather than comparing the breakout against today's own forming candle.
+        df = df[df["date"] != date.today().isoformat()]
+        if df.empty:
+            logger.debug("get_yesterday_levels: only today's candle present | sec_id=%s",
+                         security_id)
+            return empty
         yesterday = df.iloc[-1]
         yh = float(yesterday["high"])
         yl = float(yesterday["low"])

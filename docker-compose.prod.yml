@@ -38,10 +38,9 @@ services:
     command: python momentum_runner.py
 
   # ── Service 3: Discount/Premium Strategy ──────────────────────────────────
-  # PAUSED — assign profile so it does NOT start with plain `docker-compose up`.
-  # To start manually: docker-compose -f docker-compose.prod.yml up --profile discount
+  # Reads IV history from the shared ./data volume (written by iv-collector).
+  # Runs the discount scanner only — it does NOT collect IV itself.
   discount:
-    profiles: ["discount"]
     build:
       context: .
       dockerfile: Dockerfile.discount

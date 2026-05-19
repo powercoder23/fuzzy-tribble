@@ -15,7 +15,9 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = str(Path("iv_history.db"))
+# Lives inside the shared Docker volume (/app/data) so iv-collector and every
+# strategy service read/write the same SQLite file.
+DB_PATH = str(Path("data") / "iv_history.db")
 
 _CREATE_IV_HISTORY = """
 CREATE TABLE IF NOT EXISTS iv_history (
