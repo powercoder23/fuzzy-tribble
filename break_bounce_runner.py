@@ -8,8 +8,12 @@ chain (at signal time).
 
 Schedule:
   09:00        run_premarket  (load daily levels, affordability filter)
-  09:15–11:45  run_intraday_scan every 5 min (15-min breakout + 5-min entry)
-  15:15        daily summary + state reset
+  09:15–14:30  run_intraday_scan every 5 min
+                  - Stocks without a breakout get 15-min breakout check until 11:45
+                  - Stocks with a confirmed breakout get 5-min retest check
+                    every 5 min until 14:30 (giving late-window breakouts a
+                    fair chance to retest)
+  15:15        force-exit open positions + daily summary + state reset
 """
 
 import logging
@@ -48,10 +52,12 @@ logger = logging.getLogger(__name__)
 
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday"]
 
-# Every 5 min from 9:15 to 11:45 (inclusive)
+# Every 5 min from 9:15 to 14:30 (inclusive).
+# The scan itself only accepts new 15-min breakouts until 11:45 — past that, the
+# tick is used to keep checking 5-min retest patterns on stocks that already broke out.
 INTRADAY_TIMES: list[str] = []
 _h, _m = 9, 15
-while (_h, _m) <= (11, 45):
+while (_h, _m) <= (14, 30):
     INTRADAY_TIMES.append(f"{_h:02d}:{_m:02d}")
     _m += 5
     if _m >= 60:
@@ -91,7 +97,7 @@ def main():
 
     # If started mid-session, run premarket immediately so state is ready
     now = datetime.now().time()
-    if dt_time(9, 0) <= now <= dt_time(11, 45) and datetime.now().weekday() < 5:
+    if dt_time(9, 0) <= now <= dt_time(14, 30) and datetime.now().weekday() < 5:
         logger.info("Service started mid-session — running premarket immediately")
         _premarket()
 

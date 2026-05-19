@@ -235,10 +235,11 @@ class BreakBounceScanner:
         no_breakout = {"direction": "NONE", "breakout_level": 0.0, "reason": ""}
         try:
             now = datetime.now(IST)
+            # +30s grace so the 11:45-scheduled tick can still consume the 11:30→11:45 candle
             window_end = now.replace(
                 hour=BB_BREAKOUT["window_end_hour"],
                 minute=BB_BREAKOUT["window_end_min"],
-                second=0, microsecond=0,
+                second=30, microsecond=0,
             )
             if now > window_end:
                 return {**no_breakout, "reason": "window_expired"}
@@ -815,11 +816,12 @@ class BreakBounceStrategyRunner:
 
     def run_intraday_scan(self) -> list:
         """
-        Called every 5 min from 9:15–11:45.
+        Called every 5 min.
 
         For each tracked stock:
-          - If breakout not yet confirmed: run Step 2 (15-min breakout check)
-          - If breakout confirmed, no trade yet: run Step 3 (5-min entry check)
+          - If breakout not yet confirmed AND now <= 11:45+30s: Step 2 (15-min breakout)
+          - If breakout confirmed, no trade yet: Step 3 (5-min retest entry) — runs
+            past 11:45 too so a late-window breakout still gets its retest chance.
         """
         try:
             self._ensure_components()
@@ -828,11 +830,9 @@ class BreakBounceStrategyRunner:
             window_end = now.replace(
                 hour=BB_BREAKOUT["window_end_hour"],
                 minute=BB_BREAKOUT["window_end_min"],
-                second=0, microsecond=0,
+                second=30, microsecond=0,
             )
-            if now > window_end:
-                logger.debug("B&B: past 11:45 breakout window — skipping scan")
-                return []
+            in_breakout_window = now <= window_end
 
             if not self._daily_levels:
                 logger.warning("B&B: no daily levels cached — retrying premarket now")
@@ -840,6 +840,24 @@ class BreakBounceStrategyRunner:
             if not self._daily_levels:
                 logger.error("B&B: still no daily levels after retry — skipping scan")
                 return []
+
+            # Visibility: snapshot of where each stock sits in the per-stock state machine.
+            # "awaiting_retest" > 0 means the 5-min retest scan IS running for those stocks
+            # this tick (silent in logs unless a pattern matches).
+            states = list(self._stock_states.values())
+            watching = sum(1 for s in states
+                           if s["breakout_direction"] is None and not s.get("setup_voided"))
+            awaiting = sum(1 for s in states
+                           if s["breakout_direction"] is not None
+                           and not s.get("trade_placed")
+                           and not s.get("setup_voided"))
+            traded   = sum(1 for s in states if s.get("trade_placed"))
+            voided   = sum(1 for s in states if s.get("setup_voided"))
+            logger.info(
+                "B&B scan | breakout_window=%s | watching_15m=%d | awaiting_5m_retest=%d "
+                "| traded=%d | voided=%d",
+                in_breakout_window, watching, awaiting, traded, voided,
+            )
 
             signals_placed = []
 
@@ -850,11 +868,19 @@ class BreakBounceStrategyRunner:
                 levels = self._daily_levels.get(sec_id, {})
                 symbol = state["symbol"]
                 seg    = levels.get("segment", "NSE_FNO")
+                # Underlying candles need NSE_EQ ID for stocks; index sec IDs work as-is
+                candle_sec_id = levels.get("candle_sec_id", sec_id)
 
-                # ── Step 2: check 15-min breakout ────────────────────────────
+                # ── Step 2: check 15-min breakout (only inside 9:15–11:45 window) ──
                 if state["breakout_direction"] is None:
+                    if not in_breakout_window:
+                        state["setup_voided"] = True
+                        logger.debug("B&B %s: 11:45 window passed without breakout — voiding",
+                                     symbol)
+                        continue
+
                     result = self._bb_scanner.check_15min_breakout(
-                        sec_id, seg, symbol, levels)
+                        candle_sec_id, seg, symbol, levels)
                     direction = result.get("direction", "NONE")
 
                     if direction in ("BULLISH", "BEARISH"):
@@ -882,12 +908,23 @@ class BreakBounceStrategyRunner:
                     break
 
                 entry_signal = self._bb_scanner.check_5min_entry(
-                    sec_id, seg, symbol,
+                    candle_sec_id, seg, symbol,
                     state["breakout_direction"], state["breakout_level"])
 
                 if entry_signal.get("signal") == "NONE":
                     time.sleep(0.2)
                     continue
+
+                # Pattern fired — log before any downstream gate can reject it
+                logger.info(
+                    "B&B 5-MIN PATTERN: %s %s pattern=%s entry=%.2f sl_underlying=%.2f "
+                    "breakout_level=%.2f",
+                    symbol, entry_signal.get("signal"),
+                    entry_signal.get("pattern"),
+                    float(entry_signal.get("entry_price", 0.0)),
+                    float(entry_signal.get("sl_level", 0.0)),
+                    state.get("breakout_level", 0.0),
+                )
 
                 # ── Signal found — fetch option chain ────────────────────────
                 side = entry_signal["signal"]
@@ -984,21 +1021,32 @@ class BreakBounceStrategyRunner:
                 }
                 self._notifier.send_signal_alert(entry_signal, strike_data, lots, risk_data)
 
-                if os.getenv("AUTO_EXECUTE", "false").strip().lower() == "true":
+                sl_order_id = ""
+                auto_exec = os.getenv("AUTO_EXECUTE", "false").strip().lower() == "true"
+                if auto_exec:
                     order = self._place_order(strike_data, lots, lot_size, sl)
                     trade["order"] = order
+                    if order.get("status") != "ok":
+                        # Don't book a position when the broker rejected the buy
+                        logger.warning("B&B order failed for %s — not booking position: %s",
+                                       symbol, order)
+                        time.sleep(0.3)
+                        continue
+                    sl_order_id = order.get("sl_order_id", "")
 
                 self.risk_manager.record_trade()
                 self.risk_manager.add_position({
-                    "symbol":   symbol,
-                    "side":     side,
-                    "strike":   strike_data.get("strike"),
-                    "expiry":   expiry,
-                    "entry":    premium,
-                    "lots":     lots,
-                    "lot_size": lot_size,
-                    "sl":       sl,
-                    "target":   target,
+                    "symbol":             symbol,
+                    "side":               side,
+                    "strike":             strike_data.get("strike"),
+                    "expiry":             expiry,
+                    "entry":              premium,
+                    "lots":               lots,
+                    "lot_size":           lot_size,
+                    "sl":                 sl,
+                    "target":             target,
+                    "option_security_id": strike_data.get("option_security_id", ""),
+                    "sl_order_id":        sl_order_id,
                 })
                 state["trade_placed"] = True
                 signals_placed.append(trade)
@@ -1012,15 +1060,75 @@ class BreakBounceStrategyRunner:
             logger.exception("run_intraday_scan failed")
             return []
 
+    def _force_exit_all_positions(self) -> None:
+        """
+        Cancel any pending SL_M and place a MARKET SELL for every open position.
+        Called at EOD (15:15) to lock in price before the exchange's auto-square
+        at ~15:20 for INTRA orders. Already-filled SLs will simply reject — safe.
+        """
+        if not self.risk_manager.open_positions:
+            logger.info("B&B force exit: no open positions")
+            return
+
+        for pos in list(self.risk_manager.open_positions):
+            symbol      = pos.get("symbol", "?")
+            opt_sec_id  = pos.get("option_security_id", "")
+            sl_order_id = pos.get("sl_order_id", "")
+            qty         = pos.get("lots", 0) * pos.get("lot_size", 0)
+
+            if not opt_sec_id or qty <= 0:
+                logger.warning("B&B force exit %s: missing sec_id or qty — skip",
+                               symbol)
+                continue
+
+            # Cancel SL_M first so it doesn't double-fire after we square.
+            if sl_order_id:
+                try:
+                    cancel = getattr(self._scanner_obj.dhan, "cancel_order", None)
+                    if callable(cancel):
+                        cancel(sl_order_id)
+                        logger.info("B&B force exit %s: cancelled SL %s",
+                                    symbol, sl_order_id)
+                except Exception:
+                    logger.exception("B&B force exit %s: SL cancel failed "
+                                     "(may already be triggered)", symbol)
+
+            try:
+                resp = self._scanner_obj.dhan.place_order(
+                    security_id      = opt_sec_id,
+                    exchange_segment  = self._scanner_obj.dhan.NSE_FNO,
+                    transaction_type  = self._scanner_obj.dhan.SELL,
+                    quantity          = qty,
+                    order_type        = self._scanner_obj.dhan.MARKET,
+                    product_type      = self._scanner_obj.dhan.INTRA,
+                    price             = 0,
+                )
+                if isinstance(resp, dict) and resp.get("status") == "success":
+                    logger.info("B&B force exit %s: market sell placed qty=%d",
+                                symbol, qty)
+                    self._notifier.send(
+                        f"🔚 B&amp;B force exit <b>{symbol}</b>: market sell {qty} qty")
+                else:
+                    logger.warning("B&B force exit %s: sell rejected — %s",
+                                   symbol, resp)
+                    self._notifier.send(
+                        f"ℹ️ B&amp;B force exit <b>{symbol}</b>: sell rejected "
+                        "(likely SL already filled)")
+            except Exception:
+                logger.exception("B&B force exit %s: place_order exception", symbol)
+
+        self.risk_manager.open_positions = []
+
     def run_eod(self) -> None:
-        """Called at 15:15. Send daily summary and reset all state."""
+        """Called at 15:15. Force-close open positions, send summary, reset state."""
         try:
             self._ensure_components()
+            self._force_exit_all_positions()
             stats = self._journal.get_today_stats()
             self._notifier.send_daily_summary(stats, self.risk_manager.summary())
             self.risk_manager.reset_daily()
             self._stock_states = {}
             self._daily_levels = {}
-            logger.info("B&B EOD summary sent | stats=%s", stats)
+            logger.info("B&B EOD complete | stats=%s", stats)
         except Exception:
             logger.exception("run_eod failed")
