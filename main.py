@@ -9,22 +9,14 @@ import logging
 import os
 import time
 import argparse
-from datetime import datetime, time as dt_time
+from datetime import datetime
 from pathlib import Path
-from collections import deque
 
 import schedule
 
 from config import Config
 from token_manager import TokenManager
-from discount import (
-    DiscountedPremiumScanner,
-    MIN_DISCOUNT_SCORE,
-    get_trading_days_to_expiry,
-    init_iv_db,
-    migrate_csv_to_sqlite,
-    unwrap_dhan_payload,
-)
+from discount import DiscountedPremiumScanner
 
 
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Kolkata")
@@ -51,119 +43,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 class StrategySchedulerApp:
     def __init__(self):
         self.token_manager = TokenManager()
         self.strategy_jobs = [
             {
-                "name": "premarket_warmup",
-                "runner": self.run_premarket_warmup,
-                "times": ["09:15"],
-            },
+                "name": "discount",
+                "runner": self.run_discount_scan,
+                "times": DEFAULT_SCAN_TIMES,
+            }
         ]
-        logger.info("Legacy scanner disabled - using trigger-based system")
-
-    @staticmethod
-    def _warmup_security_segment(security_name):
-        return "IDX_I" if security_name in ["NIFTY", "BANKNIFTY"] else "NSE_FNO"
-
-    @staticmethod
-    def _validate_warmup_chain(scanner, chain_data):
-        if not isinstance(chain_data, dict):
-            return False, "empty option chain payload"
-        spot_price = chain_data.get("last_price")
-        option_chain = chain_data.get("oc")
-        if spot_price is None or not isinstance(option_chain, dict) or not option_chain:
-            return False, "empty option chain payload"
-        if len(option_chain) < 20:
-            return False, f"incomplete option chain ({len(option_chain)} strikes)"
-        atm_context = scanner.extract_atm_reference_ivs(option_chain, spot_price)
-        if not atm_context or atm_context.get("atm_iv") is None:
-            return False, "missing ATM IV"
-        return True, None
-
-    def process_symbol_with_retry(
-        self,
-        scanner,
-        security_id,
-        security_name,
-        expiry_cache,
-        max_retries=3,
-    ):
-        symbol_key = str(security_id)
-        security_segment = self._warmup_security_segment(security_name)
-
-        # Share one expiry lookup across all NSE_FNO stocks (same expiry dates).
-        _segment_cache_key = f"_seg_{security_segment}"
-        expiry = expiry_cache.get(symbol_key) or expiry_cache.get(_segment_cache_key)
-        if expiry is None:
-            expiries = scanner.get_expiry_list(security_id, security_segment)
-            if not expiries:
-                logger.info("Skipping %s - no expiries available (permanent)", security_name)
-                return None  # permanent: don't re-queue
-            selected_expiry = None
-
-            for exp in expiries:
-                dte = get_trading_days_to_expiry(exp)
-                if dte >= 7:
-                    selected_expiry = exp
-                    break
-
-            if not selected_expiry:
-                selected_expiry = expiries[min(1, len(expiries) - 1)]
-
-            expiry = selected_expiry
-            expiry_cache[symbol_key] = expiry
-            expiry_cache[_segment_cache_key] = expiry  # shared for same segment
-
-        dte = get_trading_days_to_expiry(expiry)
-        logger.info(f"Selected expiry: {expiry} (DTE: {dte})")
-
-        last_error = None
-        for attempt in range(max_retries):
-            logger.info("Warmup fetch %s | attempt %s/%s", security_name, attempt + 1, max_retries)
-            try:
-                chain_response = scanner.get_option_chain(security_id, security_segment, expiry)
-                if not isinstance(chain_response, dict) or chain_response.get("status") != "success":
-                    raise ValueError("invalid option chain response")
-                chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
-                is_valid, reason = self._validate_warmup_chain(scanner, chain_data)
-                if not is_valid:
-                    raise ValueError(reason)
-
-                spot_price = chain_data.get("last_price")
-                option_chain = chain_data.get("oc")
-                atm_context = scanner.extract_atm_reference_ivs(option_chain, spot_price)
-                chain_metrics = scanner.extract_chain_metrics(option_chain)
-                scanner.persist_iv_snapshot(
-                    security_id=security_id,
-                    exchange_segment=security_segment,
-                    security_name=security_name,
-                    expiry=expiry,
-                    spot_price=spot_price,
-                    atm_context=atm_context,
-                    chain_metrics=chain_metrics,
-                    store_intraday=True,
-                )
-                logger.info("Persisted IV snapshot for %s", security_name)
-                return True
-            except Exception as exc:
-                last_error = exc
-                scanner.runtime_state.get("option_chain", {}).pop((str(security_id), security_segment, expiry), None)
-                logger.warning(
-                    "Warmup fetch failed for %s on attempt %s/%s: %s",
-                    security_name,
-                    attempt + 1,
-                    max_retries,
-                    exc,
-                )
-                if attempt < max_retries - 1:
-                    is_rate_limit = "too many requests" in str(exc).lower() or "805" in str(exc)
-                    backoff = (5.0 + attempt * 5.0) if is_rate_limit else min(3.0, 1.5 + attempt * 0.75)
-                    time.sleep(backoff)
-
-        logger.warning("Warmup retries exhausted for %s: %s", security_name, last_error)
-        return False
 
     def build_discount_scanner(self):
         """Create the discount scanner with a valid token."""
@@ -199,7 +89,7 @@ class StrategySchedulerApp:
                 client_id=Config.DHAN_CLIENT_ID,
             )
 
-            opportunities = scanner.scan_all_fno_stocks(min_discount_score=MIN_DISCOUNT_SCORE)
+            opportunities = scanner.scan_all_fno_stocks(min_discount_score=55)
             scanner.generate_report(opportunities)
 
             if not opportunities.empty:
@@ -213,188 +103,6 @@ class StrategySchedulerApp:
             logger.exception("Discount strategy failed")
             return None
 
-    def run_auto_watchlist_eod(self):
-        """Build the automated NSE F&O watchlist for the next active session."""
-        logger.info("%s", "=" * 70)
-        logger.info("Running strategy: auto_watchlist_eod")
-        logger.info("%s", "=" * 70)
-        try:
-            token = self.token_manager.refresh_if_needed()
-            scanner = DiscountedPremiumScanner(
-                hardtoken=token,
-                client_id=Config.DHAN_CLIENT_ID,
-            )
-            return scanner.build_watchlist_eod()
-        except Exception:
-            logger.exception("Automated watchlist build failed")
-            return []
-
-    def run_auto_warmup_cycle(self):
-        """Run one automated warmup cycle over the persisted watchlist."""
-        logger.info("%s", "=" * 70)
-        logger.info("Running strategy: auto_warmup_cycle")
-        logger.info("%s", "=" * 70)
-        try:
-            token = self.token_manager.refresh_if_needed()
-            scanner = DiscountedPremiumScanner(
-                hardtoken=token,
-                client_id=Config.DHAN_CLIENT_ID,
-                store_intraday=True,
-            )
-            return scanner.run_warmup_cycle()
-        except Exception:
-            logger.exception("Automated warmup cycle failed")
-            return []
-
-    def run_auto_active_scanner(self):
-        """Run one automated active scanner cycle."""
-        logger.info("%s", "=" * 70)
-        logger.info("Running strategy: auto_active_scanner")
-        logger.info("%s", "=" * 70)
-        today = datetime.now().date().isoformat()
-        if not hasattr(self, "_morning_selection_done"):
-            self._morning_selection_done = None
-        try:
-            token = self.token_manager.refresh_if_needed()
-            scanner = DiscountedPremiumScanner(
-                hardtoken=token,
-                client_id=Config.DHAN_CLIENT_ID,
-                store_intraday=True,
-            )
-            now = datetime.now().time()
-            if (dt_time(9, 50) <= now <= dt_time(10, 5) and
-                    self._morning_selection_done != today):
-                scanner.run_morning_warmup_and_select()
-                self._morning_selection_done = today
-                logger.info("Morning warmup selection completed for %s", today)
-            return scanner.run_active_scanner()
-        except Exception:
-            logger.exception("Automated active scanner failed")
-            return []
-
-    def run_auto_loop(self, exit_after_one_cycle=False):
-        """
-        Clock-aware automated loop.
-
-        Before 09:15  : rebuild EOD watchlist, sleep 60s between runs.
-        09:15 - 09:50 : idle. IV warmup is owned by the iv-collector service;
-                        the discount service is a read-only consumer of the
-                        shared iv_history. At 09:50 run_morning_warmup_and_select()
-                        fires once — scoring stocks off the collector's intraday
-                        snapshots — to pick the top-N active watchlist.
-        09:50 - 15:20 : active scanner every 5 minutes on the top-N list.
-        After 15:20   : idle, sleep 60s.
-        """
-        self.warm_up_token()
-        logger.info("Automated strategy loop started")
-        _morning_selection_done_today = None
-
-        while True:
-            now = datetime.now().time()
-            today = datetime.now().date().isoformat()
-
-            if now < dt_time(9, 15):
-                self.run_auto_watchlist_eod()
-                _morning_selection_done_today = None
-                if exit_after_one_cycle:
-                    return
-                time.sleep(60)
-
-            elif dt_time(9, 15) <= now < dt_time(9, 50):
-                # IV warmup is owned by the iv-collector service. The discount
-                # service only consumes iv_history — running its own warmup here
-                # would double the option-chain API load and trigger Dhan 805s.
-                logger.info("Warmup window — IV collection handled by iv-collector; idling")
-                if exit_after_one_cycle:
-                    return
-                time.sleep(60)
-
-            elif dt_time(9, 50) <= now <= dt_time(15, 20):
-                if _morning_selection_done_today != today:
-                    logger.info("Running morning warmup selection at 09:50")
-                    scanner = self.build_discount_scanner()
-                    scanner.run_morning_warmup_and_select()
-                    _morning_selection_done_today = today
-                self.run_auto_active_scanner()
-                if exit_after_one_cycle:
-                    return
-                time.sleep(300)
-
-            else:
-                logger.info("Automated loop idle outside trading window")
-                if exit_after_one_cycle:
-                    return
-                time.sleep(60)
-
-    def run_premarket_warmup(self, ignore_time_window=False, max_cycles=None):
-        """Collect premarket ATM IV snapshots without running the scanner."""
-        logger.info("%s", "=" * 70)
-        logger.info("Running strategy: premarket_warmup")
-        logger.info("%s", "=" * 70)
-
-        try:
-            token = self.token_manager.refresh_if_needed()
-            scanner = DiscountedPremiumScanner(
-                hardtoken=token,
-                client_id=Config.DHAN_CLIENT_ID,
-                store_intraday=True,
-            )
-
-            all_symbols = list(scanner.fno_stocks.items())
-            if not all_symbols:
-                logger.warning("Premarket warmup skipped because no F&O symbols are available")
-                return False
-
-            start_time = dt_time(9, 15)
-            end_time = dt_time(9, 50)
-            expiry_cache = {}
-            symbols_queue = deque(all_symbols)
-            cycle_count = 0
-            processed_in_cycle = 0
-
-            while symbols_queue:
-                now = datetime.now().time()
-                if not ignore_time_window:
-                    if now < start_time:
-                        time.sleep(0.1)
-                        continue
-                    if now >= end_time:
-                        break
-
-                security_id, security_name = symbols_queue.popleft()
-                try:
-                    success = self.process_symbol_with_retry(
-                        scanner=scanner,
-                        security_id=security_id,
-                        security_name=security_name,
-                        expiry_cache=expiry_cache,
-                    )
-                    if success is True:
-                        logger.info("Warmup completed for %s | remaining=%s", security_name, len(symbols_queue))
-                    elif success is None:
-                        pass  # permanent skip (no expiry) — don't re-queue
-                    else:
-                        symbols_queue.append((security_id, security_name))
-                except Exception:
-                    logger.exception("Warmup processing failed for %s", security_name)
-                    symbols_queue.append((security_id, security_name))
-
-                processed_in_cycle += 1
-                if processed_in_cycle >= len(all_symbols):
-                    processed_in_cycle = 0
-                    cycle_count += 1
-                    logger.info("Completed full cycle, restarting from beginning")
-                    logger.info("Completed full cycle | metrics=%s", scanner.get_warmup_metrics())
-                    if max_cycles is not None and cycle_count >= max_cycles:
-                        break
-
-                if symbols_queue:
-                    time.sleep(1.5)
-            return True
-        except Exception:
-            logger.exception("Premarket warmup failed")
-            return None
-
     def setup_schedule(self):
         """Register all strategy jobs."""
         schedule.clear()
@@ -404,32 +112,6 @@ class StrategySchedulerApp:
                 for run_time in job["times"]:
                     getattr(schedule.every(), day).at(run_time).do(job["runner"])
                     logger.info("Scheduled %s on %s at %s", job["name"], day, run_time)
-
-        # EOD watchlist rebuild — runs before market open
-        for day in WEEKDAYS:
-            getattr(schedule.every(), day).at("08:45").do(self.run_auto_watchlist_eod)
-        logger.info("Scheduled auto_watchlist_eod on weekdays at 08:45")
-
-        # Active scanner — every 5 min 09:50–15:20
-        _active_times = [
-            "09:50", "09:55",
-            "10:00", "10:05", "10:10", "10:15", "10:20", "10:25", "10:30",
-            "10:35", "10:40", "10:45", "10:50", "10:55",
-            "11:00", "11:05", "11:10", "11:15", "11:20", "11:25", "11:30",
-            "11:35", "11:40", "11:45", "11:50", "11:55",
-            "12:00", "12:05", "12:10", "12:15", "12:20", "12:25", "12:30",
-            "12:35", "12:40", "12:45", "12:50", "12:55",
-            "13:00", "13:05", "13:10", "13:15", "13:20", "13:25", "13:30",
-            "13:35", "13:40", "13:45", "13:50", "13:55",
-            "14:00", "14:05", "14:10", "14:15", "14:20", "14:25", "14:30",
-            "14:35", "14:40", "14:45", "14:50", "14:55",
-            "15:00", "15:05", "15:10", "15:15", "15:20",
-        ]
-        for day in WEEKDAYS:
-            for t in _active_times:
-                getattr(schedule.every(), day).at(t).do(self.run_auto_active_scanner)
-        logger.info("Scheduled auto_active_scanner on weekdays at %d time slots (09:50–15:20)",
-                    len(_active_times))
 
     def run(self, run_now=False, exit_after_run=False):
         """Start the scheduler loop, with optional immediate execution."""
@@ -445,7 +127,7 @@ class StrategySchedulerApp:
 
         if run_now:
             logger.info("Immediate run requested")
-            logger.info("Legacy scanner disabled - using trigger-based system")
+            self.run_discount_scan()
             if exit_after_run:
                 logger.info("Exiting after immediate run")
                 return
@@ -467,72 +149,9 @@ def main():
         action="store_true",
         help="Run the discount scan immediately and exit without waiting for the next schedule",
     )
-    parser.add_argument(
-        "--warmup",
-        action="store_true",
-        help="Run premarket warmup immediately (dev mode)",
-    )
-    parser.add_argument(
-        "--warmup-cycles",
-        type=int,
-        default=None,
-        help="Stop warmup after the given number of full symbol cycles",
-    )
-    parser.add_argument(
-        "--auto-loop",
-        action="store_true",
-        help="Run the automated IV-compression options system loop",
-    )
-    parser.add_argument(
-        "--auto-once",
-        action="store_true",
-        help="Run one clock-aware automated system cycle and exit",
-    )
-    parser.add_argument(
-        "--build-watchlist",
-        action="store_true",
-        help="Build the automated F&O watchlist immediately and exit",
-    )
-    parser.add_argument(
-        "--active-scan",
-        action="store_true",
-        help="Run one automated active scanner cycle immediately and exit",
-    )
-    parser.add_argument(
-        "--backtest-auto",
-        type=int,
-        default=None,
-        metavar="DAYS",
-        help="Backtest the automated strategy over the given number of days",
-    )
     args = parser.parse_args()
 
-    init_iv_db()
-    migrate_csv_to_sqlite()
-
     app = StrategySchedulerApp()
-    if args.build_watchlist:
-        app.run_auto_watchlist_eod()
-        return
-    if args.active_scan:
-        app.run_auto_active_scanner()
-        return
-    if args.backtest_auto is not None:
-        token = app.token_manager.refresh_if_needed()
-        scanner = DiscountedPremiumScanner(
-            hardtoken=token,
-            client_id=Config.DHAN_CLIENT_ID,
-        )
-        scanner.backtest_strategy(days=args.backtest_auto)
-        return
-    if args.auto_loop or args.auto_once:
-        app.run_auto_loop(exit_after_one_cycle=args.auto_once)
-        return
-    if args.warmup:
-        logger.info("Running warmup in dev mode")
-        app.run_premarket_warmup(ignore_time_window=True, max_cycles=args.warmup_cycles)
-        return
-
     app.run(run_now=args.run_now or args.once, exit_after_run=args.once)
 
 

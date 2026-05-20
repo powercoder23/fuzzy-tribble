@@ -61,7 +61,7 @@ services:
       - ./logs:/app/logs
     depends_on:
       - iv-collector
-    command: python main.py --auto-loop
+    command: python main.py
 
   # ── Service 4: Break and Bounce Strategy ──────────────────────────────────
   # Step 1: Mark yesterday's daily candle high/low as key levels.
