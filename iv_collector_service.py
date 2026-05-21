@@ -435,7 +435,7 @@ class IVCollector:
         Timeline:
           before 09:15  → idle (60s sleep)
           09:15–09:50   → continuous warmup sweep (WARMUP_SLEEP between stocks)
-          09:50–15:30   → intraday passes every 15 min
+          09:50–15:30   → intraday passes every 1 hour
           after 15:30   → idle (60s sleep)
         """
         iv_store.init_db()
@@ -443,7 +443,7 @@ class IVCollector:
         logger.info("IVCollector started | fno_symbols=%d", len(scanner.fno_stocks))
 
         _intraday_last_pass: datetime = None
-        INTRADAY_INTERVAL = 15 * 60  # 15 minutes between full sweeps
+        INTRADAY_INTERVAL = 60 * 60  # 1 hour between full sweeps
         EOD_REPORT_TIME   = dt_time(15, 35)
         _last_reset_date  = datetime.now().date()
 

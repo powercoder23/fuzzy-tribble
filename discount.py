@@ -2,6 +2,7 @@ import os
 import logging
 import math
 from pathlib import Path
+import sqlite3
 
 import pandas as pd
 import numpy as np
@@ -23,7 +24,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-IV_HISTORY_FILE = Path("iv_history.csv")
+# IV_HISTORY_FILE = Path("iv_history.csv")
+IV_HISTORY_FILE = Path("data") / "iv_history.db"
+
 MIN_IV_SAMPLES = 30
 DEFAULT_FNO_STOCKS = {
     13: "NIFTY",
@@ -376,8 +379,34 @@ class DiscountedPremiumScanner:
 
         df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
         return df
-    
+
     def fetch_historical_iv(self, security_id, exchange_segment, lookback_days=252):
+        """
+        Load persisted ATM IV history from SQLite DB (read-only).
+        Writes are handled by a separate service.
+        """
+        if not self.iv_history_file.exists():
+            return []
+
+        try:
+            with sqlite3.connect(str(self.iv_history_file), timeout=30.0) as conn:
+                cursor = conn.execute("""
+                    SELECT atm_iv 
+                    FROM iv_history
+                    WHERE security_id = ?
+                    AND atm_iv IS NOT NULL
+                    AND atm_iv >= 1.0
+                    AND atm_iv <= 200.0
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """, (str(security_id), lookback_days))
+                rows = cursor.fetchall()
+                return [row[0] for row in reversed(rows)]
+        except Exception:
+            logger.exception("Failed to read IV history from DB: %s", self.iv_history_file)
+            return []
+    
+    def fetch_historical_iv_old(self, security_id, exchange_segment, lookback_days=252):
         """
         Load persisted ATM IV history for IV Rank / IV Percentile calculations.
         
@@ -560,69 +589,70 @@ class DiscountedPremiumScanner:
 
     def persist_iv_snapshot(self, security_id, exchange_segment, security_name, expiry, spot_price, atm_context, store_intraday=None):
         """Persist one ATM IV snapshot per day to build IV rank / percentile history."""
-        atm_iv = atm_context.get("atm_iv")
-        if atm_iv is None or atm_iv <= 0 or atm_iv < 1 or atm_iv > 200:
-            return
+        return
+        # atm_iv = atm_context.get("atm_iv")
+        # if atm_iv is None or atm_iv <= 0 or atm_iv < 1 or atm_iv > 200:
+        #     return
 
-        store_intraday = self.store_intraday if store_intraday is None else store_intraday
-        snapshot_dt = datetime.now()
+        # store_intraday = self.store_intraday if store_intraday is None else store_intraday
+        # snapshot_dt = datetime.now()
 
-        snapshot = pd.DataFrame([{
-            "snapshot_date": snapshot_dt.date().isoformat(),
-            "snapshot_time": snapshot_dt.strftime("%H:%M:%S"),
-            "security_id": str(security_id),
-            "symbol": security_name,
-            "spot_price": spot_price,
-            "atm_strike": atm_context.get("atm_strike"),
-            "atm_iv": atm_iv,
-            "atm_call_iv": atm_context.get("atm_call_iv"),
-            "atm_put_iv": atm_context.get("atm_put_iv"),
-        }])
+        # snapshot = pd.DataFrame([{
+        #     "snapshot_date": snapshot_dt.date().isoformat(),
+        #     "snapshot_time": snapshot_dt.strftime("%H:%M:%S"),
+        #     "security_id": str(security_id),
+        #     "symbol": security_name,
+        #     "spot_price": spot_price,
+        #     "atm_strike": atm_context.get("atm_strike"),
+        #     "atm_iv": atm_iv,
+        #     "atm_call_iv": atm_context.get("atm_call_iv"),
+        #     "atm_put_iv": atm_context.get("atm_put_iv"),
+        # }])
 
-        if self.iv_history_file.exists():
-            try:
-                existing = pd.read_csv(self.iv_history_file)
-            except Exception:
-                logger.exception("Failed to read IV history file for update: %s", self.iv_history_file)
-                existing = pd.DataFrame()
-            combined = pd.concat([existing, snapshot], ignore_index=True)
-        else:
-            combined = snapshot
+        # if self.iv_history_file.exists():
+        #     try:
+        #         existing = pd.read_csv(self.iv_history_file)
+        #     except Exception:
+        #         logger.exception("Failed to read IV history file for update: %s", self.iv_history_file)
+        #         existing = pd.DataFrame()
+        #     combined = pd.concat([existing, snapshot], ignore_index=True)
+        # else:
+        #     combined = snapshot
 
-        if "snapshot_time" not in combined.columns:
-            combined["snapshot_time"] = "00:00:00"
-        if "symbol" not in combined.columns:
-            combined["symbol"] = security_name
+        # if "snapshot_time" not in combined.columns:
+        #     combined["snapshot_time"] = "00:00:00"
+        # if "symbol" not in combined.columns:
+        #     combined["symbol"] = security_name
 
-        for column in IV_HISTORY_COLUMNS:
-            if column not in combined.columns:
-                combined[column] = np.nan
+        # for column in IV_HISTORY_COLUMNS:
+        #     if column not in combined.columns:
+        #         combined[column] = np.nan
 
-        combined["security_id"] = combined["security_id"].astype(str)
-        combined["snapshot_date"] = pd.to_datetime(combined["snapshot_date"], errors="coerce").dt.date.astype(str)
-        combined["snapshot_time"] = combined["snapshot_time"].fillna("00:00:00").astype(str)
-        combined["atm_iv"] = pd.to_numeric(combined["atm_iv"], errors="coerce")
-        combined["atm_call_iv"] = pd.to_numeric(combined["atm_call_iv"], errors="coerce")
-        combined["atm_put_iv"] = pd.to_numeric(combined["atm_put_iv"], errors="coerce")
-        combined["spot_price"] = pd.to_numeric(combined["spot_price"], errors="coerce")
-        combined["atm_strike"] = pd.to_numeric(combined["atm_strike"], errors="coerce")
+        # combined["security_id"] = combined["security_id"].astype(str)
+        # combined["snapshot_date"] = pd.to_datetime(combined["snapshot_date"], errors="coerce").dt.date.astype(str)
+        # combined["snapshot_time"] = combined["snapshot_time"].fillna("00:00:00").astype(str)
+        # combined["atm_iv"] = pd.to_numeric(combined["atm_iv"], errors="coerce")
+        # combined["atm_call_iv"] = pd.to_numeric(combined["atm_call_iv"], errors="coerce")
+        # combined["atm_put_iv"] = pd.to_numeric(combined["atm_put_iv"], errors="coerce")
+        # combined["spot_price"] = pd.to_numeric(combined["spot_price"], errors="coerce")
+        # combined["atm_strike"] = pd.to_numeric(combined["atm_strike"], errors="coerce")
 
-        combined = combined[
-            combined["snapshot_date"].notna() &
-            combined["security_id"].notna() &
-            combined["atm_iv"].notna() &
-            (combined["atm_iv"] >= 1.0) &
-            (combined["atm_iv"] <= 200.0)
-        ]
+        # combined = combined[
+        #     combined["snapshot_date"].notna() &
+        #     combined["security_id"].notna() &
+        #     combined["atm_iv"].notna() &
+        #     (combined["atm_iv"] >= 1.0) &
+        #     (combined["atm_iv"] <= 200.0)
+        # ]
 
-        dedupe_subset = ["snapshot_date", "security_id"]
-        if store_intraday:
-            dedupe_subset = ["snapshot_date", "snapshot_time", "security_id"]
+        # dedupe_subset = ["snapshot_date", "security_id"]
+        # if store_intraday:
+        #     dedupe_subset = ["snapshot_date", "snapshot_time", "security_id"]
 
-        combined = combined[IV_HISTORY_COLUMNS]
-        combined = combined.drop_duplicates(subset=dedupe_subset, keep="last")
-        combined = combined.sort_values(["security_id", "snapshot_date", "snapshot_time"])
-        combined.to_csv(self.iv_history_file, index=False)
+        # combined = combined[IV_HISTORY_COLUMNS]
+        # combined = combined.drop_duplicates(subset=dedupe_subset, keep="last")
+        # combined = combined.sort_values(["security_id", "snapshot_date", "snapshot_time"])
+        # combined.to_csv(self.iv_history_file, index=False)
     
     # ==================== 3. DISCOUNTED PREMIUM DETECTION ====================
 
