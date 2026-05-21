@@ -27,7 +27,7 @@ if hasattr(time, "tzset"):
     time.tzset()
 
 DEFAULT_SCAN_TIMES = [
-    "09:50", "10:10", "11:30", "13:30", "15:05", "15:25"
+    "09:50", "10:10", "11:30", "12:30", "13:30", "14:30", "15:05", "15:25"
 ]
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday"]
 
