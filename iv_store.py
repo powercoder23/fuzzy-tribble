@@ -153,7 +153,10 @@ def get_latest_snapshot(security_id: str) -> dict:
         cur = conn.cursor()
         cur.execute("""
             SELECT security_id, symbol, timestamp, spot_price, atm_strike,
-                   atm_iv, atm_call_iv, atm_put_iv
+                   atm_iv, atm_call_iv, atm_put_iv,
+                   total_call_oi, total_put_oi,
+                   total_call_volume, total_put_volume,
+                   max_oi_strike_call, max_oi_strike_put
             FROM   iv_history
             WHERE  security_id = ?
               AND  data_type   = 'intraday'
@@ -164,8 +167,13 @@ def get_latest_snapshot(security_id: str) -> dict:
         conn.close()
         if not row:
             return {}
-        cols = ["security_id", "symbol", "timestamp", "spot_price", "atm_strike",
-                "atm_iv", "atm_call_iv", "atm_put_iv"]
+        cols = [
+            "security_id", "symbol", "timestamp", "spot_price", "atm_strike",
+            "atm_iv", "atm_call_oi", "atm_put_oi",
+            "total_call_oi", "total_put_oi",
+            "total_call_volume", "total_put_volume",
+            "max_oi_strike_call", "max_oi_strike_put",
+        ]
         return dict(zip(cols, row))
     except Exception:
         logger.exception("iv_store.get_latest_snapshot failed | security_id=%s", security_id)
@@ -202,7 +210,8 @@ def get_bulk_latest_snapshots(security_ids: list) -> dict:
     try:
         conn = sqlite3.connect(DB_PATH)
         df = pd.read_sql(f"""
-            SELECT security_id, symbol, spot_price, atm_iv, timestamp
+            SELECT security_id, symbol, spot_price, atm_iv, timestamp,
+                   total_call_oi, total_put_oi, total_call_volume, total_put_volume
             FROM   iv_history
             WHERE  security_id IN ({placeholders})
               AND  data_type   = 'intraday'
@@ -222,6 +231,10 @@ def get_bulk_latest_snapshots(security_ids: list) -> dict:
                     "symbol":      row.get("symbol"),
                     "spot_price":  float(row["spot_price"]) if pd.notna(row["spot_price"]) else None,
                     "atm_iv":      float(row["atm_iv"])     if pd.notna(row["atm_iv"])     else None,
+                    "total_call_oi": float(row["total_call_oi"]) if pd.notna(row["total_call_oi"]) else None,
+                    "total_put_oi": float(row["total_put_oi"]) if pd.notna(row["total_put_oi"]) else None,
+                    "total_call_volume": float(row["total_call_volume"]) if pd.notna(row["total_call_volume"]) else None,
+                    "total_put_volume": float(row["total_put_volume"]) if pd.notna(row["total_put_volume"]) else None,
                     "timestamp":   row.get("timestamp"),
                 }
             except Exception:

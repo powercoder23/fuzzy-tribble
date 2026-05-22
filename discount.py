@@ -9,7 +9,7 @@ import numpy as np
 import requests
 from dhanhq import dhanhq, DhanContext
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import time
 from scipy import stats
 import warnings
@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 IV_HISTORY_FILE = Path("data") / "iv_history.db"
 
 MIN_IV_SAMPLES = 30
+# Dhan rate-limits the option-chain family of endpoints to 1 request / 3 seconds.
+# Use 3.1s for a small safety margin; silent failures (empty body, no error code)
+# happen if we breach it.
+CHAIN_API_MIN_INTERVAL_SEC = 3.1
+CHAIN_API_RETRY_BACKOFF_SEC = 4.0
 DEFAULT_FNO_STOCKS = {
     13: "NIFTY",
     14: "BANKNIFTY",
@@ -86,6 +91,82 @@ def native_number(value):
         return None
     return float(value)
 
+
+def get_trading_days_to_expiry(expiry):
+    """
+    Estimate trading-day distance to an expiry date by ignoring weekends.
+    This is used by other strategy modules to select near-expiry contracts
+    without requiring a full holiday calendar.
+    """
+    if not expiry:
+        return 0
+
+    try:
+        expiry_date = datetime.strptime(str(expiry)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return 0
+
+    today = date.today()
+    if expiry_date <= today:
+        return 0
+
+    days = 0
+    current = today
+    while current < expiry_date:
+        if current.weekday() < 5:
+            days += 1
+        current += timedelta(days=1)
+    return days
+
+
+def extract_chain_metrics(option_chain):
+    """
+    Summarize option chain-level OI / volume metrics for macro flow context.
+    Used by the IV collector and directional strategy to understand whether
+    call-side or put-side positioning is currently dominant.
+    """
+    metrics = {
+        "total_call_oi": 0.0,
+        "total_put_oi": 0.0,
+        "total_call_volume": 0.0,
+        "total_put_volume": 0.0,
+        "max_oi_strike_call": None,
+        "max_oi_strike_put": None,
+    }
+
+    if not isinstance(option_chain, dict):
+        return metrics
+
+    max_call_oi = -1.0
+    max_put_oi = -1.0
+
+    for strike_key, strike_data in option_chain.items():
+        if not isinstance(strike_data, dict):
+            continue
+
+        ce = strike_data.get("ce") or {}
+        pe = strike_data.get("pe") or {}
+
+        call_oi = float(ce.get("oi") or 0)
+        put_oi = float(pe.get("oi") or 0)
+        call_volume = float(ce.get("volume") or 0)
+        put_volume = float(pe.get("volume") or 0)
+
+        metrics["total_call_oi"] += call_oi
+        metrics["total_put_oi"] += put_oi
+        metrics["total_call_volume"] += call_volume
+        metrics["total_put_volume"] += put_volume
+
+        if call_oi >= max_call_oi:
+            max_call_oi = call_oi
+            metrics["max_oi_strike_call"] = strike_key
+        if put_oi >= max_put_oi:
+            max_put_oi = put_oi
+            metrics["max_oi_strike_put"] = strike_key
+
+    return metrics
+
+
 class DiscountedPremiumScanner:
     """
     Scanner to identify options trading at discounted premiums
@@ -111,7 +192,45 @@ class DiscountedPremiumScanner:
         self.store_intraday = store_intraday
         self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        self._last_chain_api_call = 0.0
+        self._expiry_cache = {}
         self.fno_stocks = self.load_fno_stocks()
+
+    def _throttle_chain_api(self):
+        """Enforce Dhan's 1-req-per-3-sec limit on the option-chain endpoint family."""
+        elapsed = time.monotonic() - self._last_chain_api_call
+        if elapsed < CHAIN_API_MIN_INTERVAL_SEC:
+            time.sleep(CHAIN_API_MIN_INTERVAL_SEC - elapsed)
+        self._last_chain_api_call = time.monotonic()
+
+    @staticmethod
+    def _is_rate_limit_response(response):
+        """Dhan signals rate-limit with status=failure, empty data, and null error fields."""
+        if not isinstance(response, dict) or response.get("status") == "success":
+            return False
+        data = response.get("data")
+        if data not in (None, "", [], {}):
+            return False
+        remarks = response.get("remarks") or {}
+        return all(remarks.get(k) is None for k in ("error_code", "error_type", "error_message"))
+
+    def _call_chain_api(self, fn, **kwargs):
+        """Throttle + one-shot retry on Dhan's silent rate-limit response."""
+        self._throttle_chain_api()
+        response = fn(**kwargs)
+        if self._is_rate_limit_response(response):
+            logger.warning("Chain API rate-limited; backing off %.1fs and retrying", CHAIN_API_RETRY_BACKOFF_SEC)
+            time.sleep(CHAIN_API_RETRY_BACKOFF_SEC)
+            self._last_chain_api_call = time.monotonic()
+            response = fn(**kwargs)
+        return response
+
+    @staticmethod
+    def _expiry_cache_key(security_id, segment):
+        # All NSE_FNO stocks share the same monthly expiry calendar; one cache entry covers them.
+        if segment == "NSE_FNO":
+            return ("__shared__", "NSE_FNO")
+        return (str(security_id), segment)
         
     # ==================== 1. DATA FETCHING METHODS ====================
 
@@ -214,10 +333,11 @@ class DiscountedPremiumScanner:
         Returns:
             dict: Option chain data
         """
-        response = self.dhan.option_chain(
+        response = self._call_chain_api(
+            self.dhan.option_chain,
             under_security_id=underlying_security_id,
             under_exchange_segment=underlying_segment,
-            expiry=expiry
+            expiry=expiry,
         )
         if response.get("status") != "success":
             logger.error(
@@ -240,9 +360,15 @@ class DiscountedPremiumScanner:
         Returns:
             list: List of expiry dates
         """
-        response = self.dhan.expiry_list(
+        cache_key = self._expiry_cache_key(underlying_security_id, underlying_segment)
+        cached = self._expiry_cache.get(cache_key)
+        if cached:
+            return cached
+
+        response = self._call_chain_api(
+            self.dhan.expiry_list,
             under_security_id=underlying_security_id,
-            under_exchange_segment=underlying_segment
+            under_exchange_segment=underlying_segment,
         )
         if response.get("status") != "success":
             logger.error(
@@ -289,6 +415,8 @@ class DiscountedPremiumScanner:
                         expiries.append(normalized)
 
         expiries = sorted(set(expiries))
+        if expiries:
+            self._expiry_cache[cache_key] = expiries
         logger.info(
             "Available expiries for %s (%s): %s",
             underlying_security_id,
@@ -1095,10 +1223,7 @@ class DiscountedPremiumScanner:
                         opt['symbol'] = sec_name
                         opt['security_id'] = sec_id
                         all_opportunities.append(opt)
-                
-                # Rate limiting
-                time.sleep(1)
-                
+
             except Exception:
                 logger.exception("Error scanning %s", sec_name)
         

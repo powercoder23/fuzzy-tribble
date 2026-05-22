@@ -85,3 +85,23 @@ services:
     depends_on:
       - iv-collector
     command: python break_bounce_runner.py
+
+  # ── Service 5: Directional IV Strategy ──────────────────────────────────
+  # Uses shared IV history and option chain data to identify directional
+  # option buying opportunities with IV edge and trend alignment.
+  directional-iv:
+    build:
+      context: .
+      dockerfile: Dockerfile.directional
+    container_name: directional-iv-strategy
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - shared-data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python directional_iv_runner.py

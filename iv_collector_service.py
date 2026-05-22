@@ -220,9 +220,6 @@ class IVCollector:
 
             except Exception as exc:
                 last_err = exc
-                # Evict cached chain so next retry does a fresh fetch
-                scanner.runtime_state.get("option_chain", {}).pop(
-                    (str(security_id), segment, expiry), None)
                 if attempt < max_retries - 1:
                     backoff = 5.0 if "too many requests" in str(exc).lower() else 1.5
                     time.sleep(backoff)

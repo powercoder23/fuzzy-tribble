@@ -1,4 +1,4 @@
-git+https://github.com/dhan-oss/DhanHQ-py.git
+git+https://github.com/dhan-oss/DhanHQ-py.git@06c830c4f5a7593ede3deeabbf203debd8632826
 python-dotenv
 schedule
 pandas

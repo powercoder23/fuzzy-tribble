@@ -17,6 +17,7 @@ import schedule
 from config import Config
 from token_manager import TokenManager
 from discount import DiscountedPremiumScanner
+from directional_iv_runner import run_directional_scan
 
 
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Kolkata")
@@ -52,6 +53,11 @@ class StrategySchedulerApp:
                 "name": "discount",
                 "runner": self.run_discount_scan,
                 "times": DEFAULT_SCAN_TIMES,
+            },
+            {
+                "name": "directional_iv",
+                "runner": self.run_directional_iv_scan,
+                "times": ["09:45", "11:15", "13:15", "14:45", "15:05"],
             }
         ]
 
@@ -101,6 +107,19 @@ class StrategySchedulerApp:
             return opportunities
         except Exception:
             logger.exception("Discount strategy failed")
+            return None
+
+    def run_directional_iv_scan(self):
+        """Run the directional IV scan once."""
+        logger.info("%s", "=" * 70)
+        logger.info("Running strategy: directional_iv")
+        logger.info("%s", "=" * 70)
+
+        try:
+            opportunities = run_directional_scan()
+            return opportunities
+        except Exception:
+            logger.exception("Directional IV strategy failed")
             return None
 
     def setup_schedule(self):
