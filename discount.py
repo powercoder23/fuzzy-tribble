@@ -225,6 +225,10 @@ class DiscountedPremiumScanner:
             response = fn(**kwargs)
         return response
 
+    def extract_chain_metrics(self, option_chain):
+        """Return chain-level OI/volume metrics for the given option chain."""
+        return extract_chain_metrics(option_chain)
+
     @staticmethod
     def _expiry_cache_key(security_id, segment):
         # All NSE_FNO stocks share the same monthly expiry calendar; one cache entry covers them.
@@ -704,14 +708,20 @@ class DiscountedPremiumScanner:
 
         atm_strike = min(option_chain.keys(), key=lambda strike: abs(float(strike) - spot_price))
         atm_data = option_chain.get(atm_strike, {})
-        atm_call_iv = (atm_data.get("ce") or {}).get("implied_volatility") or None
-        atm_put_iv = (atm_data.get("pe") or {}).get("implied_volatility") or None
+        atm_call = atm_data.get("ce") or {}
+        atm_put = atm_data.get("pe") or {}
+        atm_call_iv = atm_call.get("implied_volatility") or None
+        atm_put_iv = atm_put.get("implied_volatility") or None
+        atm_call_oi = atm_call.get("oi") or 0
+        atm_put_oi = atm_put.get("oi") or 0
         valid = [value for value in [atm_call_iv, atm_put_iv] if value and value > 0]
         atm_iv = float(np.mean(valid)) if valid else None
         return {
             "atm_strike": float(atm_strike),
             "atm_call_iv": atm_call_iv,
             "atm_put_iv": atm_put_iv,
+            "atm_call_oi": atm_call_oi,
+            "atm_put_oi": atm_put_oi,
             "atm_iv": atm_iv,
         }
 

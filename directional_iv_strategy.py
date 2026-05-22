@@ -123,6 +123,11 @@ class DirectionalIVScanner:
             "risk_reward": rr,
         }
 
+    def _spread_pct(self, bid: float, ask: float, mid: float) -> float:
+        if bid is None or ask is None or mid is None or mid <= 0:
+            return 1.0
+        return abs(ask - bid) / mid
+
     def _liquidity_score(self, oi: float, volume: float) -> float:
         if oi <= 0 or volume <= 0:
             return 0.0
@@ -172,7 +177,8 @@ class DirectionalIVScanner:
             bid = opt.get("top_bid_price", opt.get("last_price", 0)) or 0
             ask = opt.get("top_ask_price", opt.get("last_price", 0)) or 0
             mid = (bid + ask) / 2 if bid and ask else opt.get("last_price", 0) or 0
-            if oi < LIQUIDITY["min_oi"] or volume < LIQUIDITY["min_volume"] or mid <= 0:
+            spread_pct = self._spread_pct(bid, ask, mid)
+            if oi < LIQUIDITY["min_oi"] or volume < LIQUIDITY["min_volume"] or mid <= 0 or spread_pct > LIQUIDITY["max_spread_pct"]:
                 continue
 
             current_iv = opt.get("implied_volatility", 0)
@@ -286,6 +292,18 @@ class DirectionalIVScanner:
             return []
 
         atm_context = self.scanner.extract_atm_reference_ivs(option_chain, spot_price)
+        if (
+            atm_context.get("atm_call_oi", 0) < LIQUIDITY["min_atm_oi"]
+            and atm_context.get("atm_put_oi", 0) < LIQUIDITY["min_atm_oi"]
+        ):
+            logger.warning(
+                "Skipping %s due to low ATM liquidity (call %s, put %s)",
+                symbol,
+                atm_context.get("atm_call_oi"),
+                atm_context.get("atm_put_oi"),
+            )
+            return []
+
         historical_ivs = self.scanner.fetch_historical_iv(security_id, segment)
         has_iv_history = len(historical_ivs) >= 10
         dte = self.scanner.days_to_expiry(expiry)

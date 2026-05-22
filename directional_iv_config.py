@@ -21,9 +21,10 @@ TREND_FILTER = {
 }
 
 LIQUIDITY = {
-    "min_oi":      2500,
-    "min_volume":  500,
-    "min_atm_oi":  500,
+    "min_oi":        2500,
+    "min_volume":    500,
+    "min_atm_oi":    500,
+    "max_spread_pct": 0.20,
 }
 
 IV_FILTER = {
