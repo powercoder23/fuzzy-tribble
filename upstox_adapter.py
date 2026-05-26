@@ -13,7 +13,7 @@ Covered surface
   intraday_minute_data()   → HistoryV3Api.get_intra_day_candle_data
   historical_daily_data()  → HistoryV3Api.get_historical_candle_data
   option_chain()           → OptionsApi.get_put_call_option_chain
-  expiry_list()            → complete.db query
+  expiry_list()            → OptionsApi.get_option_contracts (live API)
   place_order()            → OrderApi.place_order
 
 Constants (match dhanhq attribute names)
@@ -72,7 +72,10 @@ def _symbol_from_security_id(security_id: str) -> str | None:
         conn = sqlite3.connect(_get_scrip_master_db())
         cur = conn.cursor()
         cur.execute(
-            "SELECT SEM_TRADING_SYMBOL FROM scrip_master WHERE SEM_SMST_SECURITY_ID = ? LIMIT 1",
+            """SELECT SEM_TRADING_SYMBOL FROM scrip_master
+               WHERE SEM_SMST_SECURITY_ID = ?
+                 AND SEM_INSTRUMENT_NAME NOT IN ('OPTSTK','OPTIDX','FUTSTK','FUTIDX')
+               LIMIT 1""",
             (sid,),
         )
         row = cur.fetchone()
@@ -437,21 +440,29 @@ class UpstoxDhanAdapter:
             return {"status": "failure", "remarks": str(exc)}
 
     def expiry_list(self, under_security_id, under_exchange_segment, **kwargs) -> dict:
-        """Return available expiry dates; returns Dhan-compatible dict."""
+        """Return available expiry dates via live Upstox option contracts API."""
         sid = str(under_security_id)
-        if sid in _INDEX_SECURITY_ID_TO_KEY:
-            raw_name = _INDEX_SECURITY_ID_TO_KEY[sid].split("|")[1]
-            _norm = {"Nifty 50": "NIFTY", "Nifty Bank": "BANKNIFTY",
-                     "Nifty Fin Service": "FINNIFTY"}
-            underlying_symbol = _norm.get(raw_name, raw_name.upper().replace(" ", ""))
-        else:
-            underlying_symbol = _symbol_from_security_id(sid) or ""
+        underlying_key = _underlying_key_from_security_id(sid, under_exchange_segment)
+        if not underlying_key:
+            logger.warning("expiry_list: no instrument_key for security_id=%s", sid)
+            return {"status": "failure", "remarks": "instrument_key not found"}
 
-        if not underlying_symbol:
-            return {"status": "failure", "remarks": "symbol not found"}
-
-        expiries = _expiry_dates_for_underlying(underlying_symbol)
-        return {"status": "success", "data": expiries}
+        try:
+            from datetime import date as _date
+            resp = self._options_api.get_option_contracts(
+                instrument_key=underlying_key,
+            )
+            contracts = resp.data if resp and resp.data else []
+            today = _date.today().isoformat()
+            expiries = sorted(set(
+                c.expiry for c in contracts
+                if getattr(c, "expiry", None) and c.expiry >= today
+            ))
+            logger.debug("expiry_list(%s → %s): %d expiries", sid, underlying_key, len(expiries))
+            return {"status": "success", "data": expiries}
+        except ApiException as exc:
+            logger.error("expiry_list ApiException [%s]: %s", underlying_key, exc)
+            return {"status": "failure", "remarks": str(exc)}
 
     # ------------------------------------------------------------------
     # Order placement
