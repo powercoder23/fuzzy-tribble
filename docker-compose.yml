@@ -4,14 +4,12 @@ volumes:
 services:
 
   # ── Service 1: IV Collector ────────────────────────────────────────────────
-  # Owns ALL option chain API calls.
-  # Saves IV snapshots to shared-data volume.
-  # No trading logic, no order placement.
   iv-collector:
     build:
       context: .
       dockerfile: Dockerfile.iv-collector
     container_name: iv-collector
+    shm_size: 512m
     restart: unless-stopped
     env_file: .env
     environment:
@@ -23,14 +21,12 @@ services:
     command: python iv_collector_service.py
 
   # ── Service 2: Momentum Strategy ──────────────────────────────────────────
-  # Reads IV from shared-data (written by iv-collector).
-  # Calls Dhan API only for: regime detection (daily candles) and
-  # option chain at signal execution time.
   momentum:
     build:
       context: .
       dockerfile: Dockerfile.momentum
     container_name: momentum-strategy
+    shm_size: 512m
     restart: unless-stopped
     env_file: .env
     environment:
@@ -44,13 +40,12 @@ services:
     command: python momentum_runner.py
 
   # ── Service 3: Discount/Premium Strategy ──────────────────────────────────
-  # Reads IV history from the shared-data volume (written by iv-collector).
-  # Runs the discount scanner only — it does NOT collect IV itself.
   discount:
     build:
       context: .
       dockerfile: Dockerfile.discount
     container_name: discount-strategy
+    shm_size: 512m
     restart: unless-stopped
     env_file: .env
     environment:
@@ -64,16 +59,12 @@ services:
     command: python main.py
 
   # ── Service 4: Break and Bounce Strategy ──────────────────────────────────
-  # Step 1: Mark yesterday's daily candle high/low as key levels.
-  # Step 2: Wait for 15-min close above/below the level (9:15–11:45 window).
-  # Step 3: After breakout, enter on Hammer/Engulfing at the retest on 5-min.
-  # Reads IV from shared-data for affordability filter.
-  # Calls Dhan API for daily/intraday candles and option chain at signal time.
   break-bounce:
     build:
       context: .
       dockerfile: Dockerfile.break-bounce
     container_name: break-bounce-strategy
+    shm_size: 512m
     restart: unless-stopped
     env_file: .env
     environment:
@@ -87,13 +78,12 @@ services:
     command: python break_bounce_runner.py
 
   # ── Service 5: Directional IV Strategy ──────────────────────────────────
-  # Uses shared IV history and option chain data to identify directional
-  # option buying opportunities with IV edge and trend alignment.
   directional-iv:
     build:
       context: .
       dockerfile: Dockerfile.directional
     container_name: directional-iv-strategy
+    shm_size: 512m
     restart: unless-stopped
     env_file: .env
     environment:

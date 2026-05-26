@@ -627,6 +627,11 @@ class BreakBounceStrategyRunner:
         self._daily_levels: dict = {}
 
     def _build_scanner(self) -> DiscountedPremiumScanner:
+        if os.getenv("DATA_PROVIDER", "dhan").lower() == "upstox":
+            from upstox_adapter import UpstoxDhanAdapter
+            from upstox_token_manager import load_upstox_token
+            adapter = UpstoxDhanAdapter(load_upstox_token())
+            return DiscountedPremiumScanner(upstox_adapter=adapter)
         token = self.token_manager.refresh_if_needed()
         if not token:
             raise RuntimeError("Failed to get valid Dhan token")

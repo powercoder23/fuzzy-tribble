@@ -110,17 +110,21 @@ class ScripMasterLotSizer:
     def get_option_security_id(self, underlying: str, expiry: str,
                                strike: float, option_type: str):
         """
-        Look up the Dhan security_id for a specific option contract.
+        Look up the security identifier for a specific option contract.
 
-        Args:
-            underlying:   e.g. "BAJAJ-AUTO"
-            expiry:       "YYYY-MM-DD" e.g. "2026-05-27"
-            strike:       e.g. 8100.0
-            option_type:  "CE" or "PE"
+        When DATA_PROVIDER=upstox (env), returns an Upstox instrument_key
+        (e.g. "NSE_FO|12345") from complete.db so that place_order() works
+        directly against the Upstox OrderApi.
 
-        Returns:
-            SEM_SMST_SECURITY_ID string or None if not found.
+        Otherwise returns the Dhan SEM_SMST_SECURITY_ID string.
         """
+        if os.getenv("DATA_PROVIDER", "dhan").lower() == "upstox":
+            return self._get_upstox_instrument_key(underlying, expiry, strike, option_type)
+        return self._get_dhan_security_id(underlying, expiry, strike, option_type)
+
+    def _get_dhan_security_id(self, underlying: str, expiry: str,
+                               strike: float, option_type: str):
+        """Dhan scrip master lookup (original implementation)."""
         try:
             expiry_dt  = datetime.strptime(expiry, "%Y-%m-%d")
             mon_year   = expiry_dt.strftime("%b%Y")   # "May2026"
@@ -145,8 +149,21 @@ class ScripMasterLotSizer:
             conn.close()
             return None
         except Exception:
-            logger.warning("get_option_security_id failed for %s %s %s %s",
+            logger.warning("_get_dhan_security_id failed for %s %s %s %s",
                            underlying, expiry, strike, option_type)
+            return None
+
+    def _get_upstox_instrument_key(self, underlying: str, expiry: str,
+                                    strike: float, option_type: str):
+        """Upstox complete.db lookup — returns instrument_key like 'NSE_FO|12345'."""
+        from upstox_adapter import _option_instrument_key
+        # Normalise underlying: Dhan uses "BAJAJ-AUTO", Upstox uses "BAJAJ-AUTO" too.
+        # For indices: Dhan "NIFTY" → Upstox underlying_symbol "NIFTY".
+        key = _option_instrument_key(underlying, expiry, strike, option_type)
+        if not key:
+            logger.warning("_get_upstox_instrument_key: no key for %s %s %s %s",
+                           underlying, expiry, strike, option_type)
+        return key
             return None
 
 
@@ -898,6 +915,11 @@ class MomentumStrategyRunner:
         self._eq_id_map: dict           = {}   # {fno_sec_id: eq_sec_id}
 
     def _build_scanner(self) -> DiscountedPremiumScanner:
+        if os.getenv("DATA_PROVIDER", "dhan").lower() == "upstox":
+            from upstox_adapter import UpstoxDhanAdapter
+            from upstox_token_manager import load_upstox_token
+            adapter = UpstoxDhanAdapter(load_upstox_token())
+            return DiscountedPremiumScanner(upstox_adapter=adapter)
         token = self.token_manager.refresh_if_needed()
         if not token:
             raise RuntimeError("Failed to get valid Dhan token")

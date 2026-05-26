@@ -11,6 +11,17 @@ class Config:
     DHAN_PIN = os.getenv('DHAN_PIN')
     DHAN_TOTP_SECRET = os.getenv('DHAN_TOTP_SECRET')
     DHAN_MOBILE = os.getenv('DHAN_MOBILE')
+
+    # Broker selector: "dhan" (default) or "upstox"
+    DATA_PROVIDER = os.getenv('DATA_PROVIDER', 'dhan')
+
+    # Upstox Credentials
+    UPSTOX_API_KEY = os.getenv('UPSTOX_API_KEY')
+    UPSTOX_API_SECRET = os.getenv('UPSTOX_API_SECRET')
+    UPSTOX_REDIRECT_URL = os.getenv('UPSTOX_REDIRECT_URL', 'https://api.upstox.com/v2/login')
+    UPSTOX_MOBILE_NO = os.getenv('UPSTOX_MOBILE_NO')
+    UPSTOX_PIN = os.getenv('UPSTOX_PIN')
+    UPSTOX_TOTP_SECRET = os.getenv('UPSTOX_TOTP_SECRET')
     
     # Telegram
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -32,8 +43,9 @@ class Config:
     SIGNALS_DIR = BASE_DIR / 'data' / 'signals'
     LOGS_DIR = BASE_DIR / 'logs'
     
-    # Token file
+    # Token files
     TOKEN_FILE = TOKEN_DIR / 'access_token.json'
+    UPSTOX_TOKEN_FILE = TOKEN_DIR / 'upstox_access_token.json'
     
     @classmethod
     def ensure_dirs(cls):

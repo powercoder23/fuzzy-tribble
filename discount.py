@@ -173,20 +173,24 @@ class DiscountedPremiumScanner:
     Using Dhan API with proper authentication pattern
     """
     
-    def __init__(self, hardtoken, client_id="1104878989", store_intraday=False):
+    def __init__(self, hardtoken=None, client_id="1104878989", store_intraday=False,
+                 upstox_adapter=None):
         """
-        Initialize scanner with Dhan API credentials
-        
-        Args:
-            hardtoken: JWT token from Dhan
-            client_id: Your Dhan client ID
-        """
-        if not client_id or not hardtoken:
-            raise ValueError("DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN are required.")
+        Initialize scanner with Dhan API credentials OR an Upstox adapter.
 
-        self.client_id = client_id
-        self.context = DhanContext(client_id, hardtoken)
-        self.dhan = dhanhq(self.context)
+        Pass `upstox_adapter=UpstoxDhanAdapter(token)` to use Upstox for all
+        data and order calls while keeping the rest of the strategy logic intact.
+        """
+        if upstox_adapter is not None:
+            self.client_id = "upstox"
+            self.context   = None
+            self.dhan      = upstox_adapter
+        else:
+            if not client_id or not hardtoken:
+                raise ValueError("DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN are required.")
+            self.client_id = client_id
+            self.context = DhanContext(client_id, hardtoken)
+            self.dhan = dhanhq(self.context)
         self.risk_free_rate = 0.065  # 6.5% - update from RBI periodically
         self.iv_history_file = IV_HISTORY_FILE
         self.store_intraday = store_intraday

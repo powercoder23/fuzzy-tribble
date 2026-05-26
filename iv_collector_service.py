@@ -78,28 +78,31 @@ class IVCollector:
     # ── scanner lifecycle ─────────────────────────────────────────────────────
 
     def _ensure_scanner(self) -> DiscountedPremiumScanner:
-        token = self.token_manager.refresh_if_needed()
-        if not token:
-            raise RuntimeError("IVCollector: failed to obtain Dhan token")
         if self._scanner is None:
-            self._scanner = DiscountedPremiumScanner(
-                hardtoken=token,
-                client_id=Config.DHAN_CLIENT_ID,
-                store_intraday=True,
-            )
+            self._scanner = self._create_scanner()
             logger.info("IVCollector: scanner initialised with %d FNO symbols",
                         len(self._scanner.fno_stocks))
         return self._scanner
 
     def _refresh_scanner(self) -> DiscountedPremiumScanner:
         """Rebuild scanner after token refresh — call once per pass."""
+        self._scanner = self._create_scanner()
+        return self._scanner
+
+    def _create_scanner(self) -> DiscountedPremiumScanner:
+        if os.getenv("DATA_PROVIDER", "dhan").lower() == "upstox":
+            from upstox_adapter import UpstoxDhanAdapter
+            from upstox_token_manager import load_upstox_token
+            adapter = UpstoxDhanAdapter(load_upstox_token())
+            return DiscountedPremiumScanner(upstox_adapter=adapter, store_intraday=True)
         token = self.token_manager.refresh_if_needed()
-        self._scanner = DiscountedPremiumScanner(
+        if not token:
+            raise RuntimeError("IVCollector: failed to obtain Dhan token")
+        return DiscountedPremiumScanner(
             hardtoken=token,
             client_id=Config.DHAN_CLIENT_ID,
             store_intraday=True,
         )
-        return self._scanner
 
     # ── expiry resolution ─────────────────────────────────────────────────────
 

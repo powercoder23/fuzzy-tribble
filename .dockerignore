@@ -1,0 +1,29 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Large data files — mounted as volumes at runtime
+data/
+logs/
+
+# Upstox instruments download (fetched at container startup)
+complete.json
+complete.json.gz
+complete.db
+
+# Dhan scrip master downloads
+*.csv
+
+# IDE / OS
+.env
+.git/
+.claude/
+*.md
+old/
+trash/
+
+# Test artefacts
+*.png
+crash.png
+upstox_login_error.png
