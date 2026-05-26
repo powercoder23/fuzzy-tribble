@@ -216,6 +216,8 @@ class DiscountedPremiumScanner:
         if data not in (None, "", [], {}):
             return False
         remarks = response.get("remarks") or {}
+        if not isinstance(remarks, dict):
+            return False  # Upstox errors return a plain string, not a Dhan-style error dict
         return all(remarks.get(k) is None for k in ("error_code", "error_type", "error_message"))
 
     def _call_chain_api(self, fn, **kwargs):

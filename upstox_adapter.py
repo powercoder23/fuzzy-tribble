@@ -86,24 +86,58 @@ def _symbol_from_security_id(security_id: str) -> str | None:
         return None
 
 
+def _isin_from_security_id(security_id: str) -> str | None:
+    """Look up SEM_ISIN_NUMBER from the Dhan scrip master for an equity/index security."""
+    try:
+        conn = sqlite3.connect(_get_scrip_master_db())
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT SEM_ISIN_NUMBER FROM scrip_master
+               WHERE SEM_SMST_SECURITY_ID = ?
+                 AND SEM_INSTRUMENT_NAME NOT IN ('OPTSTK','OPTIDX','FUTSTK','FUTIDX')
+               LIMIT 1""",
+            (str(security_id),),
+        )
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as exc:
+        logger.debug("_isin_from_security_id(%s) failed: %s", security_id, exc)
+        return None
+
+
 def _underlying_key_from_security_id(security_id: str, exchange_segment: str) -> str | None:
     """
     Return the Upstox instrument_key for an underlying.
     For indices, uses a hardcoded map.
-    For equities, queries complete.db.
+    For equities, tries (in order):
+      1. ISIN from Dhan scrip master → NSE_EQ|{isin}  (no complete.db needed)
+      2. complete.db EQ lookup
+      3. complete.db underlying_key from any option entry
     """
     sid = str(security_id)
 
     if sid in _INDEX_SECURITY_ID_TO_KEY:
         return _INDEX_SECURITY_ID_TO_KEY[sid]
 
+    # 1. ISIN path — works without complete.db
+    isin = _isin_from_security_id(sid)
+    if isin:
+        return f"NSE_EQ|{isin}"
+
+    # 2 & 3. complete.db fallbacks
     symbol = _symbol_from_security_id(sid)
     if not symbol:
+        logger.warning(
+            "_underlying_key_from_security_id(%s): symbol not found in scrip master", security_id
+        )
         return None
 
     try:
         conn = sqlite3.connect(_COMPLETE_DB)
         cur = conn.cursor()
+
+        # Try EQ row first
         cur.execute(
             """SELECT instrument_key FROM instruments
                WHERE trading_symbol = ? AND exchange = 'NSE'
@@ -112,10 +146,32 @@ def _underlying_key_from_security_id(security_id: str, exchange_segment: str) ->
             (symbol,),
         )
         row = cur.fetchone()
+        if row:
+            conn.close()
+            return row[0]
+
+        # Fallback: get underlying_key from any OPT entry (option rows store the underlying key)
+        cur.execute(
+            """SELECT DISTINCT underlying_key FROM instruments
+               WHERE underlying_symbol = ?
+                 AND instrument_type IN ('CE','PE')
+                 AND underlying_key IS NOT NULL
+               LIMIT 1""",
+            (symbol,),
+        )
+        row = cur.fetchone()
         conn.close()
-        return row[0] if row else None
+        if row:
+            return row[0]
+
+        logger.warning(
+            "_underlying_key_from_security_id(%s/%s): not found in complete.db — "
+            "run init_upstox_token.py to rebuild it",
+            security_id, symbol,
+        )
+        return None
     except Exception as exc:
-        logger.warning("_underlying_key_from_security_id(%s) failed: %s", security_id, exc)
+        logger.warning("_underlying_key_from_security_id(%s) complete.db lookup failed: %s", security_id, exc)
         return None
 
 
@@ -142,10 +198,9 @@ def _option_instrument_key(underlying_symbol: str, expiry_date: str,
                WHERE underlying_symbol = ?
                  AND strike_price      = ?
                  AND expiry            = ?
-                 AND instrument_type   = 'OPT'
-                 AND trading_symbol LIKE ?
+                 AND instrument_type   = ?
                LIMIT 1""",
-            (underlying_symbol, float(strike), expiry_epoch, f"%{option_type}"),
+            (underlying_symbol, float(strike), expiry_epoch, option_type),  # option_type is "CE" or "PE"
         )
         row = cur.fetchone()
         conn.close()
@@ -167,7 +222,7 @@ def _expiry_dates_for_underlying(underlying_symbol: str) -> list[str]:
         cur.execute(
             """SELECT DISTINCT expiry FROM instruments
                WHERE underlying_symbol = ?
-                 AND instrument_type   = 'OPT'
+                 AND instrument_type   IN ('CE','PE')
                  AND expiry            > ?
                ORDER BY expiry""",
             (underlying_symbol, now_epoch_ms),
