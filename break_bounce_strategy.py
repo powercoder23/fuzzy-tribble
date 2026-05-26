@@ -27,7 +27,6 @@ import pytz
 import requests
 
 from discount import DiscountedPremiumScanner, unwrap_dhan_payload, get_trading_days_to_expiry
-from token_manager import TokenManager
 from config import Config
 import iv_store
 from momentum_strategy import (
@@ -615,7 +614,6 @@ class BreakBounceStrategyRunner:
 
     def __init__(self, capital: float = CAPITAL):
         self.risk_manager  = BreakBounceRiskManager(capital)
-        self.token_manager = TokenManager()
         self.lot_sizer     = ScripMasterLotSizer()
         self._scanner_obj  = None
         self._bb_scanner   = None
@@ -627,15 +625,7 @@ class BreakBounceStrategyRunner:
         self._daily_levels: dict = {}
 
     def _build_scanner(self) -> DiscountedPremiumScanner:
-        if os.getenv("DATA_PROVIDER", "dhan").lower() == "upstox":
-            from upstox_adapter import UpstoxDhanAdapter
-            from upstox_token_manager import load_upstox_token
-            adapter = UpstoxDhanAdapter(load_upstox_token())
-            return DiscountedPremiumScanner(upstox_adapter=adapter)
-        token = self.token_manager.refresh_if_needed()
-        if not token:
-            raise RuntimeError("Failed to get valid Dhan token")
-        return DiscountedPremiumScanner(hardtoken=token, client_id=Config.DHAN_CLIENT_ID)
+        return DiscountedPremiumScanner()
 
     def _ensure_components(self) -> None:
         if self._scanner_obj is not None:

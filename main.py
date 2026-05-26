@@ -15,7 +15,6 @@ from pathlib import Path
 import schedule
 
 from config import Config
-from token_manager import TokenManager
 from discount import DiscountedPremiumScanner
 from directional_iv_runner import run_directional_scan
 
@@ -47,7 +46,6 @@ logger = logging.getLogger(__name__)
 
 class StrategySchedulerApp:
     def __init__(self):
-        self.token_manager = TokenManager()
         self.strategy_jobs = [
             {
                 "name": "discount",
@@ -62,25 +60,8 @@ class StrategySchedulerApp:
         ]
 
     def build_discount_scanner(self):
-        """Create the discount scanner with a valid token."""
-        token = self.token_manager.get_valid_token()
-        if not token:
-            raise RuntimeError("Failed to get valid token")
-
-        logger.info("Token obtained (first 10 chars): %s...", token[:10])
-        return DiscountedPremiumScanner(
-            hardtoken=token,
-            client_id=Config.DHAN_CLIENT_ID,
-        )
-
-    def warm_up_token(self):
-        """Ensure a valid token exists before the scheduler starts waiting."""
-        token = self.token_manager.get_valid_token()
-        if not token:
-            raise RuntimeError("Failed to warm up access token")
-
-        logger.info("Startup token is ready")
-        return token
+        """Create the discount scanner."""
+        return DiscountedPremiumScanner()
 
     def run_discount_scan(self):
         """Run the discount scanner once."""
@@ -89,12 +70,7 @@ class StrategySchedulerApp:
         logger.info("%s", "=" * 70)
 
         try:
-            token = self.token_manager.refresh_if_needed()
-            scanner = DiscountedPremiumScanner(
-                hardtoken=token,
-                client_id=Config.DHAN_CLIENT_ID,
-            )
-
+            scanner = DiscountedPremiumScanner()
             opportunities = scanner.scan_all_fno_stocks(min_discount_score=55)
             scanner.generate_report(opportunities)
 
@@ -134,7 +110,6 @@ class StrategySchedulerApp:
 
     def run(self, run_now=False, exit_after_run=False):
         """Start the scheduler loop, with optional immediate execution."""
-        self.warm_up_token()
         self.setup_schedule()
         logger.info("Strategy scheduler started")
         logger.info("Scheduler timezone: %s", APP_TIMEZONE)

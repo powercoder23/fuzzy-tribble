@@ -66,7 +66,6 @@ def _symbol_from_security_id(security_id: str) -> str | None:
     """Resolve a Dhan security_id to its trading symbol via the local scrip master."""
     sid = str(security_id)
     if sid in _INDEX_SECURITY_ID_TO_KEY:
-        # Return a short name so the caller knows it's an index
         return _INDEX_SECURITY_ID_TO_KEY[sid].split("|")[1]  # e.g. "Nifty 50"
     try:
         conn = sqlite3.connect(_get_scrip_master_db())
@@ -74,7 +73,8 @@ def _symbol_from_security_id(security_id: str) -> str | None:
         cur.execute(
             """SELECT SEM_TRADING_SYMBOL FROM scrip_master
                WHERE SEM_SMST_SECURITY_ID = ?
-                 AND SEM_INSTRUMENT_NAME NOT IN ('OPTSTK','OPTIDX','FUTSTK','FUTIDX')
+                 AND SEM_EXM_EXCH_ID = 'NSE'
+                 AND SEM_SEGMENT = 'E'
                LIMIT 1""",
             (sid,),
         )
@@ -87,14 +87,15 @@ def _symbol_from_security_id(security_id: str) -> str | None:
 
 
 def _isin_from_security_id(security_id: str) -> str | None:
-    """Look up SEM_ISIN_NUMBER from the Dhan scrip master for an equity/index security."""
+    """Look up SEM_ISIN_NUMBER from the Dhan scrip master for an NSE equity security."""
     try:
         conn = sqlite3.connect(_get_scrip_master_db())
         cur = conn.cursor()
         cur.execute(
             """SELECT SEM_ISIN_NUMBER FROM scrip_master
                WHERE SEM_SMST_SECURITY_ID = ?
-                 AND SEM_INSTRUMENT_NAME NOT IN ('OPTSTK','OPTIDX','FUTSTK','FUTIDX')
+                 AND SEM_EXM_EXCH_ID = 'NSE'
+                 AND SEM_SEGMENT = 'E'
                LIMIT 1""",
             (str(security_id),),
         )
@@ -503,16 +504,30 @@ class UpstoxDhanAdapter:
             return {"status": "failure", "remarks": "instrument_key not found"}
 
         try:
-            from datetime import date as _date
+            from datetime import date as _date, datetime as _datetime
             resp = self._options_api.get_option_contracts(
                 instrument_key=underlying_key,
             )
             contracts = resp.data if resp and resp.data else []
-            today = _date.today().isoformat()
-            expiries = sorted(set(
-                c.expiry for c in contracts
-                if getattr(c, "expiry", None) and c.expiry >= today
-            ))
+            today = _date.today()
+            expiry_strs = []
+            for c in contracts:
+                exp = getattr(c, "expiry", None)
+                if exp is None:
+                    continue
+                # SDK may return datetime.datetime or datetime.date
+                if isinstance(exp, _datetime):
+                    exp_date = exp.date()
+                elif isinstance(exp, _date):
+                    exp_date = exp
+                else:
+                    try:
+                        exp_date = _date.fromisoformat(str(exp)[:10])
+                    except Exception:
+                        continue
+                if exp_date >= today:
+                    expiry_strs.append(exp_date.strftime("%Y-%m-%d"))
+            expiries = sorted(set(expiry_strs))
             logger.debug("expiry_list(%s → %s): %d expiries", sid, underlying_key, len(expiries))
             return {"status": "success", "data": expiries}
         except ApiException as exc:

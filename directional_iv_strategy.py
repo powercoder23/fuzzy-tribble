@@ -31,15 +31,7 @@ class DirectionalIVScanner:
 
     def __init__(self, hardtoken=None, client_id=None, universe=None,
                  upstox_adapter=None):
-        if upstox_adapter is not None:
-            self.scanner = DiscountedPremiumScanner(upstox_adapter=upstox_adapter)
-        else:
-            if not hardtoken:
-                raise ValueError("Dhan access token is required")
-            self.scanner = DiscountedPremiumScanner(
-                hardtoken=hardtoken,
-                client_id=client_id or Config.DHAN_CLIENT_ID,
-            )
+        self.scanner = DiscountedPremiumScanner(upstox_adapter=upstox_adapter)
         self.universe = self._build_universe(universe)
 
     def _build_universe(self, universe):

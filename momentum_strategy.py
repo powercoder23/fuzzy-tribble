@@ -19,7 +19,6 @@ from discount import (
     unwrap_dhan_payload,
     get_trading_days_to_expiry,
 )
-from token_manager import TokenManager
 from config import Config
 from load_scrip_master_sqlite import get_security_id_symbol_map
 import iv_store
@@ -118,9 +117,7 @@ class ScripMasterLotSizer:
 
         Otherwise returns the Dhan SEM_SMST_SECURITY_ID string.
         """
-        if os.getenv("DATA_PROVIDER", "dhan").lower() == "upstox":
-            return self._get_upstox_instrument_key(underlying, expiry, strike, option_type)
-        return self._get_dhan_security_id(underlying, expiry, strike, option_type)
+        return self._get_upstox_instrument_key(underlying, expiry, strike, option_type)
 
     def _get_dhan_security_id(self, underlying: str, expiry: str,
                                strike: float, option_type: str):
@@ -164,7 +161,6 @@ class ScripMasterLotSizer:
             logger.warning("_get_upstox_instrument_key: no key for %s %s %s %s",
                            underlying, expiry, strike, option_type)
         return key
-            return None
 
 
 # ---------------------------------------------------------------------------
@@ -901,7 +897,6 @@ class MomentumStrategyRunner:
 
     def __init__(self, capital: float = CAPITAL):
         self.risk_manager  = MomentumRiskManager(capital)
-        self.token_manager = TokenManager()
         self.lot_sizer     = ScripMasterLotSizer()
         self._scanner      = None
         self._regime_filter   = None
@@ -915,16 +910,7 @@ class MomentumStrategyRunner:
         self._eq_id_map: dict           = {}   # {fno_sec_id: eq_sec_id}
 
     def _build_scanner(self) -> DiscountedPremiumScanner:
-        if os.getenv("DATA_PROVIDER", "dhan").lower() == "upstox":
-            from upstox_adapter import UpstoxDhanAdapter
-            from upstox_token_manager import load_upstox_token
-            adapter = UpstoxDhanAdapter(load_upstox_token())
-            return DiscountedPremiumScanner(upstox_adapter=adapter)
-        token = self.token_manager.refresh_if_needed()
-        if not token:
-            raise RuntimeError("Failed to get valid Dhan token")
-        return DiscountedPremiumScanner(
-            hardtoken=token, client_id=Config.DHAN_CLIENT_ID)
+        return DiscountedPremiumScanner()
 
     def _ensure_components(self) -> None:
         """Lazy initialisation. Safe to call multiple times."""

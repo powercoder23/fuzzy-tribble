@@ -11,7 +11,6 @@ import pytz
 import schedule
 
 from config import Config
-from token_manager import TokenManager
 import iv_store
 from directional_iv_config import OUTPUT_CSV
 from directional_iv_strategy import DirectionalIVScanner
@@ -39,13 +38,7 @@ SCAN_TIMES = ["09:45", "11:15", "13:15", "14:45", "15:05"]
 
 def run_directional_scan():
     iv_store.init_db()
-    if os.getenv("DATA_PROVIDER", "dhan").lower() == "upstox":
-        from upstox_adapter import UpstoxDhanAdapter
-        from upstox_token_manager import load_upstox_token
-        scanner = DirectionalIVScanner(upstox_adapter=UpstoxDhanAdapter(load_upstox_token()))
-    else:
-        token = TokenManager().refresh_if_needed()
-        scanner = DirectionalIVScanner(hardtoken=token, client_id=Config.DHAN_CLIENT_ID)
+    scanner = DirectionalIVScanner()
 
     logger.info("Directional IV scan starting")
     opportunities = scanner.scan_all_underlyings()
