@@ -35,15 +35,15 @@ MIN_IV_SAMPLES = 30
 CHAIN_API_MIN_INTERVAL_SEC = 3.1
 CHAIN_API_RETRY_BACKOFF_SEC = 4.0
 DEFAULT_FNO_STOCKS = {
-    13: "NIFTY",
-    14: "BANKNIFTY",
-    1333: "HDFCBANK",
-    1592: "RELIANCE",
-    1610: "ICICIBANK",
-    1523: "INFY",
-    1394: "TCS",
-    1510: "HINDUNILVR",
-    1633: "SBIN",
+    13:    "NIFTY",
+    14:    "BANKNIFTY",
+    1333:  "HDFCBANK",
+    2885:  "RELIANCE",
+    4963:  "ICICIBANK",
+    1594:  "INFY",
+    11536: "TCS",
+    1394:  "HINDUNILVR",
+    3045:  "SBIN",
 }
 IV_HISTORY_COLUMNS = [
     "snapshot_date",

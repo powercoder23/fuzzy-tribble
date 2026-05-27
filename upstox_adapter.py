@@ -394,7 +394,7 @@ class UpstoxDhanAdapter:
         try:
             resp = self._history_api.get_intra_day_candle_data(
                 instrument_key=inst_key,
-                unit="minute",
+                unit="minutes",
                 interval=int(interval),
             )
             candles = resp.data.candles if resp and resp.data else []
@@ -417,7 +417,7 @@ class UpstoxDhanAdapter:
         try:
             resp = self._history_api.get_historical_candle_data(
                 instrument_key=inst_key,
-                unit="day",
+                unit="days",
                 interval=1,
                 to_date=to_date,
             )
