@@ -442,14 +442,9 @@ class MomentumScanner:
             ts_col = next((c for c in df.columns
                            if c in ("timestamp", "start_time", "datetime", "time", "date")), None)
             if ts_col:
-                # Dhan returns epoch integers (Unix seconds)
-                parsed = pd.to_datetime(df[ts_col], unit="s", errors="coerce")
-                if parsed.isna().all():
-                    # Fallback: plain string datetime (forward-compatibility)
-                    parsed = pd.to_datetime(df[ts_col], errors="coerce")
-                    df["datetime"] = parsed
-                else:
-                    df["datetime"] = parsed.dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata")
+                # Upstox returns ISO strings with tz offset; parse through UTC then convert to IST
+                parsed = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
+                df["datetime"] = parsed.dt.tz_convert("Asia/Kolkata")
             elif "datetime" not in df.columns:
                 return empty
 
