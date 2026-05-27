@@ -181,9 +181,9 @@ class BreakBounceScanner:
             ts_col = next((c for c in df.columns
                            if c in ("timestamp", "start_time", "date", "time")), None)
             if ts_col:
-                # Dhan returns epoch integers (Unix seconds) — must use unit='s'
-                df["date"] = pd.to_datetime(df[ts_col], unit="s", errors="coerce") \
-                               .dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata") \
+                # Upstox returns ISO strings with tz offset; parse directly then convert to IST
+                df["date"] = pd.to_datetime(df[ts_col], errors="coerce", utc=True) \
+                               .dt.tz_convert("Asia/Kolkata") \
                                .dt.date.astype(str)
             elif "date" not in df.columns:
                 return empty

@@ -407,8 +407,8 @@ class UpstoxDhanAdapter:
             return {"status": "failure", "remarks": str(exc)}
 
     def historical_daily_data(self, security_id, exchange_segment,
-                              instrument_type, from_date, to_date,
-                              oi=False) -> dict:
+                              instrument_type, from_date, to_date,  # noqa: ARG002
+                              oi=False, **_kwargs) -> dict:
         """Fetch daily OHLCV; returns Dhan-compatible list-of-dicts payload."""
         inst_key = _underlying_key_from_security_id(security_id, exchange_segment)
         if not inst_key:
@@ -420,7 +420,6 @@ class UpstoxDhanAdapter:
                 unit="day",
                 interval=1,
                 to_date=to_date,
-                from_date=from_date,
             )
             candles = resp.data.candles if resp and resp.data else []
             col = _candles_to_dhan_columnar(candles)
