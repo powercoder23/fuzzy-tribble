@@ -20,8 +20,11 @@ services:
       - ./logs:/app/logs
     command: python iv_collector_service.py
 
-  # ── Service 2: Momentum Strategy ──────────────────────────────────────────
+  # ── Service 2: Momentum Strategy (DISCONTINUED) ──────────────────────────
+  # Excluded from default `docker-compose up` via profile.
+  # To run manually: docker-compose --profile momentum up momentum
   momentum:
+    profiles: [momentum]
     build:
       context: .
       dockerfile: Dockerfile.momentum
@@ -77,8 +80,11 @@ services:
       - iv-collector
     command: python break_bounce_runner.py
 
-  # ── Service 5: Directional IV Strategy ──────────────────────────────────
+  # ── Service 5: Directional IV Strategy (DISCONTINUED) ───────────────────
+  # Excluded from default `docker-compose up` via profile.
+  # To run manually: docker-compose --profile directional-iv up directional-iv
   directional-iv:
+    profiles: [directional-iv]
     build:
       context: .
       dockerfile: Dockerfile.directional

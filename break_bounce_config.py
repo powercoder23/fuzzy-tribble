@@ -27,6 +27,10 @@ BB_BREAKOUT = {
     # Force exit all positions by this time
     "force_exit_hour":    15,
     "force_exit_min":     15,
+    # Expire retest monitoring this many minutes after breakout confirmation.
+    # Prevents a stock from staying in the 5-min scan loop all day when the
+    # retest never arrives or every validation gate keeps rejecting it.
+    "retest_expiry_minutes": 60,
 }
 
 BB_LIQUIDITY = {

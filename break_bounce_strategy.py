@@ -181,10 +181,28 @@ class BreakBounceScanner:
             ts_col = next((c for c in df.columns
                            if c in ("timestamp", "start_time", "date", "time")), None)
             if ts_col:
-                # Upstox returns ISO strings with tz offset; parse directly then convert to IST
-                df["date"] = pd.to_datetime(df[ts_col], errors="coerce", utc=True) \
-                               .dt.tz_convert("Asia/Kolkata") \
-                               .dt.date.astype(str)
+                # Fix 1: parse timestamps safely for both tz-aware and tz-naive sources.
+                #
+                # The old code used utc=True, which reinterprets tz-naive values as UTC
+                # and then shifts them +5:30 to IST — turning a "2025-05-26" naive string
+                # into 2025-05-26 05:30 IST, which is still the right date.  But it also
+                # causes problems when the column is a mix of aware/naive entries, and it
+                # silently mis-dates any source that already carries its own non-UTC offset.
+                #
+                # Instead: detect tz info first and handle each case explicitly.
+                _parsed = pd.to_datetime(df[ts_col], errors="coerce")
+                if _parsed.dt.tz is not None:
+                    # Tz-aware (e.g. Upstox ISO "2025-05-26T00:00:00+05:30"):
+                    # convert directly to IST without reinterpreting the offset.
+                    _parsed = _parsed.dt.tz_convert("Asia/Kolkata")
+                else:
+                    # Tz-naive (plain date strings or epoch-derived naive datetimes):
+                    # these already represent IST midnight/session times — localise
+                    # directly so no UTC→IST shift is applied.
+                    _parsed = _parsed.dt.tz_localize(
+                        "Asia/Kolkata", ambiguous="infer", nonexistent="shift_forward"
+                    )
+                df["date"] = _parsed.dt.date.astype(str)
             elif "date" not in df.columns:
                 return empty
 
@@ -274,30 +292,41 @@ class BreakBounceScanner:
             if completed.empty:
                 return {**no_breakout, "reason": "no_completed_candles"}
 
-            for _, candle in completed.iterrows():
-                candle_dt = pd.to_datetime(candle["datetime"])
-                if candle_dt.tzinfo is None:
-                    candle_dt = IST.localize(candle_dt)
-                if candle_dt < market_open or candle_dt > window_end:
-                    continue
+            # Fix 3: only examine the most recent completed candle on each scan.
+            # The old loop iterated over every historical completed candle, which
+            # meant that on every 5-minute tick we re-evaluated candles from
+            # earlier in the session.  That creates two problems:
+            #   (a) redundant API / DataFrame work on each tick.
+            #   (b) a candle that broke out at 9:30 could trigger a "breakout"
+            #       alert at 11:00 if the premarket state was cleared and rebuilt.
+            # Checking only the latest completed candle is sufficient because the
+            # runner calls this method on every 5-min tick; any breakout candle
+            # will be the latest completed candle for 3 consecutive ticks
+            # (15-min candles complete every 15 min; scans run every 5 min).
+            latest    = completed.iloc[-1]
+            candle_dt = pd.to_datetime(latest["datetime"])
+            if candle_dt.tzinfo is None:
+                candle_dt = IST.localize(candle_dt)
+            if candle_dt < market_open or candle_dt > window_end:
+                return {**no_breakout, "reason": "latest_candle_outside_window"}
 
-                close = float(candle["close"])
-                if close > yh:
-                    return {
-                        "direction":      "BULLISH",
-                        "breakout_level": yh,
-                        "candle_close":   round(close, 2),
-                        "candle_time":    str(candle["datetime"]),
-                        "reason":         "closed_above_daily_high",
-                    }
-                if close < yl:
-                    return {
-                        "direction":      "BEARISH",
-                        "breakout_level": yl,
-                        "candle_close":   round(close, 2),
-                        "candle_time":    str(candle["datetime"]),
-                        "reason":         "closed_below_daily_low",
-                    }
+            close = float(latest["close"])
+            if close > yh:
+                return {
+                    "direction":      "BULLISH",
+                    "breakout_level": yh,
+                    "candle_close":   round(close, 2),
+                    "candle_time":    str(latest["datetime"]),
+                    "reason":         "closed_above_daily_high",
+                }
+            if close < yl:
+                return {
+                    "direction":      "BEARISH",
+                    "breakout_level": yl,
+                    "candle_close":   round(close, 2),
+                    "candle_time":    str(latest["datetime"]),
+                    "reason":         "closed_below_daily_low",
+                }
 
             return {**no_breakout, "reason": "no_breakout_yet"}
 
@@ -345,8 +374,17 @@ class BreakBounceScanner:
             level = breakout_level
 
             if breakout_direction == "BULLISH":
-                # Price retests yesterday's high from above — low of candle touches the level
-                at_level = abs(float(last["low"]) - level) / max(level, 1e-6) <= tol
+                # Fix 2: use candle-range overlap instead of a single-point check.
+                # The old code only checked whether last["low"] was within tol of the
+                # level.  That misses retests where the candle body sits just above the
+                # level but the wick dips through it, or where the low undershoots by a
+                # tick.  Range overlap — does the candle's [low, high] band intersect the
+                # tolerance band [level*(1-tol), level*(1+tol)]? — is both more
+                # inclusive and physically correct: if price touched the level at any
+                # point during the candle, the candle range overlaps the level band.
+                _lvl_lo  = level * (1 - tol)
+                _lvl_hi  = level * (1 + tol)
+                at_level = float(last["low"]) <= _lvl_hi and float(last["high"]) >= _lvl_lo
                 if at_level:
                     # Hammer: must be preceded by ≥2 red candles falling into the level
                     if self._is_hammer(last, prior):
@@ -375,8 +413,13 @@ class BreakBounceScanner:
                         }
 
             elif breakout_direction == "BEARISH":
-                # Price retests yesterday's low from below — high of candle touches the level
-                at_level = abs(float(last["high"]) - level) / max(level, 1e-6) <= tol
+                # Fix 2 (bearish side): same candle-range overlap logic mirrored.
+                # A valid resistance retest is any candle whose range intersects the
+                # tolerance band around the level, whether the high lands exactly on
+                # the level, falls slightly short, or briefly pierces it.
+                _lvl_lo  = level * (1 - tol)
+                _lvl_hi  = level * (1 + tol)
+                at_level = float(last["high"]) >= _lvl_lo and float(last["low"]) <= _lvl_hi
                 if at_level:
                     # Inverted hammer: must be preceded by ≥2 green candles rising to the level
                     if self._is_inverted_hammer(last, prior):
@@ -660,7 +703,7 @@ class BreakBounceStrategyRunner:
             if actual_key is None:
                 return {}
             entry = chain[actual_key]
-            sub   = entry.get("call" if side == "CE" else "put", {})
+            sub   = entry.get("ce" if side == "CE" else "pe", {})
             ltp    = float(sub.get("ltp", 0))
             bid    = float(sub.get("bid", 0))
             ask    = float(sub.get("ask", 0))
@@ -887,8 +930,11 @@ class BreakBounceStrategyRunner:
                     direction = result.get("direction", "NONE")
 
                     if direction in ("BULLISH", "BEARISH"):
-                        state["breakout_direction"] = direction
-                        state["breakout_level"]     = result.get("breakout_level", 0.0)
+                        state["breakout_direction"]    = direction
+                        state["breakout_level"]        = result.get("breakout_level", 0.0)
+                        # Fix 4: record the confirmation time so the retest expiry
+                        # check below can void setups that linger too long.
+                        state["breakout_confirmed_at"] = datetime.now(IST)
                         logger.info(
                             "B&B BREAKOUT CONFIRMED: %s %s level=%.2f close=%.2f",
                             symbol, direction, state["breakout_level"],
@@ -905,6 +951,25 @@ class BreakBounceStrategyRunner:
                     continue   # check entry on the next 5-min scan cycle
 
                 # ── Step 3: breakout confirmed — check 5-min entry ───────────
+
+                # Fix 4: expire retest monitoring that has been running too long.
+                # If liquidity / affordability / chain-fetch keeps failing on every
+                # 5-min tick, the setup would otherwise stay active until EOD.
+                # Void it after `retest_expiry_minutes` so the scanner doesn't waste
+                # API calls on a setup that clearly isn't going to materialise.
+                _expiry_mins  = BB_BREAKOUT.get("retest_expiry_minutes", 60)
+                _confirmed_at = state.get("breakout_confirmed_at")
+                if _confirmed_at is not None:
+                    _elapsed_min = (datetime.now(IST) - _confirmed_at).total_seconds() / 60
+                    if _elapsed_min > _expiry_mins:
+                        state["setup_voided"] = True
+                        logger.info(
+                            "B&B %s: retest monitoring expired after %.0f min "
+                            "(limit=%d min) — voiding setup",
+                            symbol, _elapsed_min, _expiry_mins,
+                        )
+                        continue
+
                 can_trade, reason = self.risk_manager.can_trade()
                 if not can_trade:
                     logger.info("B&B: cannot trade — %s", reason)
@@ -1073,6 +1138,13 @@ class BreakBounceStrategyRunner:
             logger.info("B&B force exit: no open positions")
             return
 
+        # Fix 5: track which exits succeeded so we only remove confirmed positions.
+        # The old code always cleared open_positions at the end, even when a
+        # place_order call threw an exception or the broker rejected the sell.
+        # Retaining failed exits in memory lets the operator inspect them and
+        # prevents silently losing track of an open leg.
+        _retained: list = []
+
         for pos in list(self.risk_manager.open_positions):
             symbol      = pos.get("symbol", "?")
             opt_sec_id  = pos.get("option_security_id", "")
@@ -1080,8 +1152,13 @@ class BreakBounceStrategyRunner:
             qty         = pos.get("lots", 0) * pos.get("lot_size", 0)
 
             if not opt_sec_id or qty <= 0:
-                logger.warning("B&B force exit %s: missing sec_id or qty — skip",
-                               symbol)
+                # Can't place an exit without an instrument key and a quantity.
+                # Retain the position so it shows up in any post-run inspection.
+                logger.warning(
+                    "B&B force exit %s: missing sec_id or qty — retaining in memory",
+                    symbol,
+                )
+                _retained.append(pos)
                 continue
 
             # Cancel SL_M first so it doesn't double-fire after we square.
@@ -1096,6 +1173,7 @@ class BreakBounceStrategyRunner:
                     logger.exception("B&B force exit %s: SL cancel failed "
                                      "(may already be triggered)", symbol)
 
+            _exit_ok = False
             try:
                 resp = self._scanner_obj.dhan.place_order(
                     security_id      = opt_sec_id,
@@ -1111,16 +1189,37 @@ class BreakBounceStrategyRunner:
                                 symbol, qty)
                     self._notifier.send(
                         f"🔚 B&amp;B force exit <b>{symbol}</b>: market sell {qty} qty")
+                    _exit_ok = True
                 else:
+                    # Rejected orders most likely mean the SL already filled, so
+                    # we don't retain them — but we log the broker response clearly.
                     logger.warning("B&B force exit %s: sell rejected — %s",
                                    symbol, resp)
                     self._notifier.send(
                         f"ℹ️ B&amp;B force exit <b>{symbol}</b>: sell rejected "
                         "(likely SL already filled)")
             except Exception:
-                logger.exception("B&B force exit %s: place_order exception", symbol)
+                logger.exception("B&B force exit %s: place_order exception — retaining",
+                                 symbol)
+                # Exception means the order was never transmitted; retain the
+                # position so it is visible and can be manually squared off.
+                _retained.append(pos)
+                continue
 
-        self.risk_manager.open_positions = []
+            # If the sell was accepted (exit_ok=True) we drop the position.
+            # Rejected sells are assumed to be SL-filled and are also dropped.
+            # Only exception-path positions are retained (added above).
+            if not _exit_ok:
+                pass  # Rejected — treated as SL-filled; not retained.
+
+        # Replace open_positions with only those that could not be exited.
+        self.risk_manager.open_positions = _retained
+        if _retained:
+            logger.warning(
+                "B&B force exit: %d position(s) retained after failed exits: %s",
+                len(_retained),
+                [p.get("symbol") for p in _retained],
+            )
 
     def run_eod(self) -> None:
         """Called at 15:15. Force-close open positions, send summary, reset state."""

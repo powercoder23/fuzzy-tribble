@@ -314,22 +314,35 @@ def _option_chain_to_dhan_format(strikes_data, underlying_symbol: str) -> dict:
                 if opt is None:
                     return {}
                 md = opt.market_data or {}
-                greeks = opt.option_greeks or {}
+                greeks_obj = opt.option_greeks or {}
                 # market_data is a Pydantic/dataclass; access as attributes
                 ltp    = getattr(md, "ltp", None) or 0.0
                 bid    = getattr(md, "bid_price", None) or 0.0
                 ask    = getattr(md, "ask_price", None) or 0.0
                 oi     = getattr(md, "oi", None) or 0.0
                 volume = getattr(md, "volume", None) or 0.0
-                iv     = getattr(greeks, "iv", None) or 0.0
+                iv     = getattr(greeks_obj, "iv",    None) or 0.0
+                delta  = getattr(greeks_obj, "delta", None) or 0.0
+                theta  = getattr(greeks_obj, "theta", None) or 0.0
+                vega   = getattr(greeks_obj, "vega",  None) or 0.0
+                gamma  = getattr(greeks_obj, "gamma", None) or 0.0
                 inst_key = getattr(opt, "instrument_key", None) or ""
                 return {
                     "ltp":               float(ltp),
+                    "last_price":        float(ltp),
+                    "top_bid_price":     float(bid),
+                    "top_ask_price":     float(ask),
                     "bid":               float(bid),
                     "ask":               float(ask),
                     "oi":                float(oi),
                     "volume":            float(volume),
                     "implied_volatility": float(iv),
+                    "greeks": {
+                        "delta": float(delta),
+                        "vega":  float(vega),
+                        "theta": float(theta),
+                        "gamma": float(gamma),
+                    },
                     "option_security_id": inst_key,  # used by place_order
                 }
 
