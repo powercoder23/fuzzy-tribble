@@ -583,16 +583,22 @@ class BreakBounceTelegramNotifier:
         )
         self.send(msg)
 
-    def send_breakout_alert(self, symbol: str, direction: str,
-                            level: float, candle_close: float) -> None:
-        arrow = "🟢 BULLISH" if direction == "BULLISH" else "🔴 BEARISH"
-        level_label = "yesterday HIGH" if direction == "BULLISH" else "yesterday LOW"
-        msg = (
-            f"⚡ <b>BREAKOUT CONFIRMED: {symbol}</b>\n"
-            f"Direction: {arrow}\n"
-            f"15-min close: ₹{candle_close:.2f} vs {level_label}: ₹{level:.2f}\n"
-            "Watching 5-min chart for retest entry..."
-        )
+    def send_breakout_batch_alert(self, breakouts: list) -> None:
+        """Send all 15-min breakouts confirmed in the current scan cycle as one message."""
+        if not breakouts:
+            return
+        lines = []
+        for b in breakouts:
+            arrow = "🟢" if b["direction"] == "BULLISH" else "🔴"
+            label = "HIGH" if b["direction"] == "BULLISH" else "LOW"
+            lines.append(
+                f"{arrow} <b>{b['symbol']}</b> — close ₹{b['candle_close']:.2f} vs {label} ₹{b['level']:.2f}"
+            )
+        count = len(breakouts)
+        header = f"⚡ <b>BREAKOUT{'S' if count > 1 else ''} CONFIRMED ({count})</b>"
+        msg = header + "\n──────────────────────────────\n" + "\n".join(lines) + \
+              "\n──────────────────────────────\nWatching 5-min chart for retest entr" + \
+              ("ies..." if count > 1 else "y...")
         self.send(msg)
 
     def send_signal_alert(self, signal: dict, strike_data: dict,
@@ -906,6 +912,7 @@ class BreakBounceStrategyRunner:
             )
 
             signals_placed = []
+            new_breakouts: list = []
 
             for sec_id, state in list(self._stock_states.items()):
                 if state.get("trade_placed") or state.get("setup_voided"):
@@ -939,10 +946,12 @@ class BreakBounceStrategyRunner:
                             "B&B BREAKOUT CONFIRMED: %s %s level=%.2f close=%.2f",
                             symbol, direction, state["breakout_level"],
                             result.get("candle_close", 0.0))
-                        self._notifier.send_breakout_alert(
-                            symbol, direction,
-                            state["breakout_level"],
-                            result.get("candle_close", 0.0))
+                        new_breakouts.append({
+                            "symbol":       symbol,
+                            "direction":    direction,
+                            "level":        state["breakout_level"],
+                            "candle_close": result.get("candle_close", 0.0),
+                        })
                     elif result.get("reason") == "window_expired":
                         state["setup_voided"] = True
                         logger.debug("B&B %s: window expired, voiding setup", symbol)
@@ -1121,6 +1130,9 @@ class BreakBounceStrategyRunner:
                 logger.info("B&B trade logged: %s %s %s lots=%d",
                             symbol, side, strike_data.get("strike"), lots)
                 time.sleep(0.3)
+
+            if new_breakouts:
+                self._notifier.send_breakout_batch_alert(new_breakouts)
 
             return signals_placed
 

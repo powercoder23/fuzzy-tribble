@@ -509,26 +509,44 @@ class DiscountedPremiumScanner:
         df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
         return df
 
-    def fetch_historical_iv(self, security_id, exchange_segment, lookback_days=252):
+    def fetch_historical_iv(self, security_id, exchange_segment, lookback_days=252,
+                             include_intraday=False):
         """
         Load persisted ATM IV history from SQLite DB (read-only).
         Writes are handled by a separate service.
+
+        FIX 2: defaults to daily rows only so intraday snapshots don't inflate
+        IV Rank / IV Percentile. Pass include_intraday=True to allow all rows.
         """
         if not self.iv_history_file.exists():
             return []
 
         try:
             with sqlite3.connect(str(self.iv_history_file), timeout=30.0) as conn:
-                cursor = conn.execute("""
-                    SELECT atm_iv 
-                    FROM iv_history
-                    WHERE security_id = ?
-                    AND atm_iv IS NOT NULL
-                    AND atm_iv >= 1.0
-                    AND atm_iv <= 200.0
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                """, (str(security_id), lookback_days))
+                if include_intraday:
+                    cursor = conn.execute("""
+                        SELECT atm_iv
+                        FROM iv_history
+                        WHERE security_id = ?
+                        AND atm_iv IS NOT NULL
+                        AND atm_iv >= 1.0
+                        AND atm_iv <= 200.0
+                        ORDER BY timestamp DESC
+                        LIMIT ?
+                    """, (str(security_id), lookback_days))
+                else:
+                    # FIX 2: restrict to daily snapshots for clean IV Rank/Pct computation.
+                    cursor = conn.execute("""
+                        SELECT atm_iv
+                        FROM iv_history
+                        WHERE security_id = ?
+                        AND data_type = 'daily'
+                        AND atm_iv IS NOT NULL
+                        AND atm_iv >= 1.0
+                        AND atm_iv <= 200.0
+                        ORDER BY timestamp DESC
+                        LIMIT ?
+                    """, (str(security_id), lookback_days))
                 rows = cursor.fetchall()
                 return [row[0] for row in reversed(rows)]
         except Exception:

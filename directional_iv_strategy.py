@@ -66,7 +66,7 @@ class DirectionalIVScanner:
 
     def _trend_context(self, price_df: pd.DataFrame) -> dict:
         if price_df.empty or len(price_df) < TREND_FILTER["ema_long"]:
-            return {"trend": "neutral"}
+            return {"trend": "neutral", "trend_strength": "neutral"}
 
         closes = price_df["close"].astype(float).copy()
         ema_fast = closes.ewm(span=TREND_FILTER["ema_fast"], adjust=False).mean()
@@ -76,38 +76,70 @@ class DirectionalIVScanner:
 
         last_close = closes.iloc[-1]
         last_open = price_df["open"].astype(float).iloc[-1]
-        is_bullish = last_close > ema_fast.iloc[-1] > ema_mid.iloc[-1] > ema_slow.iloc[-1] > ema_long.iloc[-1]
-        is_bearish = last_close < ema_fast.iloc[-1] < ema_mid.iloc[-1] < ema_slow.iloc[-1] < ema_long.iloc[-1]
-        trend = "neutral"
-        if is_bullish:
-            trend = "bullish"
-        elif is_bearish:
-            trend = "bearish"
+        ef, em, es, el = (ema_fast.iloc[-1], ema_mid.iloc[-1],
+                          ema_slow.iloc[-1], ema_long.iloc[-1])
+
+        # FIX 5: two-tier trend — strong requires the full EMA stack in order;
+        # weak requires only close vs ema_mid + ema_fast vs ema_mid.
+        strong_bullish = last_close > ef > em > es > el
+        weak_bullish   = (not strong_bullish) and last_close > em and ef > em
+        strong_bearish = last_close < ef < em < es < el
+        weak_bearish   = (not strong_bearish) and last_close < em and ef < em
+
+        if strong_bullish:
+            trend, trend_strength = "bullish", "strong_bullish"
+        elif weak_bullish:
+            trend, trend_strength = "bullish", "bullish"
+        elif strong_bearish:
+            trend, trend_strength = "bearish", "strong_bearish"
+        elif weak_bearish:
+            trend, trend_strength = "bearish", "bearish"
+        else:
+            trend, trend_strength = "neutral", "neutral"
 
         return {
             "trend": trend,
+            "trend_strength": trend_strength,
             "last_close": last_close,
             "last_open": last_open,
-            "ema_fast": ema_fast.iloc[-1],
-            "ema_mid": ema_mid.iloc[-1],
-            "ema_slow": ema_slow.iloc[-1],
-            "ema_long": ema_long.iloc[-1],
+            "ema_fast": ef,
+            "ema_mid": em,
+            "ema_slow": es,
+            "ema_long": el,
         }
 
     def _score_candidate(self, candidate: dict) -> float:
+        # FIX 1: read from score_components, not top-level candidate keys.
+        comps = candidate.get("score_components", {})
+        breakdown: dict = {}
+
+        def _w(key: str, weight: float) -> float:
+            val = comps.get(key, 0) * weight
+            breakdown[key] = round(val, 2)
+            return val
+
         score = 0.0
-        score += candidate.get("trend_alignment", 0) * 1.3
-        score += candidate.get("delta_score", 0) * 1.1
-        score += candidate.get("iv_edge_score", 0) * 1.0
-        score += candidate.get("liquidity_score", 0) * 0.9
-        score += candidate.get("iv_rank_score", 0) * 0.9
-        score += candidate.get("moneyness_score", 0) * 0.7
-        score += candidate.get("expiry_score", 0) * 0.5
+        score += _w("trend_alignment", 1.3)
+        score += _w("delta_score", 1.1)
+        score += _w("iv_edge_score", 1.0)
+        score += _w("liquidity_score", 0.9)
+        score += _w("iv_rank_score", 0.9)
+        score += _w("moneyness_score", 0.7)
+        score += _w("expiry_score", 0.5)
+        # FIX 9: persist weighted contributions for debugging and future tuning.
+        candidate["score_breakdown"] = breakdown
         return min(100.0, score)
 
-    def _build_trade_plan(self, premium: float) -> dict:
+    def _build_trade_plan(self, premium: float, delta: float = None,
+                           expected_move: float = None) -> dict:
         stop_loss = round(premium * (1 - RISK_CONFIG["sl_pct"]), 2)
-        target = round(premium * RISK_CONFIG["target_mult"], 2)
+        # FIX 4: derive target from expected option move (delta * underlying EM)
+        # when both are available; fall back to the multiplier when not.
+        if delta is not None and expected_move and expected_move > 0:
+            expected_option_move = abs(delta) * expected_move
+            target = round(premium + expected_option_move, 2)
+        else:
+            target = round(premium * RISK_CONFIG["target_mult"], 2)
         rr = None
         if premium > stop_loss:
             rr = round((target - premium) / (premium - stop_loss), 2)
@@ -149,11 +181,34 @@ class DirectionalIVScanner:
     def _normalise_delta(self, delta: float) -> float:
         return abs(delta)
 
+    def _delta_score(self, delta: float) -> float:
+        # FIX 3: tiered scoring — sweet-spot 0.15-0.35 = 100; neighbours = 80; outliers = 50.
+        if 0.15 <= delta <= 0.35:
+            return 100.0
+        if 0.10 <= delta < 0.15 or 0.35 < delta <= 0.50:
+            return 80.0
+        return 50.0
+
+    def _atm_iv_edge_score(self, iv_edge: float) -> float:
+        # FIX 6: tiered ATM-relative IV edge score.
+        # Hard reject is now at -10 (not -5) so moderate premium candidates pass through.
+        if iv_edge >= 5:
+            return 100.0
+        if iv_edge >= 0:
+            return 80.0
+        if iv_edge >= -5:
+            return 60.0
+        if iv_edge >= -10:
+            return 40.0
+        return 0.0
+
     def scan_single_strike(self, strike_data: dict, strike_price: float, spot_price: float,
                            atm_context: dict, option_chain: dict, expected_move: float,
                            dte: int, trend_bias: str, has_iv_history: bool,
                            historical_ivs: list[float], hv_metrics: dict,
-                           chain_metrics: dict) -> list[dict]:
+                           chain_metrics: dict,
+                           trend_strength: str = "neutral",  # FIX 5
+                           symbol: str = "") -> list[dict]:  # FIX 8: for debug logging
         candidates = []
         if not strike_data or not isinstance(strike_data, dict):
             return []
@@ -189,7 +244,9 @@ class DirectionalIVScanner:
             if not atm_iv:
                 atm_iv = atm_context.get("atm_iv")
             iv_edge = ((atm_iv - current_iv) / atm_iv) * 100 if atm_iv and atm_iv > 0 else 0
-            if iv_edge < -5:
+            # FIX 6: hard-reject only when IV is >10% above ATM; range -10 to -5
+            # is now penalised via tiered scoring rather than rejected outright.
+            if iv_edge < -10:
                 continue
 
             expected_move_ratio = abs(strike_price - spot_price) / expected_move if expected_move else 0
@@ -204,11 +261,11 @@ class DirectionalIVScanner:
             if bias == "bearish" and option_type != "PUT":
                 continue
 
-            trade_plan = self._build_trade_plan(mid)
+            # FIX 4: pass delta + expected_move so target uses expected option move.
+            trade_plan = self._build_trade_plan(mid, delta=delta, expected_move=expected_move)
             if trade_plan["risk_reward"] is None or trade_plan["risk_reward"] < 1.8:
                 continue
 
-            weighted_hv = hv_metrics.get("weighted_hv")
             reason = []
             if has_iv_history and iv_rank is not None:
                 reason.append(f"IV Rank {iv_rank:.0f}")
@@ -218,6 +275,7 @@ class DirectionalIVScanner:
                 reason.append(f"IV {iv_edge:.1f}%% below ATM")
             if expected_move and expected_move_ratio <= 1.0:
                 reason.append("Inside expected move")
+            # FIX 7: OI ratio is informational only — not used for direction or scoring.
             if chain_metrics.get("call_put_oi_ratio"):
                 reason.append(f"OI ratio {chain_metrics['call_put_oi_ratio']:.2f}")
             if bias == "bullish":
@@ -225,6 +283,7 @@ class DirectionalIVScanner:
             if bias == "bearish":
                 reason.append("Trend bias bearish")
 
+            moneyness_pct = abs(strike_price - spot_price) / spot_price * 100
             candidate = {
                 "type": option_type,
                 "strike": strike_price,
@@ -237,7 +296,7 @@ class DirectionalIVScanner:
                 "iv_rank": round(iv_rank, 2) if iv_rank is not None else None,
                 "iv_percentile": round(iv_percentile, 2) if iv_percentile is not None else None,
                 "atm_iv": round(atm_context.get("atm_iv") or 0, 2),
-                "moneyness": round(abs(strike_price - spot_price) / spot_price * 100, 2),
+                "moneyness": round(moneyness_pct, 2),
                 "oi": int(oi),
                 "volume": int(volume),
                 "bid": round(bid, 2),
@@ -246,15 +305,17 @@ class DirectionalIVScanner:
                 "expected_move_ratio": round(expected_move_ratio, 2),
                 "trend_bias": bias,
                 "trend": bias,
+                "trend_strength": trend_strength,  # FIX 5
                 "expiry_dte": dte,
+                # FIX 7: informational context only — not scored, not directional filter.
                 "call_put_oi_ratio": round(chain_metrics.get("call_put_oi_ratio") or 0, 2),
                 "score_components": {
                     "trend_alignment": self._trend_alignment_score(bias, option_type),
-                    "delta_score": 100.0 if IV_FILTER["min_delta"] <= delta <= 0.30 else 65.0,
-                    "iv_edge_score": self._iv_edge_score(current_iv, weighted_hv),
+                    "delta_score": self._delta_score(delta),          # FIX 3: tiered
+                    "iv_edge_score": self._atm_iv_edge_score(iv_edge), # FIX 6: tiered ATM-relative
                     "liquidity_score": self._liquidity_score(oi, volume),
                     "iv_rank_score": 100.0 - min(iv_rank or 50.0, 100.0) if iv_rank is not None else 50.0,
-                    "moneyness_score": self._moneyness_score(abs(strike_price - spot_price) / spot_price * 100),
+                    "moneyness_score": self._moneyness_score(moneyness_pct),
                     "expiry_score": 100.0 if DTE_FILTER["min_dte"] <= dte <= 21 else 65.0,
                 },
                 "score": 0.0,
@@ -262,7 +323,18 @@ class DirectionalIVScanner:
                 "spot": round(spot_price, 2),
                 "symbol": None,
             }
+            # FIX 1+9: reads score_components, stores score_breakdown as a side-effect.
             candidate["score"] = round(self._score_candidate(candidate), 2)
+            # FIX 8: per-strike debug log with all key metrics and score breakdown.
+            logger.debug(
+                "%s %s strike=%.0f | delta=%.3f | IV=%.2f | iv_rank=%s | iv_pct=%s | "
+                "iv_edge=%.1f | trend_strength=%s | score=%.2f | breakdown=%s",
+                symbol or "?", option_type, strike_price, delta, current_iv,
+                f"{iv_rank:.1f}" if iv_rank is not None else "N/A",
+                f"{iv_percentile:.1f}" if iv_percentile is not None else "N/A",
+                iv_edge, trend_strength, candidate["score"],
+                candidate.get("score_breakdown", {}),
+            )
             if candidate["score"] < MIN_SCORE:
                 continue
             candidates.append(candidate)
@@ -299,12 +371,15 @@ class DirectionalIVScanner:
             )
             return []
 
-        historical_ivs = self.scanner.fetch_historical_iv(security_id, segment)
+        # FIX 2: daily rows only — avoids intraday snapshots inflating IV Rank/Percentile.
+        historical_ivs = self.scanner.fetch_historical_iv(
+            security_id, segment, include_intraday=False
+        )
         has_iv_history = len(historical_ivs) >= 10
         dte = self.scanner.days_to_expiry(expiry)
         expected_move = self.scanner.compute_expected_move(spot_price, atm_context.get("atm_iv"), dte)
         hv_metrics = {"weighted_hv": None}
-        trend_context = {"trend": "neutral"}
+        trend_context = {"trend": "neutral", "trend_strength": "neutral"}
         hist_prices = self.scanner.fetch_historical_prices(
             security_id=security_id,
             exchange_segment=segment,
@@ -314,6 +389,17 @@ class DirectionalIVScanner:
         if not hist_prices.empty:
             hv_metrics = self.scanner.calculate_hv_metrics(hist_prices)
             trend_context = self._trend_context(hist_prices)
+
+        # FIX 8: per-underlying debug summary after all context is ready.
+        logger.debug(
+            "%s | IV samples=%d | weighted_hv=%s | expected_move=%s | trend=%s (%s)",
+            symbol,
+            len(historical_ivs),
+            round(hv_metrics.get("weighted_hv") or 0, 2),
+            round(expected_move, 2) if expected_move else "N/A",
+            trend_context.get("trend", "neutral"),
+            trend_context.get("trend_strength", "neutral"),
+        )
 
         total_metrics = self.scanner.extract_chain_metrics(option_chain)
         if total_metrics.get("total_put_oi"):
@@ -342,10 +428,13 @@ class DirectionalIVScanner:
                 historical_ivs=historical_ivs,
                 hv_metrics=hv_metrics,
                 chain_metrics=total_metrics,
+                trend_strength=trend_context.get("trend_strength", "neutral"),  # FIX 5
+                symbol=symbol,  # FIX 8
             )
             for entry in entries:
                 entry["symbol"] = symbol
                 entry["trend"] = trend_context.get("trend", "neutral")
+                entry["trend_strength"] = trend_context.get("trend_strength", "neutral")  # FIX 5
                 entry["hv"] = round(hv_metrics.get("weighted_hv") or 0, 2)
                 entry["atm_iv"] = round(atm_context.get("atm_iv") or 0, 2)
                 candidates.append(entry)
