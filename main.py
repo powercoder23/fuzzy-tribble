@@ -75,7 +75,7 @@ class StrategySchedulerApp:
             scanner.generate_report(opportunities)
 
             if not opportunities.empty:
-                output_path = Path("discounted_premiums.csv")
+                output_path = Config.DATA_DIR / "discounted_premiums.csv"
                 opportunities.to_csv(output_path, index=False)
                 logger.info("Results saved to %s", output_path)
 

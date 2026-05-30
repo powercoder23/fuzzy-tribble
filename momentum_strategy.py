@@ -21,7 +21,7 @@ from discount import (
 )
 from config import Config
 from load_scrip_master_sqlite import get_security_id_symbol_map
-import iv_store
+from collectors import iv_store
 from momentum_config import (
     CAPITAL, RISK_CONFIG, REGIME, ORB, LIQUIDITY, STRIKE,
     SCRIP_MASTER_DB, IV_HISTORY_DB, TRADE_LOG_PATH, LOT_SIZE_FALLBACK,

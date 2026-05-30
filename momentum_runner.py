@@ -22,7 +22,7 @@ from datetime import datetime, time as dt_time
 import pytz
 import schedule
 
-import iv_store
+from collectors import iv_store
 from config import Config
 from momentum_strategy import MomentumStrategyRunner
 

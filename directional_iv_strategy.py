@@ -10,7 +10,7 @@ import pandas as pd
 
 from discount import DiscountedPremiumScanner, unwrap_dhan_payload
 from config import Config
-import iv_store
+from collectors import iv_store
 from directional_iv_config import (
     CAPITAL,
     DTE_FILTER,

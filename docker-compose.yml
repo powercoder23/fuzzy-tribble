@@ -18,7 +18,7 @@ services:
     volumes:
       - shared-data:/app/data
       - ./logs:/app/logs
-    command: python iv_collector_service.py
+    command: python -m collectors.iv_collector_service
 
   # ── Service 2: Momentum Strategy (DISCONTINUED) ──────────────────────────
   # Excluded from default `docker-compose up` via profile.

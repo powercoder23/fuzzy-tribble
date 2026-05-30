@@ -11,7 +11,7 @@ import pytz
 import schedule
 
 from config import Config
-import iv_store
+from collectors import iv_store
 from directional_iv_config import OUTPUT_CSV
 from directional_iv_strategy import DirectionalIVScanner
 

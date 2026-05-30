@@ -22,16 +22,20 @@ from datetime import datetime, time as dt_time
 from pathlib import Path
 
 import requests
+import schedule
 
 import pytz
 
 from config import Config
+from collectors.bhav_collector  import BhavCollector
+from collectors.deals_collector import DealsCollector
+from collectors.vix_collector   import VixCollector
 from discount import (
     DiscountedPremiumScanner,
     unwrap_dhan_payload,
     get_trading_days_to_expiry,
 )
-import iv_store
+from collectors import iv_store
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -433,7 +437,17 @@ class IVCollector:
         EOD_REPORT_TIME   = dt_time(15, 35)
         _last_reset_date  = datetime.now().date()
 
+        # Block deals — after block window closes
+        schedule.every().day.at("10:35").do(DealsCollector(Config).run)
+        # Bulk + short deals — after market close
+        schedule.every().day.at("15:45").do(DealsCollector(Config).run)
+        # VIX EOD
+        schedule.every().day.at("18:30").do(VixCollector(Config).run)
+        # Bhavcopy — delivery data
+        schedule.every().day.at("19:00").do(BhavCollector(Config).run)
+
         while True:
+            schedule.run_pending()
             now = datetime.now()
             t   = now.time()
 

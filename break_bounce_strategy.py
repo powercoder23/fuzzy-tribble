@@ -28,7 +28,7 @@ import requests
 
 from discount import DiscountedPremiumScanner, unwrap_dhan_payload, get_trading_days_to_expiry
 from config import Config
-import iv_store
+from collectors import iv_store
 from momentum_strategy import (
     ScripMasterLotSizer,
     MomentumRegimeFilter,

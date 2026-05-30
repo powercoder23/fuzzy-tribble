@@ -1372,7 +1372,7 @@ if __name__ == "__main__":
     
     # Save to CSV
     if not all_opportunities.empty:
-        all_opportunities.to_csv("discounted_premiums.csv", index=False)
-        logger.info("Results saved to discounted_premiums.csv")
+        all_opportunities.to_csv(Path("data") / "discounted_premiums.csv", index=False)
+        logger.info("Results saved to data/discounted_premiums.csv")
 
     scanner.send_telegram_summary(all_opportunities)
