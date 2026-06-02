@@ -437,14 +437,30 @@ class IVCollector:
         EOD_REPORT_TIME   = dt_time(15, 35)
         _last_reset_date  = datetime.now().date()
 
+        _deals   = DealsCollector(Config)
+        _vix     = VixCollector(Config)
+        _bhav    = BhavCollector(Config)
+
         # Block deals — after block window closes
-        schedule.every().day.at("10:35").do(DealsCollector(Config).run)
+        schedule.every().day.at("10:35").do(_deals.run)
         # Bulk + short deals — after market close
-        schedule.every().day.at("15:45").do(DealsCollector(Config).run)
+        schedule.every().day.at("15:45").do(_deals.run)
         # VIX EOD
-        schedule.every().day.at("18:30").do(VixCollector(Config).run)
+        schedule.every().day.at("18:30").do(_vix.run)
         # Bhavcopy — delivery data
-        schedule.every().day.at("19:00").do(BhavCollector(Config).run)
+        schedule.every().day.at("19:00").do(_bhav.run)
+
+        # Catch up any collector jobs whose schedule already passed today
+        now_t = datetime.now(IST).time()
+        if now_t >= dt_time(10, 35):
+            logger.info("Startup catch-up: running deals collector")
+            _deals.run()
+        if now_t >= dt_time(18, 30):
+            logger.info("Startup catch-up: running VIX collector")
+            _vix.run()
+        if now_t >= dt_time(19, 0):
+            logger.info("Startup catch-up: running bhav collector")
+            _bhav.run()
 
         while True:
             schedule.run_pending()
