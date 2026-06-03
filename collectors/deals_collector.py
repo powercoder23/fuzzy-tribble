@@ -12,6 +12,8 @@ import time
 import pandas as pd
 import requests
 
+from collectors.notify import send_telegram
+
 logger = logging.getLogger(__name__)
 
 _CREATE_TABLE = """
@@ -122,10 +124,10 @@ class DealsCollector:
         )
         return df
 
-    def save(self, df: pd.DataFrame) -> None:
+    def save(self, df: pd.DataFrame) -> tuple[int, int]:
         if df.empty:
             logger.warning("DealsCollector.save: empty DataFrame — nothing to save")
-            return
+            return 0, 0
 
         self._init_table()
         conn = sqlite3.connect(self._db_path)
@@ -160,12 +162,20 @@ class DealsCollector:
             conn.close()
 
         logger.info("DealsCollector.save: inserted=%d / total=%d", inserted, len(df))
+        return inserted, len(df)
 
     def run(self) -> None:
         logger.info("DealsCollector.run: fetching NSE deals")
         try:
             raw = self.fetch()
             df  = self.parse(raw)
-            self.save(df)
-        except Exception:
+            inserted, total = self.save(df)
+            by_type = (df["deal_type"].value_counts().to_dict()
+                       if not df.empty else {})
+            breakdown = " ".join(f"{k}={v}" for k, v in by_type.items()) or "none"
+            send_telegram(
+                f"🤝 <b>Deals</b>: saved {inserted}/{total} rows ({breakdown})"
+            )
+        except Exception as exc:
             logger.exception("DealsCollector.run failed")
+            send_telegram(f"⚠️ <b>Deals</b> collector failed: {exc}")

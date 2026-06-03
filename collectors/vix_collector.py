@@ -12,6 +12,8 @@ from datetime import date as _Date
 
 import requests
 
+from collectors.notify import send_telegram
+
 logger = logging.getLogger(__name__)
 
 _CREATE_TABLE = """
@@ -74,10 +76,11 @@ class VixCollector:
         )
         return vix
 
-    def save(self, record: dict) -> None:
+    def save(self, record: dict) -> bool:
         today = _Date.today().isoformat()
         self._init_table()
         conn = sqlite3.connect(self._db_path)
+        inserted = False
         try:
             cur = conn.cursor()
             cur.execute("""
@@ -105,11 +108,21 @@ class VixCollector:
             logger.exception("VixCollector.save failed | date=%s", today)
         finally:
             conn.close()
+        return inserted
 
     def run(self) -> None:
         logger.info("VixCollector.run: fetching India VIX")
         try:
-            record = self.fetch()
-            self.save(record)
-        except Exception:
+            record  = self.fetch()
+            inserted = self.save(record)
+            last    = record.get("last")
+            pct     = record.get("percentChange")
+            pct_str = f"{pct:+.2f}%" if isinstance(pct, (int, float)) else "n/a"
+            tag     = "saved" if inserted else "already saved"
+            send_telegram(
+                f"📈 <b>India VIX</b> {_Date.today().isoformat()}: "
+                f"{last} ({pct_str}) → vix_daily [{tag}]"
+            )
+        except Exception as exc:
             logger.exception("VixCollector.run failed")
+            send_telegram(f"⚠️ <b>India VIX</b> collector failed: {exc}")

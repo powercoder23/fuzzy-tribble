@@ -6,11 +6,14 @@ delivery + OHLC data for F&O symbols into delivery_daily table.
 import io
 import logging
 import sqlite3
+import time
 import zipfile
 from datetime import date as _Date
 
 import pandas as pd
 import requests
+
+from collectors.notify import send_telegram
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +43,9 @@ _HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
-    "Referer": "https://www.nseindia.com",
-    "Accept": "*/*",
+    "Referer":         "https://www.nseindia.com",
+    "Accept":          "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 
@@ -58,17 +62,43 @@ class BhavCollector:
         finally:
             conn.close()
 
+    def _make_session(self) -> requests.Session:
+        # NSE archive endpoints 403 (or serve an HTML block page) for requests
+        # that arrive without cookies — prime the session via the home page
+        # first, same as the deals/vix collectors.
+        sess = requests.Session()
+        sess.headers.update(_HEADERS)
+        sess.get("https://www.nseindia.com", timeout=15)
+        time.sleep(2)
+        return sess
+
     def fetch(self, trade_date: _Date) -> pd.DataFrame:
         url = _BHAV_URL.format(date=trade_date.strftime("%Y%m%d"))
         logger.info("BhavCollector.fetch: GET %s", url)
 
-        resp = requests.get(url, headers=_HEADERS, timeout=30)
-        resp.raise_for_status()
-
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            csv_name = next(n for n in zf.namelist() if n.endswith(".csv"))
-            with zf.open(csv_name) as f:
-                df = pd.read_csv(f)
+        sess = self._make_session()
+        df = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = sess.get(url, timeout=30)
+                resp.raise_for_status()
+                # A blocked request can return HTTP 200 with an HTML body
+                # instead of the ZIP — ZipFile then raises BadZipFile, which
+                # the retry below handles.
+                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                    csv_name = next(n for n in zf.namelist() if n.endswith(".csv"))
+                    with zf.open(csv_name) as f:
+                        df = pd.read_csv(f)
+                break
+            except Exception as exc:
+                last_err = exc
+                logger.warning("BhavCollector.fetch: attempt %d/3 failed (%s)",
+                               attempt + 1, exc)
+                if attempt < 2:
+                    time.sleep(3)
+        if df is None:
+            raise last_err
 
         df.columns = df.columns.str.strip()
         df = df.rename(columns={
@@ -111,11 +141,11 @@ class BhavCollector:
                     len(df), trade_date.isoformat())
         return df
 
-    def save(self, df: pd.DataFrame, trade_date: _Date) -> None:
+    def save(self, df: pd.DataFrame, trade_date: _Date) -> tuple[int, int]:
         if df.empty:
             logger.warning("BhavCollector.save: empty DataFrame for %s",
                            trade_date.isoformat())
-            return
+            return 0, 0
 
         self._init_table()
         conn = sqlite3.connect(self._db_path)
@@ -149,6 +179,7 @@ class BhavCollector:
 
         logger.info("BhavCollector.save: inserted=%d / total=%d | date=%s",
                     inserted, len(df), trade_date.isoformat())
+        return inserted, len(df)
 
     def run(self, trade_date: _Date = None) -> None:
         if trade_date is None:
@@ -156,6 +187,13 @@ class BhavCollector:
         logger.info("BhavCollector.run: starting for %s", trade_date.isoformat())
         try:
             df = self.fetch(trade_date)
-            self.save(df, trade_date)
-        except Exception:
+            inserted, total = self.save(df, trade_date)
+            send_telegram(
+                f"📦 <b>Bhavcopy</b> {trade_date.isoformat()}: "
+                f"saved {inserted}/{total} rows → delivery_daily"
+            )
+        except Exception as exc:
             logger.exception("BhavCollector.run failed | date=%s", trade_date.isoformat())
+            send_telegram(
+                f"⚠️ <b>Bhavcopy</b> {trade_date.isoformat()} failed: {exc}"
+            )
