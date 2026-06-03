@@ -1,13 +1,19 @@
 """
-Bhavcopy collector — downloads NSE CM bhavcopy ZIP and persists
-delivery + OHLC data for F&O symbols into delivery_daily table.
+Bhavcopy collector — downloads NSE's full security-wise bhavdata CSV
+(sec_bhavdata_full) and persists delivery + OHLC data for F&O symbols into
+the delivery_daily table.
+
+NOTE: the plain BhavCopy_NSE_CM file has OHLC/volume but NO delivery columns —
+delivery qty/% only live in sec_bhavdata_full_DDMMYYYY.csv, which is a plain
+(non-zip) CSV. Columns: SYMBOL, SERIES, DATE1, PREV_CLOSE, OPEN_PRICE,
+HIGH_PRICE, LOW_PRICE, LAST_PRICE, CLOSE_PRICE, AVG_PRICE, TTL_TRD_QNTY,
+TURNOVER_LACS, NO_OF_TRADES, DELIV_QTY, DELIV_PER (all space-padded).
 """
 
 import io
 import logging
 import sqlite3
 import time
-import zipfile
 from datetime import date as _Date
 
 import pandas as pd
@@ -33,8 +39,8 @@ CREATE TABLE IF NOT EXISTS delivery_daily (
 """
 
 _BHAV_URL = (
-    "https://nsearchives.nseindia.com/content/cm/"
-    "BhavCopy_NSE_CM_0_0_0_{date}_F_0000.csv.zip"
+    "https://nsearchives.nseindia.com/products/content/"
+    "sec_bhavdata_full_{date}.csv"   # {date} = DDMMYYYY
 )
 
 _HEADERS = {
@@ -73,7 +79,7 @@ class BhavCollector:
         return sess
 
     def fetch(self, trade_date: _Date) -> pd.DataFrame:
-        url = _BHAV_URL.format(date=trade_date.strftime("%Y%m%d"))
+        url = _BHAV_URL.format(date=trade_date.strftime("%d%m%Y"))
         logger.info("BhavCollector.fetch: GET %s", url)
 
         sess = self._make_session()
@@ -84,12 +90,9 @@ class BhavCollector:
                 resp = sess.get(url, timeout=30)
                 resp.raise_for_status()
                 # A blocked request can return HTTP 200 with an HTML body
-                # instead of the ZIP — ZipFile then raises BadZipFile, which
-                # the retry below handles.
-                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                    csv_name = next(n for n in zf.namelist() if n.endswith(".csv"))
-                    with zf.open(csv_name) as f:
-                        df = pd.read_csv(f)
+                # instead of the CSV — read_csv then raises, which the retry
+                # below handles.
+                df = pd.read_csv(io.BytesIO(resp.content))
                 break
             except Exception as exc:
                 last_err = exc
@@ -102,15 +105,15 @@ class BhavCollector:
 
         df.columns = df.columns.str.strip()
         df = df.rename(columns={
-            "TckrSymb":    "symbol",
-            "SctySrs":     "series",
-            "OpnPric":     "open",
-            "HghPric":     "high",
-            "LwPric":      "low",
-            "ClsPric":     "close",
-            "TtlTradgVol": "volume",
-            "DlvryQty":    "deliv_qty",
-            "DlvryPct":    "deliv_pct",
+            "SYMBOL":       "symbol",
+            "SERIES":       "series",
+            "OPEN_PRICE":   "open",
+            "HIGH_PRICE":   "high",
+            "LOW_PRICE":    "low",
+            "CLOSE_PRICE":  "close",
+            "TTL_TRD_QNTY": "volume",
+            "DELIV_QTY":    "deliv_qty",
+            "DELIV_PER":    "deliv_pct",
         })
 
         required = {"symbol", "series", "open", "high", "low", "close",
@@ -119,6 +122,9 @@ class BhavCollector:
         if missing:
             raise ValueError(f"BhavCopy CSV missing expected columns: {missing}")
 
+        # sec_bhavdata_full pads string fields with leading spaces.
+        df["symbol"] = df["symbol"].astype(str).str.strip()
+        df["series"] = df["series"].astype(str).str.strip()
         df = df[df["series"] == "EQ"].copy()
 
         try:
