@@ -23,6 +23,14 @@ from collectors.notify import send_telegram
 
 logger = logging.getLogger(__name__)
 
+
+class BhavDataNotReady(Exception):
+    """Raised when NSE serves the price bhavcopy but has not yet appended the
+    delivery columns (DELIV_QTY/DELIV_PER). This is a transient, expected
+    condition shortly after market close — the caller should retry later
+    rather than treat it as a hard failure."""
+
+
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS delivery_daily (
     date      TEXT,
@@ -90,8 +98,18 @@ class BhavCollector:
                 resp = sess.get(url, timeout=30)
                 resp.raise_for_status()
                 # A blocked request can return HTTP 200 with an HTML body
-                # instead of the CSV — read_csv then raises, which the retry
-                # below handles.
+                # instead of the CSV. Detect that explicitly so the error names
+                # the real cause instead of a downstream parse failure.
+                ctype = resp.headers.get("content-type", "")
+                head  = resp.content[:200].lstrip()
+                if "csv" not in ctype.lower() and (
+                    head[:1] == b"<" or b"<html" in head.lower()
+                ):
+                    raise ValueError(
+                        f"NSE returned a non-CSV response "
+                        f"(content-type={ctype!r}, first bytes={resp.content[:120]!r}) "
+                        f"— likely a block / holiday / not-ready page"
+                    )
                 df = pd.read_csv(io.BytesIO(resp.content))
                 break
             except Exception as exc:
@@ -116,11 +134,26 @@ class BhavCollector:
             "DELIV_PER":    "deliv_pct",
         })
 
-        required = {"symbol", "series", "open", "high", "low", "close",
-                    "volume", "deliv_qty", "deliv_pct"}
-        missing = required - set(df.columns)
-        if missing:
-            raise ValueError(f"BhavCopy CSV missing expected columns: {missing}")
+        cols = set(df.columns)
+        core_required = {"symbol", "series", "open", "high", "low", "close", "volume"}
+        missing_core  = core_required - cols
+        if missing_core:
+            # Missing OHLC/volume means we didn't get the bhavcopy at all
+            # (wrong file / mangled response) — a genuine failure.
+            raise ValueError(
+                f"BhavCopy CSV missing core columns {missing_core} "
+                f"| got columns={sorted(cols)}"
+            )
+
+        missing_deliv = {"deliv_qty", "deliv_pct"} - cols
+        if missing_deliv:
+            # Price columns are present but delivery isn't — NSE appends
+            # DELIV_QTY/DELIV_PER only after settlement, so the file just isn't
+            # ready yet. Signal a retry rather than a hard failure.
+            raise BhavDataNotReady(
+                f"Delivery columns {missing_deliv} not yet published for "
+                f"{trade_date.isoformat()} | got columns={sorted(cols)}"
+            )
 
         # sec_bhavdata_full pads string fields with leading spaces.
         df["symbol"] = df["symbol"].astype(str).str.strip()
@@ -187,9 +220,32 @@ class BhavCollector:
                     inserted, len(df), trade_date.isoformat())
         return inserted, len(df)
 
+    def _already_saved(self, trade_date: _Date) -> bool:
+        """True if delivery_daily already has rows for this date — lets the
+        evening retry slots run harmlessly once a date is captured."""
+        try:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                cur = conn.execute(
+                    "SELECT COUNT(*) FROM delivery_daily WHERE date = ?",
+                    (trade_date.isoformat(),),
+                )
+                return cur.fetchone()[0] > 0
+            finally:
+                conn.close()
+        except sqlite3.OperationalError:
+            # table not created yet — nothing saved
+            return False
+
     def run(self, trade_date: _Date = None) -> None:
         if trade_date is None:
             trade_date = _Date.today()
+
+        if self._already_saved(trade_date):
+            logger.info("BhavCollector.run: already saved for %s — skipping",
+                        trade_date.isoformat())
+            return
+
         logger.info("BhavCollector.run: starting for %s", trade_date.isoformat())
         try:
             df = self.fetch(trade_date)
@@ -197,6 +253,14 @@ class BhavCollector:
             send_telegram(
                 f"📦 <b>Bhavcopy</b> {trade_date.isoformat()}: "
                 f"saved {inserted}/{total} rows → delivery_daily"
+            )
+        except BhavDataNotReady as exc:
+            # Expected transient — a later retry slot will pick it up.
+            logger.warning("BhavCollector.run: data not ready | date=%s | %s",
+                           trade_date.isoformat(), exc)
+            send_telegram(
+                f"⏳ <b>Bhavcopy</b> {trade_date.isoformat()}: "
+                f"delivery data not published yet — will retry later"
             )
         except Exception as exc:
             logger.exception("BhavCollector.run failed | date=%s", trade_date.isoformat())

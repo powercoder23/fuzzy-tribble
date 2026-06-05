@@ -447,8 +447,12 @@ class IVCollector:
         schedule.every().day.at("15:45").do(_deals.run)
         # VIX EOD
         schedule.every().day.at("18:30").do(_vix.run)
-        # Bhavcopy — delivery data
+        # Bhavcopy — delivery data. NSE appends DELIV_QTY/DELIV_PER only after
+        # settlement and is occasionally late past 19:00, so retry in the
+        # evening. run() is idempotent — later slots skip once the date is saved.
         schedule.every().day.at("19:00").do(_bhav.run)
+        schedule.every().day.at("20:30").do(_bhav.run)
+        schedule.every().day.at("22:00").do(_bhav.run)
 
         # Catch up any collector jobs whose schedule already passed today
         now_t = datetime.now(IST).time()
