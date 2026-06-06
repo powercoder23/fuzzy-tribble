@@ -41,6 +41,15 @@ from break_bounce_config import (
     SCRIP_MASTER_DB, TRADE_LOG_PATH, LOT_SIZE_FALLBACK,
 )
 
+# OI Validation Layer (isolated add-on). Importing these has no side effects;
+# the feature is a complete no-op unless OI_VALIDATION_ENABLED is set true.
+import oi_config
+from oi_validator import (
+    OIValidator,
+    log_line as oi_log_line,
+    format_breakout_batch as oi_format_breakout_batch,
+)
+
 IST = pytz.timezone("Asia/Kolkata")
 logger = logging.getLogger(__name__)
 
@@ -668,6 +677,8 @@ class BreakBounceStrategyRunner:
         self._bb_scanner   = None
         self._notifier     = None
         self._journal      = MomentumTradeJournal(filepath=TRADE_LOG_PATH)
+        # OI Validation Layer (lazy; only built when OI_VALIDATION_ENABLED).
+        self._oi_validator = None
         # {security_id: {symbol, breakout_direction, breakout_level, trade_placed, setup_voided}}
         self._stock_states: dict = {}
         # {security_id: {yesterday_high, yesterday_low, date, symbol, segment}}
@@ -796,6 +807,56 @@ class BreakBounceStrategyRunner:
         except Exception:
             logger.exception("_place_order exception")
             return {"status": "exception"}
+
+    # ---- OI Validation Layer hook (isolated add-on) ---------------------------
+
+    def _apply_oi_validation(self, state: dict, breakout_info: dict) -> None:
+        """
+        Validate a just-confirmed breakout against futures positioning.
+
+        Fully gated and fail-open:
+          * Returns immediately when OI_VALIDATION_ENABLED is false (no-op) —
+            existing behaviour is unchanged.
+          * On success, persists oi_classification / oi_score (+ a few extras)
+            into the existing per-stock ``state`` and annotates ``breakout_info``
+            for the Telegram alert.
+          * REJECT decision voids the setup so the 5-min retest never runs.
+          * Any missing OI data or unexpected error → the setup proceeds exactly
+            as today (trading is never blocked because of OI).
+        """
+        if not oi_config.OI_VALIDATION_ENABLED:
+            return
+        try:
+            if self._oi_validator is None:
+                self._oi_validator = OIValidator(scanner=self._scanner_obj)
+            res = self._oi_validator.validate(
+                breakout_info["symbol"],
+                breakout_info["direction"],
+                breakout_level=breakout_info.get("level", 0.0),
+            )
+            # Additive keys only — never overwrites existing state fields.
+            state.update(res.as_state())
+            breakout_info.update({
+                "oi_classification":   res.classification,
+                "oi_confidence":       res.confidence,
+                "oi_decision":         res.decision,
+                "oi_available":        res.available,
+                "oi_price_change_pct": res.price_change_pct,
+                "oi_oi_change_pct":    res.oi_change_pct,
+            })
+            logger.info("B&B %s", oi_log_line(res))
+            if res.decision == "REJECT":
+                state["setup_voided"] = True
+                logger.info(
+                    "B&B %s: OI validation REJECTED (%s) — voiding setup",
+                    breakout_info["symbol"], res.classification,
+                )
+        except Exception:
+            # Fail-open: the OI layer must never destabilise the strategy.
+            logger.exception(
+                "B&B OI validation hook failed for %s — continuing without it",
+                breakout_info.get("symbol"),
+            )
 
     # ---- Public run methods ----------------------------------------------------
 
@@ -946,12 +1007,18 @@ class BreakBounceStrategyRunner:
                             "B&B BREAKOUT CONFIRMED: %s %s level=%.2f close=%.2f",
                             symbol, direction, state["breakout_level"],
                             result.get("candle_close", 0.0))
-                        new_breakouts.append({
+                        breakout_info = {
                             "symbol":       symbol,
                             "direction":    direction,
                             "level":        state["breakout_level"],
                             "candle_close": result.get("candle_close", 0.0),
-                        })
+                        }
+                        # ── OI Validation Layer ──────────────────────────────
+                        # Runs immediately after breakout confirmation and before
+                        # the 5-min retest. No-op when disabled; fail-open when OI
+                        # data is unavailable (never blocks the existing strategy).
+                        self._apply_oi_validation(state, breakout_info)
+                        new_breakouts.append(breakout_info)
                     elif result.get("reason") == "window_expired":
                         state["setup_voided"] = True
                         logger.debug("B&B %s: window expired, voiding setup", symbol)
@@ -1132,7 +1199,15 @@ class BreakBounceStrategyRunner:
                 time.sleep(0.3)
 
             if new_breakouts:
-                self._notifier.send_breakout_batch_alert(new_breakouts)
+                # When the OI layer annotated these breakouts, send the enriched
+                # alert via the generic notifier primitive (the existing Telegram
+                # infrastructure is left untouched); otherwise use the unchanged
+                # batch alert exactly as before.
+                if oi_config.OI_VALIDATION_ENABLED and any(
+                        b.get("oi_available") for b in new_breakouts):
+                    self._notifier.send(oi_format_breakout_batch(new_breakouts))
+                else:
+                    self._notifier.send_breakout_batch_alert(new_breakouts)
 
             return signals_placed
 
