@@ -12,10 +12,31 @@ from upstox_token_manager import load_upstox_token
 from dotenv import load_dotenv
 from datetime import date, datetime, timedelta
 import time
-from scipy import stats
+# FIX 7: removed `from scipy import stats` — it was imported but never used
+# anywhere in this module (percentile/rank math uses numpy directly).
 import warnings
 from f_o_stocks_list import get_stock_futures
 from load_scrip_master_sqlite import update_scrip_master, get_security_id_symbol_map
+from discount_config import (
+    MIN_IV_SAMPLES,
+    CHAIN_API_MIN_INTERVAL_SEC,
+    CHAIN_API_RETRY_BACKOFF_SEC,
+    CHAIN_API_MAX_RETRIES,           # FIX 1: retry budget for the chain endpoint
+    CHAIN_API_BACKOFF_MULTIPLIER,    # FIX 1: exponential backoff multiplier
+    LIQUIDITY,
+    LOOSE_LIQUIDITY,                 # FIX 4: legacy loose thresholds (opt-in)
+    ALLOW_LOOSE_LIQUIDITY,           # FIX 4: toggle strict vs loose gates
+    STRIKE,
+    MIN_DTE_DAYS,
+    MIN_SCORE,
+    TRADE_PLAN,
+    STRONG_LIQUIDITY,
+    NSE_HOLIDAYS,                    # FIX 3: holiday-aware DTE calendar
+    ENABLE_DIRECTIONAL_CONFIRMATION, # FIX 8: directional confirmation toggle
+    DIRECTIONAL_WEIGHT,              # FIX 8: directional blend weight
+    ENABLE_FUTURES_OI_CONFIRMATION,  # FIX 9: futures-OI confirmation toggle
+    FUTURES_OI_BONUS,               # FIX 9: directional bonus on confirming buildup
+)
 warnings.filterwarnings('ignore')
 
 logging.basicConfig(
@@ -28,12 +49,10 @@ logger = logging.getLogger(__name__)
 # IV_HISTORY_FILE = Path("iv_history.csv")
 IV_HISTORY_FILE = Path("data") / "iv_history.db"
 
-MIN_IV_SAMPLES = 30
-# Dhan rate-limits the option-chain family of endpoints to 1 request / 3 seconds.
-# Use 3.1s for a small safety margin; silent failures (empty body, no error code)
-# happen if we breach it.
-CHAIN_API_MIN_INTERVAL_SEC = 3.1
-CHAIN_API_RETRY_BACKOFF_SEC = 4.0
+# MIN_IV_SAMPLES, CHAIN_API_MIN_INTERVAL_SEC, CHAIN_API_RETRY_BACKOFF_SEC and the
+# scanning thresholds now live in discount_config.py (imported above).
+# Dhan rate-limits the option-chain family of endpoints to 1 request / 3 seconds;
+# breaching it produces silent failures (empty body, no error code).
 DEFAULT_FNO_STOCKS = {
     13:    "NIFTY",
     14:    "BANKNIFTY",
@@ -45,17 +64,6 @@ DEFAULT_FNO_STOCKS = {
     1394:  "HINDUNILVR",
     3045:  "SBIN",
 }
-IV_HISTORY_COLUMNS = [
-    "snapshot_date",
-    "snapshot_time",
-    "security_id",
-    "symbol",
-    "spot_price",
-    "atm_strike",
-    "atm_iv",
-    "atm_call_iv",
-    "atm_put_iv",
-]
 
 def normalize_expiry_value(value):
     """Convert Dhan expiry payload values into YYYY-MM-DD strings when possible."""
@@ -118,6 +126,64 @@ def get_trading_days_to_expiry(expiry):
             days += 1
         current += timedelta(days=1)
     return days
+
+
+def get_actual_trading_days_to_expiry(expiry, holidays=None):
+    """
+    FIX 3: trading-day distance to expiry that excludes BOTH weekends AND NSE
+    trading holidays.
+
+    `holidays` is an iterable of 'YYYY-MM-DD' strings; it defaults to
+    discount_config.NSE_HOLIDAYS. When that list is empty / unavailable / has
+    only malformed entries, this degrades exactly to the weekend-only
+    get_trading_days_to_expiry() behaviour above, so existing logic is never
+    broken — it simply becomes more accurate once holidays are populated.
+    """
+    if not expiry:
+        return 0
+
+    try:
+        expiry_date = datetime.strptime(str(expiry)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return 0
+
+    today = date.today()
+    if expiry_date <= today:
+        return 0
+
+    # Build a set of holiday dates, ignoring malformed entries defensively so a
+    # single bad config value cannot raise.
+    holiday_set = set()
+    source = NSE_HOLIDAYS if holidays is None else holidays
+    for item in source or []:
+        try:
+            holiday_set.add(datetime.strptime(str(item)[:10], "%Y-%m-%d").date())
+        except (ValueError, TypeError):
+            continue
+
+    days = 0
+    current = today
+    while current < expiry_date:
+        if current.weekday() < 5 and current not in holiday_set:
+            days += 1
+        current += timedelta(days=1)
+    return days
+
+
+def parse_strike_key(value):
+    """
+    FIX 5: best-effort conversion of an option-chain strike key to float.
+
+    Strike keys can arrive as ints, floats, or numeric strings such as
+    '25000' or '25000.0'. Returns None for anything that cannot be parsed so
+    callers can skip the malformed strike instead of crashing on float().
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def extract_chain_metrics(option_chain):
@@ -189,6 +255,30 @@ class DiscountedPremiumScanner:
         self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
         self._last_chain_api_call = 0.0
         self._expiry_cache = {}
+
+        # FIX 4: resolve the effective liquidity gate once. ALLOW_LOOSE_LIQUIDITY
+        # (config constant OR the ALLOW_LOOSE_LIQUIDITY env var) reverts to the
+        # historical loose thresholds; otherwise the stricter LIQUIDITY tiers
+        # apply. Per-strike checks read self.liquidity so the choice is central.
+        _env_loose = os.getenv("ALLOW_LOOSE_LIQUIDITY")
+        if _env_loose is not None:
+            allow_loose = _env_loose.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            allow_loose = ALLOW_LOOSE_LIQUIDITY
+        self.liquidity = LOOSE_LIQUIDITY if allow_loose else LIQUIDITY
+        logger.info(
+            "Liquidity gates: %s (min_oi=%s, min_volume=%s, max_spread_pct=%s)",
+            "LOOSE" if allow_loose else "STRICT",
+            self.liquidity["min_oi"], self.liquidity["min_volume"],
+            self.liquidity["max_spread_pct"],
+        )
+
+        # FIX 9: lazily-created futures-OI provider + per-run classification
+        # cache. Default-off via ENABLE_FUTURES_OI_CONFIRMATION; never required
+        # for a scan and fully fail-open (see _get_futures_classification).
+        self._futures_oi_provider = None
+        self._futures_oi_cache = {}
+
         self.fno_stocks = self.load_fno_stocks()
 
     def _throttle_chain_api(self):
@@ -211,16 +301,96 @@ class DiscountedPremiumScanner:
             return False  # Upstox errors return a plain string, not a Dhan-style error dict
         return all(remarks.get(k) is None for k in ("error_code", "error_type", "error_message"))
 
-    def _call_chain_api(self, fn, **kwargs):
-        """Throttle + one-shot retry on Dhan's silent rate-limit response."""
-        self._throttle_chain_api()
-        response = fn(**kwargs)
-        if self._is_rate_limit_response(response):
-            logger.warning("Chain API rate-limited; backing off %.1fs and retrying", CHAIN_API_RETRY_BACKOFF_SEC)
-            time.sleep(CHAIN_API_RETRY_BACKOFF_SEC)
-            self._last_chain_api_call = time.monotonic()
-            response = fn(**kwargs)
-        return response
+    @staticmethod
+    def _option_chain_is_empty(response):
+        """
+        FIX 1: a *successful* chain response that carries no strikes is a
+        transient glitch worth retrying (Dhan occasionally returns an empty
+        'oc' right after session priming). Non-success responses are handled by
+        the rate-limit / error paths, so we don't double-count them here.
+        """
+        if not isinstance(response, dict) or response.get("status") != "success":
+            return False
+        data = unwrap_dhan_payload(response.get("data") or {})
+        oc = data.get("oc") if isinstance(data, dict) else None
+        return not isinstance(oc, dict) or len(oc) == 0
+
+    @staticmethod
+    def _expiry_list_is_empty(response):
+        """FIX 1: a successful expiry response with no payload is retryable."""
+        if not isinstance(response, dict) or response.get("status") != "success":
+            return False
+        return response.get("data") in (None, "", [], {})
+
+    def _call_chain_api(self, fn, is_empty_result=None, **kwargs):
+        """
+        Throttle + retry wrapper around Dhan's option-chain endpoint family.
+
+        FIX 1: the previous implementation retried at most ONCE on Dhan's silent
+        rate-limit response. It now retries up to CHAIN_API_MAX_RETRIES times
+        with exponential backoff and covers more failure modes. A retry fires on:
+          * the silent rate-limit response (_is_rate_limit_response)
+          * an empty/invalid payload, judged by the optional `is_empty_result`
+            predicate the caller supplies (empty option chain / empty expiry list)
+          * a temporary network error raised by `fn` (requests timeouts, etc.)
+
+        Backoff before retry N (1-indexed) is
+            CHAIN_API_RETRY_BACKOFF_SEC * CHAIN_API_BACKOFF_MULTIPLIER ** (N - 1)
+        => 4s, 8s, 16s with the default config. Every retry attempt is logged.
+        The steady-state 1-req/3s throttle is still honoured (the backoff sleeps
+        only add spacing), so we never exceed the broker's rate limit.
+        """
+        last_response = None
+        retry_reason = ""
+        for attempt in range(CHAIN_API_MAX_RETRIES + 1):
+            if attempt == 0:
+                # First call: honour the normal steady-state throttle.
+                self._throttle_chain_api()
+            else:
+                # Retry: wait an exponentially growing backoff. The sleep itself
+                # also satisfies the rate-limit spacing, so we just refresh the
+                # last-call marker afterwards.
+                backoff = CHAIN_API_RETRY_BACKOFF_SEC * (
+                    CHAIN_API_BACKOFF_MULTIPLIER ** (attempt - 1)
+                )
+                logger.warning(
+                    "Chain API retry %s/%s (reason: %s); backing off %.1fs",
+                    attempt, CHAIN_API_MAX_RETRIES, retry_reason, backoff,
+                )
+                time.sleep(backoff)
+                self._last_chain_api_call = time.monotonic()
+
+            try:
+                response = fn(**kwargs)
+            except Exception as exc:
+                # Temporary network/API error -> retry until the budget is spent,
+                # then re-raise so the caller's existing error handling kicks in.
+                retry_reason = f"network error: {exc}"
+                last_response = None
+                if attempt >= CHAIN_API_MAX_RETRIES:
+                    logger.error("Chain API exhausted retries after repeated network errors")
+                    raise
+                continue
+
+            last_response = response
+
+            if self._is_rate_limit_response(response):
+                retry_reason = "rate-limited"
+                if attempt >= CHAIN_API_MAX_RETRIES:
+                    logger.error("Chain API still rate-limited after %s retries", CHAIN_API_MAX_RETRIES)
+                    return response
+                continue
+
+            if is_empty_result is not None and is_empty_result(response):
+                retry_reason = "empty result"
+                if attempt >= CHAIN_API_MAX_RETRIES:
+                    logger.warning("Chain API returned empty result after %s retries", CHAIN_API_MAX_RETRIES)
+                    return response
+                continue
+
+            return response
+
+        return last_response
 
     def extract_chain_metrics(self, option_chain):
         """Return chain-level OI/volume metrics for the given option chain."""
@@ -336,6 +506,7 @@ class DiscountedPremiumScanner:
         """
         response = self._call_chain_api(
             self.dhan.option_chain,
+            is_empty_result=self._option_chain_is_empty,  # FIX 1: retry on empty chain
             under_security_id=underlying_security_id,
             under_exchange_segment=underlying_segment,
             expiry=expiry,
@@ -364,10 +535,22 @@ class DiscountedPremiumScanner:
         cache_key = self._expiry_cache_key(underlying_security_id, underlying_segment)
         cached = self._expiry_cache.get(cache_key)
         if cached:
+            # FIX 6/11: all NSE_FNO stocks resolve to one shared cache key, so
+            # every stock after the first is a cache HIT and triggers no API
+            # call. Logged at DEBUG to confirm reuse without spamming INFO.
+            logger.debug(
+                "Expiry cache HIT for %s (%s) via key %s",
+                underlying_security_id, underlying_segment, cache_key,
+            )
             return cached
+        logger.debug(
+            "Expiry cache MISS for %s (%s); fetching expiry list",
+            underlying_security_id, underlying_segment,
+        )
 
         response = self._call_chain_api(
             self.dhan.expiry_list,
+            is_empty_result=self._expiry_list_is_empty,  # FIX 1: retry on empty expiry list
             under_security_id=underlying_security_id,
             under_exchange_segment=underlying_segment,
         )
@@ -552,51 +735,7 @@ class DiscountedPremiumScanner:
         except Exception:
             logger.exception("Failed to read IV history from DB: %s", self.iv_history_file)
             return []
-    
-    def fetch_historical_iv_old(self, security_id, exchange_segment, lookback_days=252):
-        """
-        Load persisted ATM IV history for IV Rank / IV Percentile calculations.
-        
-        Args:
-            security_id: Security ID
-            exchange_segment: Exchange segment
-            lookback_days: Number of days to look back
-        
-        Returns:
-            list: Historical ATM IV values
-        """
-        if not self.iv_history_file.exists():
-            return []
 
-        try:
-            df = pd.read_csv(self.iv_history_file)
-        except Exception:
-            logger.exception("Failed to read IV history file: %s", self.iv_history_file)
-            return []
-
-        if "snapshot_time" not in df.columns:
-            df["snapshot_time"] = "00:00:00"
-
-        required_cols = {"security_id", "snapshot_date", "snapshot_time", "atm_iv"}
-        if not required_cols.issubset(df.columns):
-            return []
-
-        filtered = df[df["security_id"].astype(str) == str(security_id)].copy()
-        if filtered.empty:
-            return []
-
-        filtered["snapshot_date"] = pd.to_datetime(filtered["snapshot_date"], errors="coerce")
-        filtered["snapshot_time"] = filtered["snapshot_time"].fillna("00:00:00").astype(str)
-        filtered["atm_iv"] = pd.to_numeric(filtered["atm_iv"], errors="coerce")
-        filtered = filtered.dropna(subset=["snapshot_date", "atm_iv"])
-        filtered = filtered[
-            (filtered["atm_iv"] >= 1.0) &
-            (filtered["atm_iv"] <= 200.0)
-        ]
-        filtered = filtered.sort_values(["snapshot_date", "snapshot_time"])
-        filtered = filtered.tail(lookback_days)
-        return filtered["atm_iv"].tolist()
-    
     # ==================== 2. VOLATILITY CALCULATIONS ====================
     
     def calculate_historical_volatility(self, price_df, window=20):
@@ -610,9 +749,18 @@ class DiscountedPremiumScanner:
         Returns:
             float: Annualized volatility percentage
         """
-        if price_df.empty or len(price_df) < window:
+        # FIX 2: validate the historical frame before touching it. Missing the
+        # required 'close' column would raise KeyError and abort the scan; we
+        # now log once and return None so the caller continues safely.
+        if price_df is None or price_df.empty or len(price_df) < window:
             return None
-        
+        if 'close' not in price_df.columns:
+            logger.warning(
+                "HV (window=%s) skipped: required 'close' column missing (columns=%s)",
+                window, list(price_df.columns),
+            )
+            return None
+
         # Calculate daily log returns
         log_returns = np.log(price_df['close'] / price_df['close'].shift(1))
         
@@ -626,6 +774,17 @@ class DiscountedPremiumScanner:
 
     def calculate_hv_metrics(self, price_df):
         """Build a multi-window HV view to reduce single-window noise."""
+        # FIX 2: validate the required column up-front so a malformed historical
+        # frame degrades gracefully (all-None HV) instead of crashing the scan.
+        # This logs at most once per underlying rather than once per HV window.
+        if price_df is None or price_df.empty or 'close' not in price_df.columns:
+            if price_df is not None and not price_df.empty and 'close' not in price_df.columns:
+                logger.warning(
+                    "HV metrics skipped: required 'close' column missing (columns=%s)",
+                    list(price_df.columns),
+                )
+            return {"hv10": None, "hv20": None, "hv60": None, "weighted_hv": None}
+
         hv10 = self.calculate_historical_volatility(price_df, window=10)
         hv20 = self.calculate_historical_volatility(price_df, window=20)
         hv60 = self.calculate_historical_volatility(price_df, window=60)
@@ -718,10 +877,25 @@ class DiscountedPremiumScanner:
         return spot_price * (reference_iv / 100.0) * math.sqrt(dte / 365.0)
 
     def extract_atm_reference_ivs(self, option_chain, spot_price):
+        empty = {"atm_strike": None, "atm_call_iv": None, "atm_put_iv": None, "atm_iv": None}
         if not option_chain:
-            return {"atm_strike": None, "atm_call_iv": None, "atm_put_iv": None, "atm_iv": None}
+            return empty
 
-        atm_strike = min(option_chain.keys(), key=lambda strike: abs(float(strike) - spot_price))
+        # FIX 5: defensively parse strike keys (int / float / "25000" / "25000.0")
+        # instead of calling float() inline. Malformed keys are logged and
+        # skipped so a single bad key can never crash ATM selection.
+        valid_strikes = []
+        for key in option_chain.keys():
+            parsed = parse_strike_key(key)
+            if parsed is None:
+                logger.warning("Ignoring malformed strike key %r during ATM selection", key)
+                continue
+            valid_strikes.append((parsed, key))
+        if not valid_strikes:
+            logger.warning("No valid numeric strike keys found; cannot determine ATM")
+            return empty
+
+        atm_parsed, atm_strike = min(valid_strikes, key=lambda pair: abs(pair[0] - spot_price))
         atm_data = option_chain.get(atm_strike, {})
         atm_call = atm_data.get("ce") or {}
         atm_put = atm_data.get("pe") or {}
@@ -732,7 +906,9 @@ class DiscountedPremiumScanner:
         valid = [value for value in [atm_call_iv, atm_put_iv] if value and value > 0]
         atm_iv = float(np.mean(valid)) if valid else None
         return {
-            "atm_strike": float(atm_strike),
+            # FIX 5: report the already-parsed numeric strike (atm_strike is the
+            # original, possibly-string key used only to index the chain above).
+            "atm_strike": float(atm_parsed),
             "atm_call_iv": atm_call_iv,
             "atm_put_iv": atm_put_iv,
             "atm_call_oi": atm_call_oi,
@@ -740,79 +916,20 @@ class DiscountedPremiumScanner:
             "atm_iv": atm_iv,
         }
 
-    def persist_iv_snapshot(self, security_id, exchange_segment, security_name, expiry, spot_price, atm_context, store_intraday=None):
-        """Persist one ATM IV snapshot per day to build IV rank / percentile history."""
-        return
-        # atm_iv = atm_context.get("atm_iv")
-        # if atm_iv is None or atm_iv <= 0 or atm_iv < 1 or atm_iv > 200:
-        #     return
+    # IV snapshot persistence is owned by the IV collector service
+    # (collectors/iv_collector_service.py); the discount scanner is a
+    # read-only consumer of iv_history.db.
 
-        # store_intraday = self.store_intraday if store_intraday is None else store_intraday
-        # snapshot_dt = datetime.now()
-
-        # snapshot = pd.DataFrame([{
-        #     "snapshot_date": snapshot_dt.date().isoformat(),
-        #     "snapshot_time": snapshot_dt.strftime("%H:%M:%S"),
-        #     "security_id": str(security_id),
-        #     "symbol": security_name,
-        #     "spot_price": spot_price,
-        #     "atm_strike": atm_context.get("atm_strike"),
-        #     "atm_iv": atm_iv,
-        #     "atm_call_iv": atm_context.get("atm_call_iv"),
-        #     "atm_put_iv": atm_context.get("atm_put_iv"),
-        # }])
-
-        # if self.iv_history_file.exists():
-        #     try:
-        #         existing = pd.read_csv(self.iv_history_file)
-        #     except Exception:
-        #         logger.exception("Failed to read IV history file for update: %s", self.iv_history_file)
-        #         existing = pd.DataFrame()
-        #     combined = pd.concat([existing, snapshot], ignore_index=True)
-        # else:
-        #     combined = snapshot
-
-        # if "snapshot_time" not in combined.columns:
-        #     combined["snapshot_time"] = "00:00:00"
-        # if "symbol" not in combined.columns:
-        #     combined["symbol"] = security_name
-
-        # for column in IV_HISTORY_COLUMNS:
-        #     if column not in combined.columns:
-        #         combined[column] = np.nan
-
-        # combined["security_id"] = combined["security_id"].astype(str)
-        # combined["snapshot_date"] = pd.to_datetime(combined["snapshot_date"], errors="coerce").dt.date.astype(str)
-        # combined["snapshot_time"] = combined["snapshot_time"].fillna("00:00:00").astype(str)
-        # combined["atm_iv"] = pd.to_numeric(combined["atm_iv"], errors="coerce")
-        # combined["atm_call_iv"] = pd.to_numeric(combined["atm_call_iv"], errors="coerce")
-        # combined["atm_put_iv"] = pd.to_numeric(combined["atm_put_iv"], errors="coerce")
-        # combined["spot_price"] = pd.to_numeric(combined["spot_price"], errors="coerce")
-        # combined["atm_strike"] = pd.to_numeric(combined["atm_strike"], errors="coerce")
-
-        # combined = combined[
-        #     combined["snapshot_date"].notna() &
-        #     combined["security_id"].notna() &
-        #     combined["atm_iv"].notna() &
-        #     (combined["atm_iv"] >= 1.0) &
-        #     (combined["atm_iv"] <= 200.0)
-        # ]
-
-        # dedupe_subset = ["snapshot_date", "security_id"]
-        # if store_intraday:
-        #     dedupe_subset = ["snapshot_date", "snapshot_time", "security_id"]
-
-        # combined = combined[IV_HISTORY_COLUMNS]
-        # combined = combined.drop_duplicates(subset=dedupe_subset, keep="last")
-        # combined = combined.sort_values(["security_id", "snapshot_date", "snapshot_time"])
-        # combined.to_csv(self.iv_history_file, index=False)
-    
     # ==================== 3. DISCOUNTED PREMIUM DETECTION ====================
 
     def build_strategy_plan(self, option_type, strike_price, spot_price, mid_price, option_chain,
                             expected_move, trend, score):
         """Create tradable strategy suggestions from a shortlisted option."""
-        strike_keys = sorted(float(key) for key in option_chain.keys())
+        # FIX 5: skip malformed strike keys so one bad key can't abort planning.
+        strike_keys = sorted(
+            parsed for parsed in (parse_strike_key(key) for key in option_chain.keys())
+            if parsed is not None
+        )
         if option_type == "CALL":
             candidate_shorts = [strike for strike in strike_keys if strike > strike_price]
             short_strike = candidate_shorts[0] if candidate_shorts else None
@@ -821,8 +938,8 @@ class DiscountedPremiumScanner:
             short_strike = candidate_shorts[-1] if candidate_shorts else None
 
         entry = mid_price
-        stop_loss = mid_price * 0.65 if mid_price else 0
-        target = mid_price * 1.8 if mid_price else 0
+        stop_loss = mid_price * TRADE_PLAN["stop_loss_mult"] if mid_price else 0
+        target = mid_price * TRADE_PLAN["target_mult"] if mid_price else 0
         risk_reward = None
         if entry and stop_loss and target and entry != stop_loss:
             risk_reward = (target - entry) / (entry - stop_loss)
@@ -854,8 +971,97 @@ class DiscountedPremiumScanner:
             "risk_reward": round(risk_reward, 2) if risk_reward is not None else None,
         }
 
+    def _get_futures_classification(self, symbol):
+        """
+        FIX 9: classify the underlying's nearest-expiry futures into one of the
+        OI quadrants (LONG_BUILDUP / SHORT_BUILDUP / SHORT_COVERING /
+        LONG_UNWINDING) by reusing the isolated, fail-open oi_validator module.
+
+        Returns None when the feature is disabled OR futures OI is unavailable;
+        the scan then proceeds exactly as before. The result is cached per
+        symbol for the lifetime of the scanner so we make at most one futures
+        fetch per underlying per run. Every failure path is swallowed — this
+        never raises and never blocks a scan.
+        """
+        if not ENABLE_FUTURES_OI_CONFIRMATION:
+            return None
+        if symbol in self._futures_oi_cache:
+            return self._futures_oi_cache[symbol]
+
+        classification = None
+        try:
+            # Imported lazily so the discount scanner has no hard dependency on
+            # the OI module unless the feature is actually switched on.
+            from oi_validator import FuturesOIProvider, classify
+            if self._futures_oi_provider is None:
+                self._futures_oi_provider = FuturesOIProvider(scanner=self)
+            snapshot = self._futures_oi_provider.fetch_snapshot(symbol)
+            if snapshot is not None and getattr(snapshot, "available", False):
+                classification = classify(snapshot.price_change_pct, snapshot.oi_change_pct)
+                logger.debug(
+                    "Futures OI for %s: %s (dP %.2f%% / dOI %.2f%%)",
+                    symbol, classification, snapshot.price_change_pct, snapshot.oi_change_pct,
+                )
+            else:
+                logger.debug("Futures OI unavailable for %s; skipping confirmation", symbol)
+        except Exception:
+            # Fail-open: any import/data error means "no confirmation available".
+            logger.debug("Futures OI classification raised for %s", symbol, exc_info=True)
+            classification = None
+
+        self._futures_oi_cache[symbol] = classification
+        return classification
+
+    def compute_directional_score(self, option_type, spot_price, trend_context,
+                                  atm_context, futures_classification=None):
+        """
+        FIX 8: directional confirmation layer (0-100).
+
+        Cheap IV alone should not produce a high-confidence signal. This scores
+        how well price structure + flow agree with the option's direction:
+
+          CALL (ce) is bullish-confirmed when: spot > EMA20, EMA20 > EMA50,
+              trend == "bullish", and ATM call OI dominates ATM put OI.
+          PUT  (pe) is the bearish mirror.
+
+        Each satisfied condition contributes an equal share of 100. When EMA
+        structure is unavailable (insufficient history) we return a neutral 50
+        so the layer never penalizes purely on missing data.
+
+        FIX 9: when ENABLE_FUTURES_OI_CONFIRMATION is on AND a futures-OI
+        classification is available, a confirming buildup (LONG for calls /
+        SHORT for puts) adds FUTURES_OI_BONUS. Missing futures data is ignored
+        (no penalty), so the scan is unaffected when the feature is off.
+        """
+        trend_context = trend_context or {}
+        atm_context = atm_context or {}
+        ema20 = trend_context.get("ema20")
+        ema50 = trend_context.get("ema50")
+        trend = trend_context.get("trend", "neutral")
+        call_oi = atm_context.get("atm_call_oi") or 0
+        put_oi = atm_context.get("atm_put_oi") or 0
+
+        if ema20 is None or ema50 is None or spot_price is None:
+            base = 50.0  # neutral: not enough structure to judge direction
+        else:
+            if option_type == "ce":
+                checks = [spot_price > ema20, ema20 > ema50, trend == "bullish", call_oi > put_oi]
+            else:
+                checks = [spot_price < ema20, ema20 < ema50, trend == "bearish", put_oi > call_oi]
+            base = (sum(1 for c in checks if c) / len(checks)) * 100.0
+
+        # FIX 9: optional futures-OI buildup bonus (additive, fail-open).
+        if ENABLE_FUTURES_OI_CONFIRMATION and futures_classification:
+            if option_type == "ce" and futures_classification == "LONG_BUILDUP":
+                base += FUTURES_OI_BONUS
+            elif option_type == "pe" and futures_classification == "SHORT_BUILDUP":
+                base += FUTURES_OI_BONUS
+
+        return clip_score(base)
+
     def score_option(self, current_iv, weighted_hv, delta, vega, oi, volume, skew_discount,
-                     expected_move_ratio, iv_rank=None, iv_percentile=None, vol_mode="skew"):
+                     expected_move_ratio, iv_rank=None, iv_percentile=None, vol_mode="skew",
+                     has_expected_move=True):
         """Weighted quantitative score for option selection."""
         hv_score = 50.0
         if weighted_hv and weighted_hv > 0:
@@ -873,7 +1079,14 @@ class DiscountedPremiumScanner:
         vega_score = clip_score(vega * 400) if vega is not None else 20.0
         liquidity_score = clip_score((math.log1p(max(oi, 0)) * 12) + (math.log1p(max(volume, 0)) * 8))
         skew_score = clip_score(50 + skew_discount * 4) if skew_discount is not None else 40.0
-        relevance_score = clip_score(100 - (max(expected_move_ratio - 0.5, 0) / 1.0) * 100)
+        # Strike relevance only means something when we have a valid expected move.
+        # Without one, expected_move_ratio is 0, which would otherwise hand every
+        # strike a perfect (100) relevance score and inflate the composite. Fall
+        # back to a neutral 50 in that case.
+        if has_expected_move:
+            relevance_score = clip_score(100 - (max(expected_move_ratio - 0.5, 0) / 1.0) * 100)
+        else:
+            relevance_score = 50.0
 
         if vol_mode == "historical":
             cheap_vol_score = clip_score(100 - ((iv_rank * 0.5) + (iv_percentile * 0.5)))
@@ -921,10 +1134,11 @@ class DiscountedPremiumScanner:
     def scan_single_strike(self, strike_data, strike_price, spot_price, option_chain,
                           historical_ivs=None, hv_metrics=None, atm_context=None,
                           expected_move=None, dte=None, trend="neutral", hedging_mode=False,
-                          has_iv_history=False):
+                          has_iv_history=False, trend_context=None,
+                          futures_classification=None, trading_dte=None):
         """
         Analyze a single strike using quantitative volatility, probability, and structure filters.
-        
+
         Args:
             strike_data: Option data for a strike (contains ce and/or pe)
             strike_price: Strike price
@@ -936,7 +1150,10 @@ class DiscountedPremiumScanner:
             dte: Days to expiry
             trend: Market context trend
             hedging_mode: Whether to allow very low delta options
-        
+            trend_context: Full EMA structure dict for the directional layer (FIX 8)
+            futures_classification: Futures OI quadrant for this underlying (FIX 9)
+            trading_dte: Holiday-aware trading days to expiry (FIX 3/10)
+
         Returns:
             list: Structured trade candidates
         """
@@ -955,14 +1172,50 @@ class DiscountedPremiumScanner:
             vega = opt.get('greeks', {}).get('vega', 0)
             abs_delta = abs(delta)
 
-            # Skip illiquid or extremely low-probability options
-            if oi < 1000 or volume <= 0:
+            # Skip illiquid or extremely low-probability options.
+            # FIX 4: thresholds come from self.liquidity (strict by default; the
+            # legacy loose values only when ALLOW_LOOSE_LIQUIDITY is set).
+            # FIX 11: every rejection reason is logged at DEBUG (never INFO) so a
+            # full scan stays quiet by default but is fully diagnosable on demand.
+            if oi < self.liquidity["min_oi"] or volume < self.liquidity["min_volume"]:
+                logger.debug(
+                    "Reject %s %.2f: liquidity oi=%s (min %s) volume=%s (min %s)",
+                    option_type, strike_price, oi, self.liquidity["min_oi"],
+                    volume, self.liquidity["min_volume"],
+                )
                 continue
-            if not hedging_mode and abs_delta < 0.10:
+            if not hedging_mode and abs_delta < STRIKE["min_abs_delta"]:
+                logger.debug(
+                    "Reject %s %.2f: |delta|=%.3f below min %.2f",
+                    option_type, strike_price, abs_delta, STRIKE["min_abs_delta"],
+                )
+                continue
+
+            # Tradeability gate: require a live two-sided quote within the max
+            # spread. Without this a strike with a huge bid-ask could rank highly
+            # yet be impossible to enter without giving up the edge.
+            bid = opt.get('top_bid_price') or 0
+            ask = opt.get('top_ask_price') or 0
+            if bid <= 0 or ask <= 0:
+                logger.debug(
+                    "Reject %s %.2f: no live two-sided quote (bid=%s ask=%s)",
+                    option_type, strike_price, bid, ask,
+                )  # FIX 11
+                continue
+            mid_price = (bid + ask) / 2
+            if mid_price <= 0:
+                continue
+            spread_pct = (ask - bid) / mid_price
+            if spread_pct > self.liquidity["max_spread_pct"]:
+                logger.debug(
+                    "Reject %s %.2f: spread %.3f > max %.3f",
+                    option_type, strike_price, spread_pct, self.liquidity["max_spread_pct"],
+                )  # FIX 11
                 continue
 
             current_iv = opt.get('implied_volatility', 0)
             if current_iv == 0:
+                logger.debug("Reject %s %.2f: IV unavailable", option_type, strike_price)  # FIX 11
                 continue
 
             reference_iv = (atm_context or {}).get("atm_call_iv") if option_type == "ce" else (atm_context or {}).get("atm_put_iv")
@@ -971,9 +1224,15 @@ class DiscountedPremiumScanner:
             skew_discount = ((reference_iv - current_iv) / reference_iv) * 100 if reference_iv and reference_iv > 0 else None
             iv_context = "below_atm" if reference_iv and current_iv < reference_iv else "above_atm"
 
+            has_expected_move = bool(expected_move and expected_move > 0)
             distance_from_spot = abs(strike_price - spot_price)
-            expected_move_ratio = (distance_from_spot / expected_move) if expected_move and expected_move > 0 else 0
-            if expected_move and expected_move_ratio > 1.5:
+            expected_move_ratio = (distance_from_spot / expected_move) if has_expected_move else 0
+            if has_expected_move and expected_move_ratio > STRIKE["max_expected_move_ratio"]:
+                logger.debug(
+                    "Reject %s %.2f: EM ratio %.2f > max %.2f",
+                    option_type, strike_price, expected_move_ratio,
+                    STRIKE["max_expected_move_ratio"],
+                )  # FIX 11
                 continue
 
             vol_mode = "historical" if has_iv_history else "skew"
@@ -991,15 +1250,40 @@ class DiscountedPremiumScanner:
                 iv_rank=iv_rank,
                 iv_percentile=iv_percentile,
                 vol_mode=vol_mode,
+                has_expected_move=has_expected_move,
             )
 
-            score = score_details["score"]
-            if score < 55:
+            # FIX 8: blend the directional confirmation layer into the final
+            # score. score_option() returns the UNCHANGED base composite (its
+            # internal component weights are preserved); here we combine it with
+            # the 0-100 directional_score using DIRECTIONAL_WEIGHT (default 15%).
+            #   final = base * (1 - DIRECTIONAL_WEIGHT) + directional * DIRECTIONAL_WEIGHT
+            # When ENABLE_DIRECTIONAL_CONFIRMATION is False, score == base_score
+            # so results are byte-identical to the pre-change behaviour.
+            base_score = score_details["score"]
+            directional_score = self.compute_directional_score(
+                option_type=option_type,
+                spot_price=spot_price,
+                trend_context=trend_context,
+                atm_context=atm_context,
+                futures_classification=futures_classification,
+            )
+            if ENABLE_DIRECTIONAL_CONFIRMATION:
+                score = round(
+                    base_score * (1 - DIRECTIONAL_WEIGHT)
+                    + directional_score * DIRECTIONAL_WEIGHT,
+                    2,
+                )
+            else:
+                score = base_score
+
+            if score < MIN_SCORE:
+                logger.debug(
+                    "Reject %s %.2f: score %.2f < MIN_SCORE %s (base=%.2f, directional=%.2f)",
+                    option_type, strike_price, score, MIN_SCORE, base_score, directional_score,
+                )  # FIX 11
                 continue
 
-            bid = opt.get('top_bid_price', opt.get('last_price', 0))
-            ask = opt.get('top_ask_price', opt.get('last_price', 0))
-            mid_price = (bid + ask) / 2 if bid and ask else opt.get('last_price', 0)
             hv_gap = weighted_hv - current_iv if weighted_hv else None
             moneyness = ((strike_price - spot_price) / spot_price * 100) if option_type == 'ce' else ((spot_price - strike_price) / spot_price * 100)
 
@@ -1026,9 +1310,9 @@ class DiscountedPremiumScanner:
             if skew_discount and skew_discount > 0:
                 reasons.append(f"Strike IV is {skew_discount:.2f}% below ATM IV")
             reasons.append(f"IV context is {iv_context}")
-            if expected_move and expected_move_ratio <= 1.0:
+            if has_expected_move and expected_move_ratio <= 1.0:
                 reasons.append("Strike is inside the 1x expected move envelope")
-            if oi > 10000 and volume > 1000:
+            if oi > STRONG_LIQUIDITY["oi"] and volume > STRONG_LIQUIDITY["volume"]:
                 reasons.append("Liquidity is strong in both OI and volume")
 
             discounted.append({
@@ -1050,6 +1334,10 @@ class DiscountedPremiumScanner:
                 "vega": native_number(vega),
                 "theta": native_number(opt.get('greeks', {}).get('theta', 0)),
                 "score": native_number(score),
+                # FIX 8/10: directional analytics. base_score is the pre-blend
+                # composite; directional_score is the 0-100 confirmation layer.
+                "base_score": native_number(base_score),
+                "directional_score": native_number(directional_score),
                 "entry": strategy_plan["entry"],
                 "stop_loss": strategy_plan["stop_loss"],
                 "target": strategy_plan["target"],
@@ -1058,6 +1346,7 @@ class DiscountedPremiumScanner:
                 "mid_price": native_number(mid_price),
                 "bid": native_number(bid),
                 "ask": native_number(ask),
+                "spread_pct": native_number(spread_pct),
                 "spot": native_number(spot_price),
                 "moneyness": native_number(moneyness),
                 "oi": oi,
@@ -1069,6 +1358,12 @@ class DiscountedPremiumScanner:
                 "skew_discount": native_number(skew_discount),
                 "trend": trend,
                 "dte": dte,
+                # FIX 3/10: holiday-aware trading days to expiry (additive column;
+                # the MIN_DTE gate still uses calendar days to preserve behaviour).
+                "trading_dte": trading_dte,
+                # FIX 10: timestamp each record so future win-rate tracking can
+                # join scans to outcomes. Additive only — existing columns intact.
+                "scan_timestamp": datetime.now().isoformat(timespec="seconds"),
                 "component_scores": score_details["component_scores"],
             })
         
@@ -1101,7 +1396,22 @@ class DiscountedPremiumScanner:
                 return []
             expiry = expiries[0]  # Nearest expiry
             logger.info("Using nearest expiry: %s", expiry)
-        
+
+        # Time gate: too close to expiry, premium decays faster than any cheap-IV
+        # edge can pay off. Checked before the chain fetch to save an API call.
+        dte = self.days_to_expiry(expiry)
+        if dte < MIN_DTE_DAYS:
+            logger.info(
+                "Skipping %s: nearest expiry %s is %s DTE (< MIN_DTE_DAYS=%s)",
+                security_name, expiry, dte, MIN_DTE_DAYS,
+            )
+            return []
+
+        # FIX 3: holiday-aware trading-day distance, computed for analytics/export
+        # only. The MIN_DTE_DAYS gate above intentionally still uses calendar days
+        # so the universe selection behaviour is unchanged.
+        trading_dte = get_actual_trading_days_to_expiry(expiry, NSE_HOLIDAYS)
+
         # Fetch option chain
         chain_response = self.get_option_chain(security_id, security_segment, expiry)
         
@@ -1127,8 +1437,6 @@ class DiscountedPremiumScanner:
         has_iv_history = len(historical_ivs) >= MIN_IV_SAMPLES
         iv_rank_atm = self.calculate_iv_rank(atm_context.get("atm_iv") or 0, historical_ivs) if atm_context.get("atm_iv") and has_iv_history else None
         iv_percentile_atm = self.calculate_iv_percentile(atm_context.get("atm_iv") or 0, historical_ivs) if atm_context.get("atm_iv") and has_iv_history else None
-        self.persist_iv_snapshot(security_id, security_segment, security_name, expiry, spot_price, atm_context)
-        dte = self.days_to_expiry(expiry)
         expected_move = self.compute_expected_move(spot_price, atm_context.get("atm_iv"), dte)
         logger.info("Volatility Mode: %s", "IV_HISTORY" if has_iv_history else "SKEW")
         logger.info("IV Samples Available: %s", len(historical_ivs))
@@ -1142,7 +1450,6 @@ class DiscountedPremiumScanner:
         # Calculate historical volatility if requested
         hv_metrics = {"hv10": None, "hv20": None, "hv60": None, "weighted_hv": None}
         trend_context = {"trend": "neutral"}
-        hist_prices = pd.DataFrame()
         if use_hv:
             logger.info("Calculating historical volatility...")
             # Fetch historical prices for HV calculation
@@ -1173,18 +1480,25 @@ class DiscountedPremiumScanner:
                     logger.warning("Historical volatility calculation returned no usable value")
             else:
                 logger.warning("Could not calculate HV for %s", security_name)
-        elif hist_prices.empty:
-            historical_ivs = self.fetch_historical_iv(security_id, security_segment)
 
         if historical_ivs:
             logger.info("Historical IV samples: %s", len(historical_ivs))
-        
+
+        # FIX 9: classify futures OI once per underlying (default-off, fail-open).
+        # Computed here so all strikes of this underlying share a single futures
+        # fetch; returns None unless ENABLE_FUTURES_OI_CONFIRMATION is set.
+        futures_classification = self._get_futures_classification(security_name)
+
         # Scan each strike
         all_discounted = []
-        
+
         for strike_str, strike_data in option_chain.items():
-            strike_price = float(strike_str)
-            
+            # FIX 5: tolerate malformed strike keys instead of crashing float().
+            strike_price = parse_strike_key(strike_str)
+            if strike_price is None:
+                logger.warning("Skipping malformed strike key %r for %s", strike_str, security_name)
+                continue
+
             discounted = self.scan_single_strike(
                 strike_data=strike_data,
                 strike_price=strike_price,
@@ -1196,9 +1510,12 @@ class DiscountedPremiumScanner:
                 expected_move=expected_move,
                 dte=dte,
                 trend=trend_context.get("trend", "neutral"),
+                trend_context=trend_context,                    # FIX 8: EMA structure
+                futures_classification=futures_classification,  # FIX 9: OI confirmation
+                trading_dte=trading_dte,                        # FIX 3/10: analytics
                 has_iv_history=has_iv_history,
             )
-            
+
             all_discounted.extend(discounted)
         
         # Sort by discount score
@@ -1208,8 +1525,24 @@ class DiscountedPremiumScanner:
         return all_discounted
     
     # ==================== 4. MULTI-STOCK SCANNER ====================
-    
-    def scan_all_fno_stocks(self, security_ids=None, expiry=None, min_discount_score=55):
+
+    def _prefetch_shared_fno_expiries(self, security_ids):
+        """
+        FIX 6: prime the shared NSE_FNO expiry cache with a single API call.
+
+        The first stock primes the shared cache entry; every subsequent stock is
+        then a cache HIT (see get_expiry_list logging). Failures are non-fatal —
+        if the prefetch returns nothing, per-stock lookups simply happen lazily
+        as before. This never increases request frequency (it just front-loads
+        the one call that would have happened on the first stock anyway).
+        """
+        for sec_id, sec_name in security_ids.items():
+            if sec_name in ('NIFTY', 'BANKNIFTY'):
+                continue  # indices have their own per-id expiry calendar
+            self.get_expiry_list(sec_id, "NSE_FNO")
+            break  # one stock is enough to populate the shared NSE_FNO entry
+
+    def scan_all_fno_stocks(self, security_ids=None, expiry=None, min_discount_score=MIN_SCORE):
         """
         Scan all FNO stocks for discounted premiums
         
@@ -1223,9 +1556,18 @@ class DiscountedPremiumScanner:
         """
         if security_ids is None:
             security_ids = self.fno_stocks
-        
+
+        # FIX 6: warm the shared NSE F&O expiry cache with ONE call before the
+        # loop. All NSE_FNO stocks resolve to a single shared cache key
+        # (_expiry_cache_key), so after this prefetch every per-stock expiry
+        # lookup inside scan_underlying is a cache HIT and issues no further API
+        # call. Index expiries are still fetched lazily on first use (separate
+        # calendars). This keeps total expiry-list calls at ~3 regardless of how
+        # many stocks are scanned, without raising request frequency.
+        self._prefetch_shared_fno_expiries(security_ids)
+
         all_opportunities = []
-        
+
         for sec_id, sec_name in security_ids.items():
             try:
                 # Determine segment
