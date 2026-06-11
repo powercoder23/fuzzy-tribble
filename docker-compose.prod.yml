@@ -104,3 +104,104 @@ services:
     depends_on:
       - iv-collector
     command: python directional_iv_runner.py
+
+  # ── Option-buyer scanners (alert-only, zero broker/NSE calls) ─────────────
+  # No `profiles:` -> these start automatically with the normal daily command:
+  #   docker-compose -f docker-compose.prod.yml up -d
+  # All read the shared ./data/iv_history.db written by iv-collector. To turn
+  # one OFF, add `profiles: [<name>]` back to that service.
+
+  # IV Rank — cheap-IV "buy zone" screener.
+  iv-rank:
+    build:
+      context: .
+      dockerfile: Dockerfile.iv-rank
+    container_name: iv-rank-scanner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python iv_rank_runner.py
+
+  # OI Buildup — Long/Short buildup, covering, unwinding across F&O.
+  oi-buildup:
+    build:
+      context: .
+      dockerfile: Dockerfile.scanner
+    container_name: oi-buildup-scanner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python oi_buildup_runner.py
+
+  # Extreme Opening — gap% + open beyond prior high/low.
+  gap-scan:
+    build:
+      context: .
+      dockerfile: Dockerfile.scanner
+    container_name: gap-scanner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python gap_scanner_runner.py
+
+  # Delivery-% Surge — conviction-backed moves from bhav delivery data.
+  delivery-surge:
+    build:
+      context: .
+      dockerfile: Dockerfile.scanner
+    container_name: delivery-surge-scanner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python delivery_surge_runner.py
+
+  # Smart-Money — net bulk/block institutional flow -> CE/PE BTST bias.
+  smart-money:
+    build:
+      context: .
+      dockerfile: Dockerfile.scanner
+    container_name: smart-money-scanner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python smart_money_runner.py

@@ -239,6 +239,14 @@ class DirectionalIVScanner:
             iv_percentile = self.scanner.calculate_iv_percentile(current_iv, historical_ivs) if has_iv_history else None
             if has_iv_history and iv_rank is not None and iv_rank > IV_FILTER["max_iv_rank"]:
                 continue
+            # Optional buy-zone gate (off by default): only trade cheap IV.
+            if (
+                IV_FILTER.get("buy_zone_only")
+                and has_iv_history
+                and iv_rank is not None
+                and iv_rank > IV_FILTER.get("buy_zone_max_ivr", 35)
+            ):
+                continue
 
             atm_iv = atm_context.get("atm_call_iv") if option_type == "CALL" else atm_context.get("atm_put_iv")
             if not atm_iv:

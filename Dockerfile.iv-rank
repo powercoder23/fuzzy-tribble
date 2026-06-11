@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# No chromium/broker deps — this service only reads iv_history.db.
+RUN apt-get update && apt-get install -y tzdata && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+RUN mkdir -p /app/data /app/logs && chmod -R 777 /app/data /app/logs
+
+COPY . /app
+
+CMD ["python", "iv_rank_runner.py"]

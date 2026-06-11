@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Generic image for the read-only DB scanners (iv-rank, oi-buildup, gap-scan).
+# No chromium/broker deps — these services only read iv_history.db.
+RUN apt-get update && apt-get install -y tzdata && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+RUN mkdir -p /app/data /app/logs && chmod -R 777 /app/data /app/logs
+
+COPY . /app
+
+# Each compose service overrides `command:` with its own runner.
+CMD ["python", "-c", "print('set a command: in docker-compose')"]

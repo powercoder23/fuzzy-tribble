@@ -6,7 +6,7 @@ CAPITAL = float(os.getenv("DIRECTIONAL_IV_CAPITAL", "200000"))
 RISK_CONFIG = {
     "max_risk_pct":         0.02,   # 2% of capital per trade
     "sl_pct":               0.30,   # Stop loss at 30% premium decay
-    "target_mult":          1.8,    # Target at 1.8× entry
+    "target_mult":          1.8,    # Target at 1.8x entry
     "daily_loss_limit_pct": 0.03,   # Hard stop if down 3% on day
     "max_trades_per_day":   2,
     "max_open_positions":   2,
@@ -34,6 +34,11 @@ IV_FILTER = {
     "max_moneyness_pct":   2.5,
     "min_delta":           0.18,
     "max_delta":           0.40,
+    # --- IV-rank buy-zone gate (fed by the standalone iv-rank scanner) ------ #
+    # When enabled, directional_iv only trades names whose IV rank sits in the
+    # cheap buy zone. Default OFF so behaviour is unchanged unless you opt in.
+    "buy_zone_only":       os.getenv("DIRECTIONAL_IV_BUY_ZONE_ONLY", "false").lower() == "true",
+    "buy_zone_max_ivr":    float(os.getenv("DIRECTIONAL_IV_BUY_ZONE_MAX_IVR", "35")),
 }
 
 DTE_FILTER = {
