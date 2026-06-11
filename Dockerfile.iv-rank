@@ -5,12 +5,14 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# No chromium/broker deps — this service only reads iv_history.db.
+# Lean image — iv-rank only reads iv_history.db and sends Telegram alerts, so it
+# needs NO broker SDK (DhanHQ/upstox), no selenium, no git/chromium. Just pandas
+# + a few small libs. tzdata gives correct Asia/Kolkata times.
 RUN apt-get update && apt-get install -y tzdata && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
+COPY requirements-scanner.txt /app/requirements-scanner.txt
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements-scanner.txt
 
 RUN mkdir -p /app/data /app/logs && chmod -R 777 /app/data /app/logs
 

@@ -5,13 +5,15 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Generic image for the read-only DB scanners (iv-rank, oi-buildup, gap-scan).
-# No chromium/broker deps — these services only read iv_history.db.
+# Lean image for the read-only DB scanners (iv-rank, oi-buildup, gap-scan,
+# delivery-surge, smart-money). They only read iv_history.db and send Telegram
+# alerts, so they need NO broker SDK (DhanHQ/upstox), no selenium, no git/chromium
+# — just pandas + a few small libs. tzdata gives correct Asia/Kolkata times.
 RUN apt-get update && apt-get install -y tzdata && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
+COPY requirements-scanner.txt /app/requirements-scanner.txt
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements-scanner.txt
 
 RUN mkdir -p /app/data /app/logs && chmod -R 777 /app/data /app/logs
 

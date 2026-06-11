@@ -1,0 +1,8 @@
+# Minimal deps for the read-only DB scanners (iv-rank, oi-buildup, gap-scan,
+# delivery-surge, smart-money). These services only read iv_history.db and send
+# Telegram alerts — they need NO broker SDK (DhanHQ/upstox), no selenium, no git.
+pandas
+python-dotenv
+requests
+schedule
+pytz
