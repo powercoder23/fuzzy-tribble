@@ -7,7 +7,8 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import requests
-from dhanhq import dhanhq, DhanContext
+from upstox_adapter import UpstoxDhanAdapter
+from upstox_token_manager import load_upstox_token
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import time
@@ -228,21 +229,28 @@ class DiscountedPremiumScanner:
     
     _shared_runtime_state = None
 
-    def __init__(self, hardtoken, client_id="1104878989", store_intraday=False):
+    def __init__(self, hardtoken=None, client_id=None, store_intraday=False,
+                 upstox_adapter=None):
         """
-        Initialize scanner with Dhan API credentials
-        
-        Args:
-            hardtoken: JWT token from Dhan
-            client_id: Your Dhan client ID
-        """
-        if not client_id or not hardtoken:
-            raise ValueError("DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN are required.")
+        Initialize scanner with an Upstox adapter.
 
-        self.client_id = client_id
-        self.access_token = hardtoken
-        self.context = DhanContext(client_id, hardtoken)
-        self.dhan = dhanhq(self.context)
+        The adapter exposes the same surface the scanner historically used from
+        the dhanhq client (option_chain / expiry_list / historical_daily_data),
+        so the rest of this module needs no changes. If no adapter is injected,
+        one is auto-created from the on-disk Upstox token.
+
+        Args:
+            hardtoken: legacy/unused (kept for call-site compatibility).
+            client_id: legacy/unused (kept for call-site compatibility).
+            upstox_adapter: optional pre-built UpstoxDhanAdapter to reuse.
+        """
+        if upstox_adapter is None:
+            upstox_adapter = UpstoxDhanAdapter(load_upstox_token())
+
+        self.client_id = "upstox"
+        self.access_token = None
+        self.context = None
+        self.dhan = upstox_adapter
         self.risk_free_rate = 0.065  # 6.5% - update from RBI periodically
         self.iv_history_file = IV_HISTORY_FILE
         self.expired_options_cache_dir = EXPIRED_OPTIONS_CACHE_DIR

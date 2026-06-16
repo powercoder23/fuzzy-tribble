@@ -9,7 +9,7 @@ import logging
 import os
 import time
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import schedule
@@ -26,9 +26,20 @@ os.environ["TZ"] = APP_TIMEZONE
 if hasattr(time, "tzset"):
     time.tzset()
 
-DEFAULT_SCAN_TIMES = [
-    "09:50", "10:10", "11:30", "12:30", "13:30", "14:30", "15:05", "15:25"
-]
+def generate_interval_times(start, end, interval_minutes):
+    """Return a list of "HH:MM" strings from start to end (inclusive) at the
+    given interval. start/end are "HH:MM" strings."""
+    start_dt = datetime.strptime(start, "%H:%M")
+    end_dt = datetime.strptime(end, "%H:%M")
+    times = []
+    current = start_dt
+    while current <= end_dt:
+        times.append(current.strftime("%H:%M"))
+        current += timedelta(minutes=interval_minutes)
+    return times
+
+
+DEFAULT_SCAN_TIMES = generate_interval_times(start="09:30", end="15:15", interval_minutes=15)
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday"]
 
 
@@ -51,11 +62,6 @@ class StrategySchedulerApp:
                 "name": "discount",
                 "runner": self.run_discount_scan,
                 "times": DEFAULT_SCAN_TIMES,
-            },
-            {
-                "name": "directional_iv",
-                "runner": self.run_directional_iv_scan,
-                "times": ["09:45", "11:15", "13:15", "14:45", "15:05"],
             }
         ]
 
