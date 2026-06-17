@@ -64,7 +64,7 @@ STRIKE = {
 # NOTE: the scanner only looks at the *nearest* expiry, so within this many
 # days of a monthly expiry the stock universe will return few/no ideas until
 # the next expiry becomes nearest.
-MIN_DTE_DAYS = 3
+MIN_DTE_DAYS = 5
 
 # FIX 3: NSE trading-holiday calendar used by get_actual_trading_days_to_expiry().
 # A simple, hand-maintained list of 'YYYY-MM-DD' strings. When this is empty (or
@@ -105,11 +105,52 @@ FUTURES_OI_BONUS = 10
 # way, so toggling this does not remove existing output.
 EXPORT_BACKTEST_COLUMNS = True
 
-# --- Trade plan (single-leg premium levels) -----------------------------
+# --- Trade plan (single-leg premium levels, INTRADAY) -------------------
+# Calibrated for same-day, single-leg Volatility Expansion Plays on ~5-DTE
+# options. Levels are multiples of the entry mid premium.
+#   SL  = entry * 0.85   (-15%, hard exit)
+#   T1  = entry * 1.25   (+25%, book t1_book_fraction of the position)
+#   T2  = entry * 1.45   (+45%, exit remaining runner)
+# After T1 the runner's stop moves to breakeven (entry) — locks the T1 gain.
 TRADE_PLAN = {
-    "stop_loss_mult": 0.65,  # stop-loss at 65% of entry mid
-    "target_mult": 1.8,      # target at 180% of entry mid
+    "stop_loss_mult": 0.85,      # -15%
+    "t1_mult": 1.25,             # +25%
+    "t2_mult": 1.45,             # +45%
+    "t1_book_fraction": 0.70,    # book 70% at T1, trail 30%
+    "runner_stop_to_breakeven": True,
+    # kept for backward-compat with existing CSV/analytics columns:
+    "target_mult": 1.25,         # legacy "target" == T1
 }
+
+# --- Intraday session rules (no carry-forward) --------------------------
+INTRADAY = {
+    "scan_interval_min": 5,       # 5-minute scan cadence
+    "session_start": "09:30",     # first scan
+    "no_entry_after": "14:00",    # no NEW paper trades after this time
+    "square_off": "15:20",        # force-close any open paper trade
+    "monitor_until": "15:20",     # keep re-pricing open trades until square-off
+    "eod_summary_at": "15:25",    # send realized-P&L summary
+    "max_signals_per_day": 5,     # alert + paper-trade top N by score
+}
+
+# --- Universe (DISCOUNT SCANNER ONLY) -----------------------------------
+# Trim the scan universe to the most liquid F&O names. Ranking uses the latest
+# OI x volume from the local iv_history.db (zero extra API calls). Does NOT
+# affect momentum / break-bounce / directional-IV — they keep their own
+# universes. Set LIQUID_UNIVERSE_ONLY = False to scan the full F&O list.
+LIQUID_UNIVERSE_ONLY = True
+LIQUID_UNIVERSE_SIZE = 120
+
+# --- Upstox API pacing (replaces the Dhan 1-req/3s throttle) ------------
+# Upstox "Other Standard APIs" limits: 50/sec, 500/min, 2000/30min (per-user).
+# We pace well under these. iv-collector shares the same token, so the
+# 30-min option-chain budget is shared — keep total scanner calls modest.
+UPSTOX_MAX_REQ_PER_SEC = 7          # ~7/s -> well under 50/s and 500/min
+UPSTOX_MIN_REQ_INTERVAL_SEC = 1.0 / UPSTOX_MAX_REQ_PER_SEC
+CACHE_DAILY_CANDLES = True          # fetch daily candles once per day per stock
+# Soft budget guard: stop issuing new chain calls in a scan if we'd exceed this
+# many option-chain requests in the trailing 30 min (leaves room for iv-collector).
+CHAIN_CALLS_30MIN_BUDGET = 1500
 
 # --- "Strong liquidity" annotation thresholds ---------------------------
 # Cosmetic only: drives the human-readable reason text on an alert.

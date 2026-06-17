@@ -63,3 +63,4 @@ data/fno_cache/*
 data/premarket_warmup_state.json
 .claude/*
 .claude/worktrees/elated-nightingale-65b1dd
+data/iv_history.db-journal

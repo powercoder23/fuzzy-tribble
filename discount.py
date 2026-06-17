@@ -16,6 +16,15 @@ from scipy import stats
 import warnings
 from f_o_stocks_list import get_stock_futures
 from load_scrip_master_sqlite import update_scrip_master, get_security_id_symbol_map
+from discount_config import (
+    TRADE_PLAN,
+    INTRADAY,
+    MIN_DTE_DAYS,
+    LIQUID_UNIVERSE_ONLY,
+    LIQUID_UNIVERSE_SIZE,
+    UPSTOX_MIN_REQ_INTERVAL_SEC,
+    CACHE_DAILY_CANDLES,
+)
 warnings.filterwarnings('ignore')
 
 logging.basicConfig(
@@ -301,7 +310,10 @@ class DiscountedPremiumScanner:
         return state
 
     def rate_limited_call(self, operation_name, func, *args, **kwargs):
-        min_interval = 1.5
+        # Upstox pace (config). Replaces the old Dhan 1.5s/3.1s throttle, which
+        # made a full ~200-stock scan take ~10-20 min — too slow for a 5-min
+        # cadence. Upstox allows 50/s, 500/min; we pace at UPSTOX_MAX_REQ_PER_SEC.
+        min_interval = UPSTOX_MIN_REQ_INTERVAL_SEC
         elapsed = time.monotonic() - self.runtime_state["last_api_call_ts"]
         if elapsed < min_interval:
             time.sleep(min_interval - elapsed)
@@ -407,10 +419,72 @@ class DiscountedPremiumScanner:
             if sec_id not in resolved and symbol not in resolved.values()
         }
         resolved.update(fallback_missing)
+
+        # DISCOUNT-SCANNER-ONLY universe trim: keep the most liquid N names by
+        # latest OI x volume from the local iv_history.db (zero extra API calls).
+        # Reserved indices are always retained. Other strategies are unaffected.
+        if LIQUID_UNIVERSE_ONLY:
+            resolved = self._trim_to_liquid_universe(
+                resolved, reserved_indices, LIQUID_UNIVERSE_SIZE
+            )
+
         ordered = dict(sorted(resolved.items(), key=lambda item: item[1]))
         self.runtime_state["fno_symbols"] = ordered
         self.runtime_state["fno_symbols_day"] = self.runtime_state["cache_day"]
+        logger.info("F&O universe size after trim: %s", len(ordered))
         return dict(ordered)
+
+    def _trim_to_liquid_universe(self, resolved, reserved_indices, size):
+        """Rank security_ids by latest OI x volume (iv_history.db) and keep top N.
+
+        Reserved indices are always kept. Falls back to the full set if the DB
+        has no usable liquidity rows (e.g. before the IV collector has run).
+        """
+        if not resolved or len(resolved) <= size:
+            return resolved
+        liquidity = {}
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            # Most-recent snapshot per security on the latest available date.
+            cur.execute(
+                """
+                SELECT security_id,
+                       (COALESCE(total_call_oi,0)+COALESCE(total_put_oi,0)) AS oi,
+                       (COALESCE(total_call_volume,0)+COALESCE(total_put_volume,0)) AS vol,
+                       MAX(timestamp) AS ts
+                FROM iv_history
+                GROUP BY security_id
+                """
+            )
+            for sec_id, oi, vol, _ts in cur.fetchall():
+                try:
+                    liquidity[str(sec_id)] = float(oi or 0) * float(vol or 0)
+                except (TypeError, ValueError):
+                    continue
+            conn.close()
+        except Exception:
+            logger.exception("Liquidity ranking failed; scanning full universe")
+            return resolved
+
+        if not liquidity:
+            logger.warning(
+                "No liquidity data in %s yet — scanning full universe of %s names",
+                DB_PATH, len(resolved),
+            )
+            return resolved
+
+        # Always keep reserved indices; rank the rest by liquidity score.
+        kept = {sid: sym for sid, sym in resolved.items() if sid in reserved_indices}
+        rankable = [(sid, sym) for sid, sym in resolved.items() if sid not in reserved_indices]
+        rankable.sort(key=lambda it: liquidity.get(str(it[0]), 0.0), reverse=True)
+        for sid, sym in rankable[: max(size - len(kept), 0)]:
+            kept[sid] = sym
+        logger.info(
+            "Liquid-universe trim: %s -> %s (top %s by OI x volume)",
+            len(resolved), len(kept), size,
+        )
+        return kept
 
     def send_telegram_summary(self, opportunities_df):
         """Send a short end-of-run summary to Telegram."""
@@ -520,7 +594,60 @@ class DiscountedPremiumScanner:
                 expiry,
             )
             return {"status": "failure", "data": {}}
-    
+
+    def get_current_option_premium(self, security_id, exchange_segment, expiry, strike, side):
+        """Re-price a single option leg for the paper-trade monitor.
+
+        Args:
+            security_id: underlying security id
+            exchange_segment: "IDX_I" or "NSE_FNO"
+            expiry: "YYYY-MM-DD"
+            strike: numeric strike
+            side: "CALL"/"CE" or "PUT"/"PE"
+
+        Returns:
+            dict {last, mid, bid, ask, spot} or None if unavailable.
+        """
+        side_key = "ce" if str(side).upper() in ("CALL", "CE") else "pe"
+        try:
+            chain_response = self.get_option_chain(security_id, exchange_segment, expiry)
+            if chain_response.get("status") != "success":
+                return None
+            chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
+            spot = chain_data.get("last_price")
+            oc = chain_data.get("oc")
+            if not isinstance(oc, dict):
+                return None
+            # Strike keys may be strings like "1400.000000"; match on float.
+            target = float(strike)
+            strike_data = None
+            for key, val in oc.items():
+                try:
+                    if abs(float(key) - target) < 1e-6:
+                        strike_data = val
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if not isinstance(strike_data, dict):
+                return None
+            opt = strike_data.get(side_key) or {}
+            if not opt:
+                return None
+            pricing = self.get_execution_prices(opt)
+            return {
+                "last": native_number(opt.get("last_price", 0)) or 0.0,
+                "mid": pricing.get("mid_price"),
+                "bid": pricing.get("bid"),
+                "ask": pricing.get("ask"),
+                "spot": native_number(spot),
+            }
+        except Exception:
+            logger.exception(
+                "get_current_option_premium failed for %s %s %s %s",
+                security_id, expiry, strike, side,
+            )
+            return None
+
     def get_expiry_list(self, underlying_security_id, underlying_segment):
         """
         Get all available expiries for an underlying
@@ -624,6 +751,20 @@ class DiscountedPremiumScanner:
         Returns:
             pd.DataFrame: Historical price data
         """
+        # Daily candles do not change intraday, so cache per (security, range)
+        # for the trading day. This removes ~1 API call per stock on every
+        # 5-min scan after the first — critical for staying under the Upstox
+        # 2000-req/30-min option-chain+candle budget shared with iv-collector.
+        cache_key = (str(security_id), str(from_date), str(to_date))
+        if CACHE_DAILY_CANDLES:
+            cache = getattr(self, "_daily_candle_cache", None)
+            today = datetime.now().date().isoformat()
+            if cache is None or cache.get("_day") != today:
+                cache = {"_day": today}
+                self._daily_candle_cache = cache
+            if cache_key in cache:
+                return cache[cache_key].copy()
+
         history_exchange_segment = "IDX_I" if exchange_segment == "IDX_I" else "NSE_EQ"
         instrument_type = "INDEX" if history_exchange_segment == "IDX_I" else "EQUITY"
 
@@ -691,8 +832,10 @@ class DiscountedPremiumScanner:
             return pd.DataFrame()
 
         df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+        if CACHE_DAILY_CANDLES and not df.empty:
+            self._daily_candle_cache[cache_key] = df.copy()
         return df
-    
+
     def fetch_historical_iv(self, security_id, exchange_segment, lookback_days=252):
         """
         Load persisted ATM IV history for IV Rank / IV Percentile calculations.
@@ -1860,22 +2003,17 @@ class DiscountedPremiumScanner:
         return deviation <= 0.10, deviation
 
     def classify_trade_type(self, iv_rank, skew_discount, iv_trend, trend, abs_delta, expected_move_ratio):
-        """Keep directional and volatility trade definitions strictly separated."""
+        """VOLATILITY-ONLY mode.
+
+        This scanner emits ONLY single-leg "Volatility Expansion Play" signals.
+        Directional spread classification has been removed by design — anything
+        that is not a volatility setup returns None and is skipped upstream.
+        """
         is_volatility_trade = (
             ((iv_rank is not None and iv_rank < 40) or (skew_discount is not None and skew_discount > 0.1)) and
             (iv_trend is None or iv_trend <= 0.05)
         )
-        is_directional_trade = (
-            trend != "neutral" and
-            0.05 <= abs_delta <= 0.55 and
-            expected_move_ratio <= 1.5
-        )
-
-        if is_volatility_trade:
-            return "volatility"
-        if is_directional_trade:
-            return "directional"
-        return None
+        return "volatility" if is_volatility_trade else None
 
     def select_top_trades(self, opportunities, limit=500, max_per_direction=260):
         """Pick the highest-conviction trades with a per-direction cap."""
@@ -1900,49 +2038,36 @@ class DiscountedPremiumScanner:
 
     def build_strategy_plan(self, option_type, strike_price, spot_price, mid_price, option_chain,
                             expected_move, trend, score, entry_price=None, exit_price=None):
-        """Create tradable strategy suggestions from a shortlisted option."""
-        strike_keys = sorted(float(key) for key in option_chain.keys())
-        if option_type == "CALL":
-            candidate_shorts = [strike for strike in strike_keys if strike > strike_price]
-            short_strike = candidate_shorts[0] if candidate_shorts else None
-        else:
-            candidate_shorts = [strike for strike in strike_keys if strike < strike_price]
-            short_strike = candidate_shorts[-1] if candidate_shorts else None
+        """Single-leg INTRADAY Volatility Expansion Play.
 
+        Premium levels come from TRADE_PLAN (discount_config). This scanner is
+        volatility-only, so there is no short leg and no directional spread:
+            entry = option mid (or supplied entry_price)
+            SL    = entry * stop_loss_mult   (default -15%)
+            T1    = entry * t1_mult           (default +25%, book t1_book_fraction)
+            T2    = entry * t2_mult           (default +45%, runner)
+        """
         reference_entry = entry_price if entry_price is not None else mid_price
-        reference_exit = exit_price if exit_price is not None else mid_price
+        entry = reference_entry or 0.0
 
-        entry = reference_entry
-        stop_loss = reference_exit * 0.65 if reference_exit else 0
-        target = reference_entry * 1.8 if reference_entry else 0
+        stop_loss = entry * TRADE_PLAN["stop_loss_mult"] if entry else 0.0
+        t1 = entry * TRADE_PLAN["t1_mult"] if entry else 0.0
+        t2 = entry * TRADE_PLAN["t2_mult"] if entry else 0.0
+        target = t1  # legacy "target" column == T1
+
         risk_reward = None
-        if entry and stop_loss and target and entry != stop_loss:
-            risk_reward = (target - entry) / (entry - stop_loss)
-
-        if option_type == "CALL" and trend == "bullish":
-            strategy = "Call Debit Spread"
-            if expected_move and short_strike is not None:
-                cap_strike = min(
-                    [strike for strike in candidate_shorts if strike <= strike_price + expected_move] or [short_strike]
-                )
-                short_strike = cap_strike
-        elif option_type == "PUT" and trend == "bearish":
-            strategy = "Bear Put Spread"
-            if expected_move and short_strike is not None:
-                floor_strike = max(
-                    [strike for strike in candidate_shorts if strike >= strike_price - expected_move] or [short_strike]
-                )
-                short_strike = floor_strike
-        else:
-            strategy = "Volatility Expansion Play"
-            short_strike = None
+        if entry and stop_loss and t1 and entry != stop_loss:
+            risk_reward = (t1 - entry) / (entry - stop_loss)
 
         return {
-            "strategy": strategy,
-            "short_strike": short_strike,
+            "strategy": "Volatility Expansion Play",
+            "short_strike": None,
             "entry": round(entry, 2) if entry else 0.0,
             "stop_loss": round(stop_loss, 2) if stop_loss else 0.0,
             "target": round(target, 2) if target else 0.0,
+            "t1": round(t1, 2) if t1 else 0.0,
+            "t2": round(t2, 2) if t2 else 0.0,
+            "t1_book_fraction": TRADE_PLAN["t1_book_fraction"],
             "risk_reward": round(risk_reward, 2) if risk_reward is not None else None,
         }
 
@@ -2451,6 +2576,9 @@ class DiscountedPremiumScanner:
                 "entry": strategy_plan["entry"],
                 "stop_loss": strategy_plan["stop_loss"],
                 "target": strategy_plan["target"],
+                "t1": strategy_plan.get("t1"),
+                "t2": strategy_plan.get("t2"),
+                "t1_book_fraction": strategy_plan.get("t1_book_fraction"),
                 "risk_reward": strategy_plan["risk_reward"],
                 "reason": reasons,
                 "mid_price": native_number(mid_price),
@@ -2531,7 +2659,7 @@ class DiscountedPremiumScanner:
             for i, exp in enumerate(expiries):
                 dte = get_trading_days_to_expiry(exp)
 
-                if dte >= 7:
+                if dte >= MIN_DTE_DAYS:
                     selected_expiry = exp
                     break
 
@@ -2815,8 +2943,13 @@ class DiscountedPremiumScanner:
                     candidate.get("volume"),
                 )
         self._score_debug_candidates = []
+        # Attach the resolved expiry + segment so the paper-trade monitor can
+        # re-price each option later (these are constant for the whole stock).
+        for _rec in all_discounted:
+            _rec["expiry"] = expiry
+            _rec["exchange_segment"] = security_segment
         logger.info("Completed scan for %s with %s discounted opportunities", security_name, len(all_discounted))
-        
+
         return all_discounted
     
     # ==================== 4. MULTI-STOCK SCANNER ====================
@@ -3008,3 +3141,5 @@ if __name__ == "__main__":
         logger.info("Results saved to discounted_premiums.csv")
 
     scanner.send_telegram_summary(all_opportunities)
+
+# (volatility-only intraday paper-trading build — see discount_volatility_intraday_plan.md)
