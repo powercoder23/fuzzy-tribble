@@ -35,7 +35,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 IV_HISTORY_FILE = Path("iv_history.csv")
-DB_PATH = "iv_history.db"
+# Must match collectors/iv_store.py — the shared iv_history.db lives inside the
+# /app/data Docker volume so iv-collector and every strategy read/write the SAME
+# file. (A bare "iv_history.db" points at the container-local /app root, an empty
+# DB nobody populates → "no such table: iv_history".)
+DB_PATH = str(Path("data") / "iv_history.db")
 EXPIRED_OPTIONS_CACHE_DIR = Path("data/expired_options_cache")
 MIN_IV_SAMPLES = 30
 DEFAULT_FNO_STOCKS = {
@@ -73,6 +77,30 @@ IV_HISTORY_OPTIONAL_COLUMNS = {
 
 
 def ensure_iv_history_schema(cursor):
+    # Create the base table first so this is safe on a cold/empty DB. Without
+    # this, the ALTER TABLE below raised "no such table: iv_history" whenever the
+    # iv-collector hadn't populated the shared DB yet. Schema matches
+    # collectors/iv_store.py exactly.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS iv_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            security_id TEXT,
+            symbol TEXT,
+            timestamp DATETIME,
+            spot_price REAL,
+            atm_strike REAL,
+            atm_iv REAL,
+            atm_call_iv REAL,
+            atm_put_iv REAL,
+            data_type TEXT,
+            UNIQUE(security_id, timestamp, data_type)
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_iv_security_time ON iv_history(security_id, timestamp)"
+    )
     existing_columns = {
         row[1]
         for row in cursor.execute("PRAGMA table_info(iv_history)").fetchall()
@@ -1034,27 +1062,23 @@ class DiscountedPremiumScanner:
                     interval=15,
                 )
             else:
-                response = requests.post(
-                    "https://api.dhan.co/v2/charts/rollingoption",
-                    headers={
-                        "access-token": self.access_token,
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "securityId": security_id,
-                        "exchangeSegment": exchange_segment,
-                        "instrument": instrument_type,
-                        "expiryFlag": "MONTH",
-                        "expiryCode": 1,
-                        "strike": strike,
-                        "drvOptionType": option_type,
-                        "requiredData": required_data,
-                        "fromDate": fetch_from_date.isoformat(),
-                        "toDate": end_date.isoformat(),
-                        "interval": 15,
-                    },
-                    timeout=20,
-                ).json()
+                # The Upstox adapter exposes no expired/rolling-option endpoint.
+                # Skip the legacy Dhan REST call (it would fail DH-905 with no
+                # Dhan token now that we run on Upstox) and fall back to any
+                # persisted history instead of spamming a dead API every scan.
+                logger.debug(
+                    "Expired-option data unsupported on current provider; "
+                    "using persisted cache for %s (%s) %s",
+                    security_id, exchange_segment, option_type,
+                )
+                fallback_df = persisted_df[
+                    (persisted_df["timestamp"].dt.date >= start_date) &
+                    (persisted_df["timestamp"].dt.date <= end_date)
+                ].reset_index(drop=True) if not persisted_df.empty else pd.DataFrame(
+                    columns=["timestamp", "iv", "close", "volume", "spot"]
+                )
+                self.expired_data_cache[cache_key] = fallback_df.copy()
+                return fallback_df
         except Exception:
             logger.exception(
                 "Failed to fetch expired option data for %s (%s) %s",
