@@ -26,13 +26,13 @@ Design rules (same isolation contract as the other scanners)
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
 from datetime import date as _date, datetime
 
 import pandas as pd
 
 from collectors import iv_store
+import notifications
 import gap_scanner_config as cfg
 
 logger = logging.getLogger(__name__)
@@ -282,12 +282,6 @@ class GapScanner:
 
     # ---- alerting ---------------------------------------------------------- #
     def send_telegram(self, df: pd.DataFrame) -> None:
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        if not bot_token or not chat_id:
-            logger.info("gap-scan: telegram skipped; creds missing")
-            return
-
         src = df["ohlc_source"].iloc[0] if not df.empty else "n/a"
         lines = [
             "Extreme Opening Scanner (gap + range)",
@@ -309,17 +303,10 @@ class GapScanner:
         lines.append("\nGap-and-go is momentum; beware open-rejection. Confirm with a 15-min hold.")
         text = "\n".join(lines)
 
-        try:
-            import requests
-            resp = requests.post(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            logger.info("gap-scan: telegram alert sent")
-        except Exception:
-            logger.exception("gap-scan: failed to send telegram alert")
+        if notifications.notify(text, parse_mode=None):
+            logger.info("gap-scan: alert sent")
+        else:
+            logger.info("gap-scan: alert skipped; no channel configured")
 
     @staticmethod
     def _fmt(r) -> str:

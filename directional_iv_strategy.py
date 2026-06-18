@@ -1,6 +1,5 @@
 import logging
 import math
-import os
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -9,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from discount import DiscountedPremiumScanner, unwrap_dhan_payload
+import notifications
 from config import Config
 from collectors import iv_store
 from directional_iv_config import (
@@ -487,12 +487,6 @@ class DirectionalIVScanner:
             logger.info("%s", "-" * 100)
 
     def send_telegram_summary(self, opportunities_df: pd.DataFrame):
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        if not bot_token or not chat_id:
-            logger.info("Telegram summary skipped; bot token or chat ID missing")
-            return
-
         if opportunities_df.empty:
             text = "Directional IV scan completed. No strong buy setups found."
         else:
@@ -518,17 +512,10 @@ class DirectionalIVScanner:
                 lines.append(f"(+{len(opportunities_df) - len(top_rows)} additional candidates)")
             text = "\n".join(lines)
 
-        try:
-            import requests
-            response = requests.post(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
-                timeout=15,
-            )
-            response.raise_for_status()
-            logger.info("Directional IV telegram summary sent")
-        except Exception:
-            logger.exception("Failed to send directional IV telegram summary")
+        if notifications.notify(text, parse_mode=None):
+            logger.info("Directional IV summary sent")
+        else:
+            logger.info("Directional IV summary skipped; no channel configured")
 
 
 def clip_score(value, floor=0.0, ceiling=100.0) -> float:

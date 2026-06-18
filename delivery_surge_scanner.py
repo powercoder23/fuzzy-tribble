@@ -29,13 +29,13 @@ Design rules (same isolation contract as the other scanners)
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
 from datetime import datetime
 
 import pandas as pd
 
 from collectors import iv_store
+import notifications
 import delivery_surge_config as cfg
 
 logger = logging.getLogger(__name__)
@@ -214,12 +214,6 @@ class DeliverySurgeScanner:
 
     # ---- alerting ---------------------------------------------------------- #
     def send_telegram(self, df: pd.DataFrame) -> None:
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        if not bot_token or not chat_id:
-            logger.info("delivery-surge: telegram skipped; creds missing")
-            return
-
         depth = int(df["hist_days"].max()) if not df.empty else 0
         label = "reliable" if depth >= cfg.RELIABLE_HISTORY_DAYS else f"low-confidence ({depth}d baseline)"
         lines = [
@@ -240,17 +234,10 @@ class DeliverySurgeScanner:
         lines.append("\nℹ️ BTST/swing signal — pair with cheap IV (iv-rank) and 4+ DTE.")
         text = "\n".join(lines)
 
-        try:
-            import requests
-            resp = requests.post(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            logger.info("delivery-surge: telegram alert sent")
-        except Exception:
-            logger.exception("delivery-surge: failed to send telegram alert")
+        if notifications.notify(text, parse_mode=None):
+            logger.info("delivery-surge: alert sent")
+        else:
+            logger.info("delivery-surge: alert skipped; no channel configured")
 
     @staticmethod
     def _fmt(r) -> str:

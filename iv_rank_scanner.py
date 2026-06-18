@@ -29,13 +29,13 @@ Public surface
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
 from datetime import datetime
 
 import pandas as pd
 
 from collectors import iv_store
+import notifications
 import iv_rank_config as cfg
 
 logger = logging.getLogger(__name__)
@@ -249,12 +249,6 @@ class IVRankScanner:
         return f"IV %ile ({depth}d baseline)"
 
     def send_telegram(self, df: pd.DataFrame) -> None:
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        if not bot_token or not chat_id:
-            logger.info("iv-rank: telegram skipped; bot token or chat id missing")
-            return
-
         label = self._baseline_label(df)
         cheap = df[df["zone"] == ZONE_CHEAP] if not df.empty else df
 
@@ -279,17 +273,10 @@ class IVRankScanner:
         lines.append("\nℹ️ Cheap IV favours buyers — still needs a catalyst + direction.")
         text = "\n".join(lines)
 
-        try:
-            import requests
-            resp = requests.post(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            logger.info("iv-rank: telegram alert sent")
-        except Exception:
-            logger.exception("iv-rank: failed to send telegram alert")
+        if notifications.notify(text, parse_mode=None):
+            logger.info("iv-rank: alert sent")
+        else:
+            logger.info("iv-rank: alert skipped; no channel configured")
 
     @staticmethod
     def _fmt_row(r) -> str:

@@ -33,7 +33,6 @@ Buyer bias mapping
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
 from datetime import datetime
 
@@ -41,6 +40,7 @@ import pandas as pd
 
 from collectors import iv_store
 from oi_validator import classify
+import notifications
 import oi_config
 import oi_buildup_config as cfg
 
@@ -218,12 +218,6 @@ class OIBuildupScanner:
 
     # ---- alerting ---------------------------------------------------------- #
     def send_telegram(self, df: pd.DataFrame) -> None:
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        if not bot_token or not chat_id:
-            logger.info("oi-buildup: telegram skipped; creds missing")
-            return
-
         lines = [
             "🔭 OI Buildup Scanner",
             f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')} (latest vs day-open, aggregate option OI)",
@@ -244,17 +238,10 @@ class OIBuildupScanner:
         lines.append("\nℹ️ Buildup = direction; still confirm cheap IV + a catalyst before buying.")
         text = "\n".join(lines)
 
-        try:
-            import requests
-            resp = requests.post(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            logger.info("oi-buildup: telegram alert sent")
-        except Exception:
-            logger.exception("oi-buildup: failed to send telegram alert")
+        if notifications.notify(text, parse_mode=None):
+            logger.info("oi-buildup: alert sent")
+        else:
+            logger.info("oi-buildup: alert skipped; no channel configured")
 
     @staticmethod
     def _fmt(r) -> str:

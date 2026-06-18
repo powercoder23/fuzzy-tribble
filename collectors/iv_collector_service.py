@@ -21,11 +21,11 @@ from collections import Counter, deque
 from datetime import datetime, time as dt_time
 from pathlib import Path
 
-import requests
 import schedule
 
 import pytz
 
+import notifications
 from config import Config
 from collectors.bhav_collector  import BhavCollector
 from collectors.deals_collector import DealsCollector
@@ -310,23 +310,11 @@ class IVCollector:
     # ── telegram ──────────────────────────────────────────────────────────────
 
     def _send_telegram(self, text: str) -> bool:
-        token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-        if not token or not chat_id:
-            logger.info("Telegram not configured — EOD summary not sent")
-            return False
-        try:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-                timeout=10,
-            )
-            if not resp.ok:
-                logger.warning("Telegram EOD send failed: %s", resp.text[:200])
-            return resp.ok
-        except Exception:
-            logger.exception("Telegram EOD send exception")
-            return False
+        """Send the EOD summary via Telegram, falling back to Discord."""
+        if notifications.notify(text):
+            return True
+        logger.info("EOD summary not sent — no channel configured or all sends failed")
+        return False
 
     def _build_eod_message(self, universe_size: int) -> str:
         stats    = iv_store.get_eod_stats()

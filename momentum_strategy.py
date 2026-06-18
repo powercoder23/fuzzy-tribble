@@ -12,13 +12,13 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import pytz
-import requests
 
 from discount import (
     DiscountedPremiumScanner,
     unwrap_dhan_payload,
     get_trading_days_to_expiry,
 )
+import notifications
 from config import Config
 from load_scrip_master_sqlite import get_security_id_symbol_map
 from collectors import iv_store
@@ -743,27 +743,10 @@ class MomentumTelegramNotifier:
     def __init__(self, bot_token: str, chat_id: str):
         self.bot_token = bot_token or ""
         self.chat_id   = chat_id or ""
-        self._url      = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
 
     def send(self, text: str) -> bool:
-        """POST to Telegram. Returns True on success. Never raises."""
-        if not self.bot_token or not self.chat_id:
-            logger.warning("Telegram not configured — skipping send")
-            return False
-        try:
-            resp = requests.post(
-                self._url,
-                json={"chat_id": self.chat_id, "text": text,
-                      "parse_mode": "HTML"},
-                timeout=10,
-            )
-            if not resp.ok:
-                logger.warning("Telegram send failed: %s %s", resp.status_code, resp.text[:200])
-                return False
-            return True
-        except Exception:
-            logger.warning("Telegram send exception")
-            return False
+        """Send via Telegram, falling back to Discord. Returns True on success."""
+        return notifications.notify(text, bot_token=self.bot_token, chat_id=self.chat_id)
 
     def send_premarket_report(self, regime_results: list, vix: float,
                               affordable_count: int, risk_summary: dict) -> None:

@@ -29,7 +29,7 @@ import logging
 import sqlite3
 from datetime import datetime
 
-import requests
+import notifications
 
 try:
     from discount_config import INTRADAY, TRADE_PLAN
@@ -346,23 +346,14 @@ def format_eod_summary(trades, date):
 
 
 def send_telegram(text, bot_token=None, chat_id=None, parse_mode="HTML"):
-    bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
-    if not bot_token or not chat_id:
-        logger.info("Telegram skipped: bot token / chat id missing")
-        return False
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode,
-                  "disable_web_page_preview": True},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return True
-    except Exception:
-        logger.exception("Failed to send Telegram message")
-        return False
+    """Send via Telegram, falling back to Discord. Returns True on success."""
+    # `or None` so empty/unset creds defer to the env inside notify().
+    return notifications.notify(
+        text,
+        bot_token=bot_token or None,
+        chat_id=chat_id or None,
+        parse_mode=parse_mode,
+    )
 
 
 # ---------------------------------------------------------------------------

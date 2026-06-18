@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pandas as pd
 import numpy as np
-import requests
 from upstox_adapter import UpstoxDhanAdapter
 from upstox_token_manager import load_upstox_token
 from dotenv import load_dotenv
@@ -15,6 +14,7 @@ import time
 from scipy import stats
 import warnings
 from f_o_stocks_list import get_stock_futures
+import notifications
 from load_scrip_master_sqlite import update_scrip_master, get_security_id_symbol_map
 from discount_config import (
     TRADE_PLAN,
@@ -515,11 +515,7 @@ class DiscountedPremiumScanner:
         return kept
 
     def send_telegram_summary(self, opportunities_df):
-        """Send a short end-of-run summary to Telegram."""
-        if not self.telegram_bot_token or not self.telegram_chat_id:
-            logger.info("Telegram alert skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing")
-            return
-
+        """Send a short end-of-run summary (Telegram, Discord fallback)."""
         if opportunities_df is None or opportunities_df.empty:
             message = (
                 "Options Scanner Summary\n"
@@ -567,19 +563,15 @@ class DiscountedPremiumScanner:
                 lines.append("")
             message = "\n".join(lines)
 
-        try:
-            response = requests.post(
-                f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage",
-                json={
-                    "chat_id": self.telegram_chat_id,
-                    "text": message,
-                },
-                timeout=15,
-            )
-            response.raise_for_status()
-            logger.info("Telegram summary sent")
-        except Exception:
-            logger.exception("Failed to send Telegram summary")
+        if notifications.notify(
+            message,
+            bot_token=self.telegram_bot_token,
+            chat_id=self.telegram_chat_id,
+            parse_mode=None,
+        ):
+            logger.info("Scanner summary sent")
+        else:
+            logger.info("Scanner summary not sent: no channel configured or all sends failed")
     
     def get_option_chain(self, underlying_security_id, underlying_segment, expiry):
         """

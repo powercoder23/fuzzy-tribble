@@ -26,13 +26,13 @@ Design rules (same isolation contract as the other scanners)
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
 from datetime import datetime
 
 import pandas as pd
 
 from collectors import iv_store
+import notifications
 import smart_money_config as cfg
 
 logger = logging.getLogger(__name__)
@@ -210,12 +210,6 @@ class SmartMoneyScanner:
 
     # ---- alerting ---------------------------------------------------------- #
     def send_telegram(self, df: pd.DataFrame) -> None:
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        if not bot_token or not chat_id:
-            logger.info("smart-money: telegram skipped; creds missing")
-            return
-
         lines = [
             "🏦 Smart-Money Scanner (bulk/block, BTST bias)",
             f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')} | last {cfg.LOOKBACK_DAYS} session(s)",
@@ -234,17 +228,10 @@ class SmartMoneyScanner:
         lines.append("\nℹ️ Disclosed post-close = next-day signal. Pair with cheap IV + 4+ DTE.")
         text = "\n".join(lines)
 
-        try:
-            import requests
-            resp = requests.post(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            logger.info("smart-money: telegram alert sent")
-        except Exception:
-            logger.exception("smart-money: failed to send telegram alert")
+        if notifications.notify(text, parse_mode=None):
+            logger.info("smart-money: alert sent")
+        else:
+            logger.info("smart-money: alert skipped; no channel configured")
 
     @staticmethod
     def _fmt(r) -> str:
