@@ -279,16 +279,19 @@ def format_signal_alert(sig):
     entry = float(sig["entry"])
     lot = int(sig.get("lot_size", 1) or 1)
     risk_rupees = (entry - float(sig["sl"])) * lot
+    target_rupees = (float(sig["t2"]) - entry) * lot
+    now_str = datetime.now().strftime("%H:%M:%S")
     lines = [
-        f"{dot} <b>VOLATILITY EXPANSION</b> • <b>{sig['symbol']}</b> {side} {_fmt(sig['strike'],0)}",
-        f"Score {_fmt(sig.get('score'),1)} | DTE {sig.get('dte','?')} | Spot {_fmt(sig.get('spot'),1)}",
+        f"{dot} <b>PAPER TRADE TAKEN</b> • <b>{sig['symbol']}</b> {side} {_fmt(sig['strike'],0)}",
+        f"⏱ Entry time {now_str} • Expiry {sig.get('expiry','?')} • DTE {sig.get('dte','?')}",
+        f"Score {_fmt(sig.get('score'),1)} | Spot {_fmt(sig.get('spot'),1)} | "
         f"IVR {_fmt(sig.get('iv_rank'),0)} • IV/HV {_fmt(sig.get('iv'),1)}/{_fmt(sig.get('hv'),1)}",
         f"Entry ₹{_fmt(entry)}  SL ₹{_fmt(sig['sl'])} (-15%)",
         f"T1 ₹{_fmt(sig['t1'])} (+25%, book {int(round(sig.get('t1_book_fraction',0.7)*100))}%)  "
         f"T2 ₹{_fmt(sig['t2'])} (+45%, trail)",
-        f"Liq OI {sig.get('oi','?')} • Vol {sig.get('volume','?')}",
-        f"Square-off {INTRADAY['square_off']} • Lot {lot} • Risk ≈ ₹{_fmt(risk_rupees,0)}/lot",
-        "<i>#paper — alert only, no live order</i>",
+        f"Lot size {lot} • Qty {lot} (1 lot) • Risk ≈ ₹{_fmt(risk_rupees,0)} • Reward ≈ ₹{_fmt(target_rupees,0)}",
+        f"Liq OI {sig.get('oi','?')} • Vol {sig.get('volume','?')} • Square-off {INTRADAY['square_off']}",
+        "<i>#paper — simulated, no live order</i>",
     ]
     return "\n".join(lines)
 
@@ -312,36 +315,76 @@ def format_fill_update(trade, event):
     return "\n".join(bits)
 
 
+def _hhmmss(ts):
+    """Pull HH:MM:SS out of a stored 'YYYY-mm-dd HH:MM:SS' string."""
+    if not ts:
+        return "—"
+    s = str(ts)
+    return s[11:19] if len(s) >= 19 else s
+
+
+def _why(trade):
+    """Plain-language reason for how a trade ended (or why it didn't move)."""
+    reason = trade.get("exit_reason")
+    pct = trade.get("realized_pct") or 0.0
+    if trade.get("status") == "open":
+        return "still open at EOD"
+    if reason == "SL":
+        return "hit stop-loss (−15%); premium fell after entry"
+    if reason == "T2":
+        return "ran to T2 target (+45%); strong directional move"
+    if reason == "Runner BE":
+        return "booked T1, runner came back to breakeven (move stalled)"
+    if reason and reason.startswith("Time"):
+        if pct > 5:
+            return "closed in profit at square-off (trend held, no target hit)"
+        if pct < -5:
+            return "closed in loss at square-off (drifted against us)"
+        return "flat at square-off — premium barely moved (no momentum)"
+    # T1-only partials that never fully closed elsewhere
+    if reason == "T1":
+        return "booked partial at T1; rest exited later"
+    return reason or "—"
+
+
 def format_eod_summary(trades, date):
-    """EOD realized-P&L HTML summary."""
+    """EOD realized-P&L HTML summary with per-trade lot/time/entry/exit/reason."""
     closed = [t for t in trades if t.get("status") == "closed"]
     if not trades:
-        return f"<b>📒 Paper EOD — {date}</b>\nNo volatility-expansion signals today."
+        return f"<b>📒 Paper EOD — {date}</b>\nNo paper trades were taken today."
 
     wins = [t for t in closed if (t.get("realized_rupees") or 0) > 0]
     losses = [t for t in closed if (t.get("realized_rupees") or 0) < 0]
+    flats = [t for t in closed if (t.get("realized_rupees") or 0) == 0]
     total_rupees = sum((t.get("realized_rupees") or 0) for t in closed)
     hit_rate = (len(wins) / len(closed) * 100.0) if closed else 0.0
 
     lines = [
         f"<b>📒 Paper EOD — {date}</b>",
-        f"Trades {len(trades)} | Closed {len(closed)} | Win {len(wins)} / Loss {len(losses)} "
-        f"({hit_rate:.0f}% hit)",
-        f"<b>Net ₹{total_rupees:,.0f}/lot</b>",
+        f"Trades {len(trades)} | Closed {len(closed)} | "
+        f"Win {len(wins)} / Loss {len(losses)} / Flat {len(flats)} ({hit_rate:.0f}% hit)",
+        f"<b>Net ₹{total_rupees:,.0f}</b> (1-lot basis)",
         "─────────────",
     ]
     for t in sorted(trades, key=lambda x: (x.get("realized_rupees") or 0), reverse=True):
         side = "CE" if str(t.get("side", "")).upper() in ("CALL", "CE") else "PE"
         rr = t.get("realized_rupees")
         pct = t.get("realized_pct")
-        status = t.get("exit_reason") or ("open" if t.get("status") == "open" else "—")
+        lot = int(t.get("lot_size", 1) or 1)
         tag = "🟩" if (rr or 0) > 0 else "🟥" if (rr or 0) < 0 else "⬜"
+        # Header line: instrument + result
         lines.append(
-            f"{tag} {t['symbol']} {side} {_fmt(t['strike'],0)} | "
-            f"entry ₹{_fmt(t['entry'])} → ₹{_fmt(t.get('last_price'))} | "
-            f"{_fmt(pct,1)}% (₹{_fmt(rr,0)}) | {status}"
+            f"{tag} <b>{t['symbol']} {side} {_fmt(t['strike'],0)}</b> "
+            f"→ {_fmt(pct,1)}% (₹{_fmt(rr,0)})"
         )
-    lines.append("<i>#paper — simulated on actual LTP, 1-lot basis</i>")
+        # Detail line: lot, times, prices
+        lines.append(
+            f"    lot {lot} • in {_hhmmss(t.get('opened_at'))} @ ₹{_fmt(t['entry'])} "
+            f"→ out {_hhmmss(t.get('closed_at'))} @ ₹{_fmt(t.get('last_price'))}"
+        )
+        # Reason line
+        lines.append(f"    why: {_why(t)}")
+    lines.append("<i>#paper — simulated on actual option LTP, 1-lot basis</i>")
     return "\n".join(lines)
 
 
@@ -442,45 +485,4 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
 
 
 def monitor(book, scanner, now=None, bot_token=None, chat_id=None, square_off=False):
-    """Re-price every open paper trade and advance its exit state machine."""
-    now = now or datetime.now()
-    date = now.date().isoformat()
-    closed = []
-    for trade in book.open_trades(date):
-        quote = None
-        try:
-            quote = scanner.get_current_option_premium(
-                trade["security_id"], trade["exchange_segment"],
-                trade["expiry"], trade["strike"], trade["side"],
-            )
-        except Exception:
-            logger.exception("Re-price failed for trade %s", trade.get("id"))
-        if not quote or quote.get("last") in (None, 0):
-            # No usable price; only act if we must square off (use last known).
-            if not square_off:
-                continue
-            last_price = trade.get("last_price") or trade["entry"]
-        else:
-            last_price = quote.get("last") or quote.get("mid") or trade["entry"]
-
-        events = apply_tick(trade, last_price, square_off=square_off)
-        if events:
-            book.save_runtime(trade, now)
-            for ev in events:
-                send_telegram(format_fill_update(trade, ev), bot_token, chat_id)
-            if trade.get("status") == "closed":
-                closed.append(trade)
-        else:
-            book.save_runtime(trade, now)
-    return closed
-
-
-def run_eod(book, scanner=None, now=None, bot_token=None, chat_id=None):
-    """Force square-off any still-open trades, then send the EOD summary."""
-    now = now or datetime.now()
-    date = now.date().isoformat()
-    if scanner is not None:
-        monitor(book, scanner, now=now, bot_token=bot_token, chat_id=chat_id, square_off=True)
-    summary = format_eod_summary(book.all_trades(date), date)
-    send_telegram(summary, bot_token, chat_id)
-    return summary
+    """Re-price every open paper trade and advance its

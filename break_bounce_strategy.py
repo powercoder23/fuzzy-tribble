@@ -139,6 +139,14 @@ class BreakBounceScanner:
         self.scanner           = scanner
         self._daily_fetcher    = MomentumRegimeFilter(scanner)
         self._intraday_fetcher = MomentumScanner(scanner)
+        # All candle reads go through the single DataProvider (L2). Until its
+        # pollers are started, intraday_candles() falls back to a direct fetch,
+        # so behaviour is identical; start the pollers to switch to fetch-once.
+        try:
+            from data_provider import DataProvider
+            self._provider = DataProvider(scanner)
+        except Exception:
+            self._provider = None
 
     # ---- Step 1: Daily levels --------------------------------------------------
 
@@ -283,8 +291,10 @@ class BreakBounceScanner:
             if not yh or not yl:
                 return {**no_breakout, "reason": "no_levels"}
 
-            df = self._intraday_fetcher.get_intraday_candles(
-                security_id, exchange_segment, interval_minutes=15)
+            df = (self._provider.intraday_candles(security_id, exchange_segment, interval=15)
+                  if self._provider is not None
+                  else self._intraday_fetcher.get_intraday_candles(
+                      security_id, exchange_segment, interval_minutes=15))
             if df is None or df.empty or len(df) < 2:
                 return {**no_breakout, "reason": "insufficient_candles"}
 
@@ -363,8 +373,10 @@ class BreakBounceScanner:
             "security_id": security_id, "sl_level": 0.0, "reason": "",
         }
         try:
-            df = self._intraday_fetcher.get_intraday_candles(
-                security_id, exchange_segment, interval_minutes=5)
+            df = (self._provider.intraday_candles(security_id, exchange_segment, interval=5)
+                  if self._provider is not None
+                  else self._intraday_fetcher.get_intraday_candles(
+                      security_id, exchange_segment, interval_minutes=5))
             if df is None or df.empty or len(df) < 5:
                 return {**no_signal, "reason": "insufficient_candles"}
 
@@ -741,58 +753,11 @@ class BreakBounceStrategyRunner:
 
     def _place_order(self, strike_data: dict, lots: int,
                      lot_size: int, sl_price: float) -> dict:
-        try:
-            option_sec_id = strike_data.get("option_security_id", "")
-            if not option_sec_id:
-                logger.error("_place_order: no option_security_id in strike_data")
-                return {"status": "no_option_security_id"}
-            qty = lots * lot_size
-            response = self._scanner_obj.dhan.place_order(
-                security_id      = option_sec_id,
-                exchange_segment  = self._scanner_obj.dhan.NSE_FNO,
-                transaction_type  = self._scanner_obj.dhan.BUY,
-                quantity          = qty,
-                order_type        = self._scanner_obj.dhan.MARKET,
-                product_type      = self._scanner_obj.dhan.INTRA,
-                price             = 0,
-            )
-            logger.info("B&B buy order response: %s", response)
-            if response.get("status") != "success":
-                return {"status": "buy_failed", "response": response}
-            sl_response = self._scanner_obj.dhan.place_order(
-                security_id      = option_sec_id,
-                exchange_segment  = self._scanner_obj.dhan.NSE_FNO,
-                transaction_type  = self._scanner_obj.dhan.SELL,
-                quantity          = qty,
-                order_type        = self._scanner_obj.dhan.SL_M,
-                product_type      = self._scanner_obj.dhan.INTRA,
-                price             = 0,
-                trigger_price     = sl_price,
-            )
-            if sl_response.get("status") != "success":
-                logger.error("B&B SL order failed — placing emergency exit: %s", sl_response)
-                self._scanner_obj.dhan.place_order(
-                    security_id      = option_sec_id,
-                    exchange_segment  = self._scanner_obj.dhan.NSE_FNO,
-                    transaction_type  = self._scanner_obj.dhan.SELL,
-                    quantity          = qty,
-                    order_type        = self._scanner_obj.dhan.MARKET,
-                    product_type      = self._scanner_obj.dhan.INTRA,
-                    price             = 0,
-                )
-                self._notifier.send(
-                    f"⚠️ B&amp;B SL order failed for {strike_data.get('side')} "
-                    f"{strike_data.get('strike')} — emergency exit placed"
-                )
-                return {"status": "sl_failed_emergency_exit"}
-            return {
-                "status":       "ok",
-                "buy_order_id": response.get("orderId", ""),
-                "sl_order_id":  sl_response.get("orderId", ""),
-            }
-        except Exception:
-            logger.exception("_place_order exception")
-            return {"status": "exception"}
+        import order_manager
+        return order_manager.place_bracket_order(
+            self._scanner_obj.dhan, strike_data, lots, lot_size, sl_price,
+            notify=getattr(self._notifier, "send", None), label="B&B ",
+        )
 
     # ---- OI Validation Layer hook (isolated add-on) ---------------------------
 
@@ -1307,3 +1272,4 @@ class BreakBounceStrategyRunner:
             logger.info("B&B EOD complete | stats=%s", stats)
         except Exception:
             logger.exception("run_eod failed")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  

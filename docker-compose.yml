@@ -202,3 +202,24 @@ services:
     depends_on:
       - iv-collector
     command: python smart_money_runner.py
+
+  # Composite Conviction scanner — FUSES all five scanners above into one
+  # ranked, direction-aware conviction score per stock. Reads only the persisted
+  # *_history tables (zero broker calls). EOD-primary (runs ~20:15, after deals +
+  # delivery land). To run manually: docker-compose --profile composite up composite
+  composite:
+    build:
+      context: .
+      dockerfile: Dockerfile.scanner
+    container_name: composite-scanner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - shared-data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python composite_runner.py

@@ -124,13 +124,14 @@ TRADE_PLAN = {
 
 # --- Intraday session rules (no carry-forward) --------------------------
 INTRADAY = {
-    "scan_interval_min": 5,       # 5-minute scan cadence
+    "scan_interval_min": 15,      # scanner cadence: find + book NEW trades every 15 min
+    "monitor_interval_min": 5,    # order-manager cadence: re-price + exit-manage OPEN positions every 5 min
     "session_start": "09:30",     # first scan
-    "no_entry_after": "14:00",    # no NEW paper trades after this time
+    "no_entry_after": "15:00",    # no NEW paper trades after this time (paper: allow later)
     "square_off": "15:20",        # force-close any open paper trade
     "monitor_until": "15:20",     # keep re-pricing open trades until square-off
     "eod_summary_at": "15:25",    # send realized-P&L summary
-    "max_signals_per_day": 5,     # alert + paper-trade top N by score
+    "max_signals_per_day": 15,    # paper-trade top N by score (liberal — it's paper)
 }
 
 # --- Universe (DISCOUNT SCANNER ONLY) -----------------------------------
@@ -152,9 +153,4 @@ CACHE_DAILY_CANDLES = True          # fetch daily candles once per day per stock
 # many option-chain requests in the trailing 30 min (leaves room for iv-collector).
 CHAIN_CALLS_30MIN_BUDGET = 1500
 
-# --- "Strong liquidity" annotation thresholds ---------------------------
-# Cosmetic only: drives the human-readable reason text on an alert.
-STRONG_LIQUIDITY = {
-    "oi": 10000,
-    "volume": 1000,
-}
+# --- "Strong liquidity" 

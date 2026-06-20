@@ -1038,67 +1038,13 @@ class MomentumStrategyRunner:
 
     def _place_order(self, strike_data: dict, lots: int,
                      lot_size: int, sl_price: float) -> dict:
-        """Place buy order + immediate SL order via Dhan API."""
-        try:
-            option_sec_id = strike_data.get("option_security_id", "")
-            if not option_sec_id:
-                logger.error("_place_order: no option_security_id in strike_data")
-                return {"status": "no_option_security_id"}
-
-            qty = lots * lot_size
-
-            response = self._scanner.dhan.place_order(
-                security_id      = option_sec_id,
-                exchange_segment  = self._scanner.dhan.NSE_FNO,
-                transaction_type  = self._scanner.dhan.BUY,
-                quantity          = qty,
-                order_type        = self._scanner.dhan.MARKET,
-                product_type      = self._scanner.dhan.INTRA,
-                price             = 0,
-            )
-            logger.info("Buy order response: %s", response)
-
-            if response.get("status") != "success":
-                return {"status": "buy_failed", "response": response}
-
-            sl_response = self._scanner.dhan.place_order(
-                security_id      = option_sec_id,
-                exchange_segment  = self._scanner.dhan.NSE_FNO,
-                transaction_type  = self._scanner.dhan.SELL,
-                quantity          = qty,
-                order_type        = self._scanner.dhan.SL_M,
-                product_type      = self._scanner.dhan.INTRA,
-                price             = 0,
-                trigger_price     = sl_price,
-            )
-
-            if sl_response.get("status") != "success":
-                logger.error("SL order failed — placing emergency market sell: %s", sl_response)
-                self._scanner.dhan.place_order(
-                    security_id      = option_sec_id,
-                    exchange_segment  = self._scanner.dhan.NSE_FNO,
-                    transaction_type  = self._scanner.dhan.SELL,
-                    quantity          = qty,
-                    order_type        = self._scanner.dhan.MARKET,
-                    product_type      = self._scanner.dhan.INTRA,
-                    price             = 0,
-                )
-                symbol = strike_data.get("side", "")
-                self._notifier.send(
-                    f"⚠️ SL order failed for {symbol} {strike_data.get('strike')} "
-                    "— emergency exit placed"
-                )
-                return {"status": "sl_failed_emergency_exit"}
-
-            return {
-                "status":       "ok",
-                "buy_order_id": response.get("orderId", ""),
-                "sl_order_id":  sl_response.get("orderId", ""),
-            }
-
-        except Exception:
-            logger.exception("_place_order exception")
-            return {"status": "exception"}
+        """Place buy order + immediate SL order (delegated to the shared
+        OrderManager.place_bracket_order — single copy across strategies)."""
+        import order_manager
+        return order_manager.place_bracket_order(
+            self._scanner.dhan, strike_data, lots, lot_size, sl_price,
+            notify=getattr(self._notifier, "send", None),
+        )
 
     def run_premarket(self) -> dict:
         """Called at 9:00 AM."""
@@ -1329,3 +1275,4 @@ class MomentumStrategyRunner:
             logger.info("EOD summary sent | stats=%s", stats)
         except Exception:
             logger.exception("run_eod failed")
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
