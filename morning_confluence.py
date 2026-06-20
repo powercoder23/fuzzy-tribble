@@ -145,9 +145,13 @@ class MorningConfluence:
         self.provider = provider          # optional DataProvider for 5-min support
 
     def _universe(self):
+        # READ-ONLY consumer of iv_history.db. morning_confluence never INSERTs or
+        # UPDATEs iv_history (collectors/iv_collector_service.py is the SOLE WRITER);
+        # it reads the DAILY snapshots only, never intraday.
         with sqlite3.connect(self.db_path) as conn:
             return [(str(s), m) for s, m in conn.execute(
-                "SELECT security_id, MAX(symbol) FROM iv_history GROUP BY security_id")]
+                "SELECT security_id, MAX(symbol) FROM iv_history "
+                "WHERE data_type = 'daily' GROUP BY security_id")]
 
     def _discount_rows(self):
         try:

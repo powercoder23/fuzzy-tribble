@@ -1304,17 +1304,18 @@ class DiscountedPremiumScanner:
 
     def determine_trend_context(self, price_df):
         """Simple market context based on EMA structure."""
-        if price_df.empty or "close" not in price_df.columns or len(price_df) < 50:
+        if price_df.empty or "close" not in price_df.columns or len(price_df) < 20:
             return {"trend": "neutral", "ema20": None, "ema50": None}
 
         closes = price_df["close"].astype(float)
-        ema20 = closes.ewm(span=20, adjust=False).mean().iloc[-1]
-        ema50 = closes.ewm(span=50, adjust=False).mean().iloc[-1]
+        ema20 = closes.ewm(span=5,  adjust=False).mean().iloc[-1]  # was span=20
+        ema50 = closes.ewm(span=20, adjust=False).mean().iloc[-1]  # was span=50
         last_close = closes.iloc[-1]
 
-        if last_close > ema20 > ema50:
+        # Relaxed: ema50 as primary, ema20 as confirmation only
+        if last_close > ema50 and ema20 > ema50:
             trend = "bullish"
-        elif last_close < ema20 < ema50:
+        elif last_close < ema50 and ema20 < ema50:
             trend = "bearish"
         else:
             trend = "neutral"
@@ -2019,12 +2020,22 @@ class DiscountedPremiumScanner:
         return deviation <= 0.10, deviation
 
     def classify_trade_type(self, iv_rank, skew_discount, iv_trend, trend, abs_delta, expected_move_ratio):
-        """VOLATILITY-ONLY mode.
+        """Classify a setup as a directional or volatility trade.
 
-        This scanner emits ONLY single-leg "Volatility Expansion Play" signals.
-        Directional spread classification has been removed by design — anything
-        that is not a volatility setup returns None and is skipped upstream.
+        A strong directional signal (clear trend + tradeable delta + not-cheap IV)
+        takes PRIORITY and returns "directional". Otherwise the volatility check
+        decides; anything that is neither returns None and is skipped upstream.
         """
+        # Priority: a strong directional signal wins over volatility.
+        is_strong_directional = (
+            trend != "neutral"
+            and 0.15 <= abs_delta <= 0.45
+            and (iv_rank is None or iv_rank >= 40)  # not cheap IV
+        )
+        if is_strong_directional:
+            return "directional"
+
+        # Then check volatility (existing logic unchanged).
         is_volatility_trade = (
             ((iv_rank is not None and iv_rank < 40) or (skew_discount is not None and skew_discount > 0.1)) and
             (iv_trend is None or iv_trend <= 0.05)
@@ -2922,7 +2933,12 @@ class DiscountedPremiumScanner:
                 if item.get("market_direction") == ("bullish" if item.get("type") == "CALL" else "bearish"):
                     market_confidence = item.get("market_confidence")
                     market_confidence = market_confidence if market_confidence is not None else 50.0
-                    final_rank_score += min(8.0, max(0.0, (market_confidence - 50.0) / 5.0))
+                    # Max bonus = 5 pts, only meaningful when confidence > 60, so
+                    # market confidence DIFFERENTIATES stocks by their actual option
+                    # metrics instead of uniformly inflating every stock to ~95 when
+                    # the market regime is STRONG_BULLISH.
+                    confidence_bonus = min(5.0, max(0.0, (market_confidence - 60.0) / 8.0))
+                    final_rank_score += confidence_bonus
                 item["final_rank_score"] = round(final_rank_score, 2)
 
             all_discounted = sorted(

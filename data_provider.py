@@ -69,10 +69,12 @@ class CandlePoller:
     fetch_fn(instrument, segment, interval_min) -> DataFrame.
     """
 
-    def __init__(self, interval_min: int, fetch_fn, cache: CandleCache, name=None):
+    def __init__(self, interval_min: int, fetch_fn, cache: CandleCache, name=None,
+                 bulk_fetch_fn=None):
         self.interval_min = int(interval_min)
         self.fetch_fn = fetch_fn
         self.cache = cache
+        self.bulk_fetch_fn = bulk_fetch_fn
         self.name = name or f"poll-{interval_min}m"
         self._subs: dict = {}            # instrument -> {"segment": str, "who": set}
         self._lock = threading.Lock()
@@ -123,19 +125,37 @@ class CandlePoller:
         return (now - b).total_seconds() >= settle_seconds
 
     def tick(self, now=None):
-        """Fetch the latest candle for every subscribed instrument once."""
+        """Fetch the latest candle for every subscribed instrument once.
+
+        If a bulk fetcher is configured, all subscribed instruments are pulled
+        in a single (batched) call; otherwise fall back to one fetch per
+        instrument via fetch_fn.
+        """
         now = now or datetime.now()
         with self._lock:
             targets = [(i, e["segment"]) for i, e in self._subs.items()]
         fetched = 0
-        for instrument, segment in targets:
+        if self.bulk_fetch_fn and targets:
+            # Single bulk call for all instruments.
             try:
-                df = self.fetch_fn(instrument, segment, self.interval_min)
+                results = self.bulk_fetch_fn(targets, self.interval_min)
+            except Exception:
+                logger.exception("%s: bulk fetch failed", self.name)
+                results = {}
+            for instrument, df in (results or {}).items():
                 if df is not None:
                     self.cache.put(instrument, self.interval_min, df, ts=now)
                     fetched += 1
-            except Exception:
-                logger.exception("%s: fetch failed for %s", self.name, instrument)
+        else:
+            # Fallback: one-by-one (existing logic).
+            for instrument, segment in targets:
+                try:
+                    df = self.fetch_fn(instrument, segment, self.interval_min)
+                    if df is not None:
+                        self.cache.put(instrument, self.interval_min, df, ts=now)
+                        fetched += 1
+                except Exception:
+                    logger.exception("%s: fetch failed for %s", self.name, instrument)
         self._last_boundary = self._boundary(now)
         if fetched:
             logger.info("%s: refreshed %d instrument(s)", self.name, fetched)
@@ -174,8 +194,10 @@ class DataProvider:
         self._fetch_intraday = fetch_intraday or self._default_intraday
         self._fetch_daily = fetch_daily or self._default_daily
         self.cache = cache or CandleCache()
-        self.poll_5m = CandlePoller(5, self._fetch_intraday, self.cache)
-        self.poll_15m = CandlePoller(15, self._fetch_intraday, self.cache)
+        self.poll_5m = CandlePoller(5, self._fetch_intraday, self.cache,
+                                    bulk_fetch_fn=self._bulk_intraday)
+        self.poll_15m = CandlePoller(15, self._fetch_intraday, self.cache,
+                                     bulk_fetch_fn=self._bulk_intraday)
         self._pollers = {5: self.poll_5m, 15: self.poll_15m}
         if start_pollers:
             self.start()
@@ -197,6 +219,73 @@ class DataProvider:
     def _default_daily(self, instrument, segment, interval_min=None):
         _, regime = self._momentum_fetchers()
         return regime.get_daily_candles(instrument, segment)
+
+    # ---- bulk intraday OHLC (Upstox bulk market-quote API) ----------------
+    def _bulk_intraday(self, targets, interval_min):
+        """
+        Calls the Upstox bulk OHLC API for all targets in batches of 500.
+        targets = [(instrument_key, segment), ...]
+        Returns {instrument_key: DataFrame}.
+
+        Best-effort: any batch that errors or returns non-200 is logged and
+        skipped, leaving those instruments to the per-instrument direct-fetch
+        fallback used by the read methods.
+        """
+        import requests
+        import pandas as pd
+
+        results = {}
+        # Token source: scanner attribute if it carries one, else the shared
+        # Upstox token file (the scanner's own .access_token is typically None,
+        # the live token lives in the adapter / token store).
+        token = getattr(self._scanner, "access_token", None)
+        if not token:
+            try:
+                from upstox_token_manager import load_upstox_token
+                token = load_upstox_token()
+            except Exception:
+                logger.exception("Bulk OHLC: no Upstox token available")
+                return results
+
+        batch_size = 500
+        interval_map = {5: "5minute", 15: "15minute", 1: "1minute"}
+        interval_str = interval_map.get(interval_min, f"{interval_min}minute")
+
+        for i in range(0, len(targets), batch_size):
+            batch = targets[i:i + batch_size]
+            keys = ",".join(instr for instr, _ in batch)
+            url = "https://api.upstox.com/v2/market-quote/ohlc"
+            try:
+                resp = requests.get(
+                    url,
+                    params={"instrument_key": keys, "interval": interval_str},
+                    headers={"Authorization": f"Bearer {token}",
+                             "Accept": "application/json"},
+                    timeout=10,
+                )
+            except Exception:
+                logger.exception("Bulk OHLC request error")
+                continue
+            if resp.status_code != 200:
+                logger.warning("Bulk OHLC failed: %s", resp.text)
+                continue
+            data = resp.json().get("data", {})
+            for key, quote in data.items():
+                # Convert the OHLC snapshot to a single-row DataFrame matching
+                # the existing candle DataFrame format.
+                ohlc = quote.get("ohlc", {})
+                df = pd.DataFrame([{
+                    "open":   ohlc.get("open"),
+                    "high":   ohlc.get("high"),
+                    "low":    ohlc.get("low"),
+                    "close":  ohlc.get("close"),
+                    "volume": quote.get("volume", 0),
+                    "ltp":    quote.get("last_price"),
+                }])
+                # API returns keys like "NSE_EQ:SYMBOL"; normalize to the
+                # subscription "NSE_EQ|SYMBOL" format.
+                results[key.replace(":", "|")] = df
+        return results
 
     # ---- subscription API -------------------------------------------------
     def subscribe(self, instrument, who, interval, segment):

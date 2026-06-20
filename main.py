@@ -27,6 +27,7 @@ import paper_trader
 from order_manager import OrderManager
 from trade_suggester import TradeSuggester
 from cycle_gate import CycleGate
+from data_provider import DataProvider
 
 
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Kolkata")
@@ -87,6 +88,7 @@ class StrategySchedulerApp:
         self._suggester = None
         self._cycle_gate = None
         self._lot_fn = None
+        self._data_provider = None
 
     # --- lazy singletons ----------------------------------------------------
     def scanner(self):
@@ -108,6 +110,14 @@ class StrategySchedulerApp:
         if self._cycle_gate is None:
             self._cycle_gate = CycleGate()
         return self._cycle_gate
+
+    def data_provider(self):
+        if self._data_provider is None:
+            self._data_provider = DataProvider(self.scanner())
+            # Start the 5m/15m background pollers so subscribed instruments are
+            # fetched in bulk once per boundary instead of one-by-one on demand.
+            self._data_provider.start()
+        return self._data_provider
 
     def lot_fn(self):
         if self._lot_fn is None:
@@ -212,6 +222,9 @@ class StrategySchedulerApp:
     def run(self, run_now=False, exit_after_run=False):
         """Start the scheduler loop, with optional immediate execution."""
         self.setup_schedule()
+        # Instantiate the DataProvider and start its candle pollers up front so
+        # they are running for the whole session.
+        self.data_provider()
         logger.info("Strategy scheduler started")
         logger.info("Scheduler timezone: %s", APP_TIMEZONE)
         logger.info("Current local time: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))

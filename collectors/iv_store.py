@@ -1,3 +1,5 @@
+# SOLE WRITER: collectors/iv_collector_service.py
+# All other modules READ ONLY from this database.
 """
 Shared IV snapshot storage layer.
 

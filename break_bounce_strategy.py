@@ -145,6 +145,9 @@ class BreakBounceScanner:
         try:
             from data_provider import DataProvider
             self._provider = DataProvider(scanner)
+            # Start the 5m/15m pollers so subscribed instruments are fetched
+            # fetch-once per boundary instead of one-by-one on each read.
+            self._provider.start()
         except Exception:
             self._provider = None
 
@@ -954,6 +957,13 @@ class BreakBounceStrategyRunner:
                         # Fix 4: record the confirmation time so the retest expiry
                         # check below can void setups that linger too long.
                         state["breakout_confirmed_at"] = datetime.now(IST)
+                        # DataProvider: this stock now needs 5-min retest candles
+                        # rather than 15-min breakout candles — move it between
+                        # pollers so the retest scan reads from cache.
+                        if self._provider is not None:
+                            self._provider.move(candle_sec_id, who="bb",
+                                                from_interval=15, to_interval=5,
+                                                segment=seg)
                         logger.info(
                             "B&B BREAKOUT CONFIRMED: %s %s level=%.2f close=%.2f",
                             symbol, direction, state["breakout_level"],
@@ -990,6 +1000,9 @@ class BreakBounceStrategyRunner:
                     _elapsed_min = (datetime.now(IST) - _confirmed_at).total_seconds() / 60
                     if _elapsed_min > _expiry_mins:
                         state["setup_voided"] = True
+                        # Setup cancelled — release the 5-min retest subscription.
+                        if self._provider is not None:
+                            self._provider.unsubscribe(candle_sec_id, who="bb", interval=5)
                         logger.info(
                             "B&B %s: retest monitoring expired after %.0f min "
                             "(limit=%d min) — voiding setup",
@@ -1144,6 +1157,9 @@ class BreakBounceStrategyRunner:
                     "sl_order_id":        sl_order_id,
                 })
                 state["trade_placed"] = True
+                # Trade placed — release the 5-min retest subscription.
+                if self._provider is not None:
+                    self._provider.unsubscribe(candle_sec_id, who="bb", interval=5)
                 signals_placed.append(trade)
                 logger.info("B&B trade logged: %s %s %s lots=%d",
                             symbol, side, strike_data.get("strike"), lots)

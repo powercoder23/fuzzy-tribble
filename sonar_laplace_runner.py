@@ -41,7 +41,13 @@ WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday"]
 
 def run_sonar_scan():
     iv_store.init_db()
-    scanner = SonarScanner()
+    # Sonar now reads 5-min candles from the shared DataProvider instead of the
+    # iv_history spot snapshots. Pollers are not started here (start_pollers=False)
+    # — reads fall back to a direct fetch per name through the provider.
+    from discount import DiscountedPremiumScanner
+    from data_provider import DataProvider
+    provider = DataProvider(DiscountedPremiumScanner(), start_pollers=False)
+    scanner = SonarScanner(data_provider=provider)
     logger.info("Sonar-Laplace scan starting")
     df = scanner.scan()
     if not df.empty:

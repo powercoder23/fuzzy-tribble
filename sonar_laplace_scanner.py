@@ -12,7 +12,8 @@ derive a smoothed midline + adaptive bands. From those it reads:
     reversal   : price was beyond a band and crossed back toward the mean
 
 Design rules (same isolation philosophy as the other screeners)
-* Reads ONLY iv_history.db (the intraday spot series). ZERO broker calls.
+* Reads 5-min CLOSE candles from the shared DataProvider (cache-first, falling
+  back to a direct fetch on a miss) instead of the iv_history spot snapshots.
 * Pure, side-effect-free math (super_smoother / bands / classify) — unit-testable.
 * Fail-open: a name with too few points is skipped, never crashes the scan.
 
@@ -36,6 +37,7 @@ import pandas as pd
 from collectors import iv_store
 import notifications
 import sonar_laplace_config as cfg
+from data_provider import DataProvider
 
 logger = logging.getLogger(__name__)
 CE, PE = "CE", "PE"
@@ -121,29 +123,31 @@ def classify(prev_price, last_price, upper, lower, slope_p, min_slope) -> dict:
 # Scanner
 # --------------------------------------------------------------------------- #
 class SonarScanner:
-    def __init__(self, db_path: str | None = None):
+    def __init__(self, db_path: str | None = None, data_provider=None):
         self.db_path = db_path or iv_store.DB_PATH
+        self._provider = data_provider  # injected from runner
 
     def _connect(self):
         return sqlite3.connect(self.db_path)
 
     def _series_map(self) -> dict:
-        """{security_id: (symbol, [spot,...])} from today's intraday snapshots."""
-        with self._connect() as conn:
-            df = pd.read_sql(
-                """
-                SELECT security_id, symbol, timestamp, spot_price
-                FROM   iv_history
-                WHERE  data_type = 'intraday'
-                  AND  spot_price > 0
-                  AND  substr(timestamp,1,10) = (SELECT substr(MAX(timestamp),1,10) FROM iv_history)
-                ORDER  BY security_id, timestamp
-                """,
-                conn,
-            )
+        """{security_id: (symbol, [close,...])} from the DataProvider 5-min cache."""
+        if self._provider is None:
+            return {}
         out = {}
-        for sid, g in df.groupby("security_id"):
-            out[str(sid)] = (g["symbol"].iloc[-1], g["spot_price"].astype(float).tolist())
+        from f_o_stocks_list import get_stock_futures
+        from load_scrip_master_sqlite import get_security_id_symbol_map
+        # {sec_id: symbol} for the current F&O futures universe.
+        symbol_map = get_security_id_symbol_map(get_stock_futures())
+        for sec_id, symbol in symbol_map.items():
+            df = self._provider.intraday_candles(
+                str(sec_id), "NSE_FO", interval=5
+            )
+            if df is None or df.empty or "close" not in df.columns:
+                continue
+            closes = df["close"].dropna().astype(float).tolist()
+            if len(closes) >= cfg.MIN_POINTS:
+                out[str(sec_id)] = (symbol, closes)
         return out
 
     def scan(self) -> pd.DataFrame:
