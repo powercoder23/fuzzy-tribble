@@ -200,4 +200,61 @@ class StrategySchedulerApp:
             for run_time in MONITOR_TIMES:
                 getattr(schedule.every(), day).at(run_time).do(self.run_monitor_cycle)
             getattr(schedule.every(), day).at(INTRADAY["square_off"]).do(self.run_square_off)
-            getattr(schedule.every(), day).at(INTRADAY["eod_summary_at"])
+            getattr(schedule.every(), day).at(INTRADAY["eod_summary_at"]).do(self.run_eod_summary)
+        logger.info(
+            "Scheduled discount scan %s..15:15 every %smin | OrderManager track every %smin "
+            "until %s | square-off %s | EOD %s",
+            INTRADAY["session_start"], INTRADAY["scan_interval_min"],
+            INTRADAY.get("monitor_interval_min", 5), INTRADAY.get("monitor_until", "15:20"),
+            INTRADAY["square_off"], INTRADAY["eod_summary_at"],
+        )
+
+    def run(self, run_now=False, exit_after_run=False):
+        """Start the scheduler loop, with optional immediate execution."""
+        self.setup_schedule()
+        logger.info("Strategy scheduler started")
+        logger.info("Scheduler timezone: %s", APP_TIMEZONE)
+        logger.info("Current local time: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        if schedule.jobs:
+            next_run = min(job.next_run for job in schedule.jobs if job.next_run is not None)
+            logger.info("Next scheduled run: %s", next_run.strftime("%Y-%m-%d %H:%M:%S"))
+
+        if run_now:
+            logger.info("Immediate run requested")
+            self.run_monitor_cycle()   # manage any open positions first
+            self.run_scan_cycle()      # then look for + book new trades
+            if exit_after_run:
+                logger.info("Exiting after immediate run")
+                return
+
+        while True:
+            schedule.run_pending()
+            time.sleep(20)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Strategy scheduler")
+    parser.add_argument(
+        "--run-now",
+        action="store_true",
+        help="Run one discount cycle immediately before entering the scheduler loop",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one discount cycle immediately and exit without waiting for the next schedule",
+    )
+    parser.add_argument(
+        "--auto-loop",
+        action="store_true",
+        help="No-op; the scheduler loop is the default. Kept so the Dockerfile "
+             "default CMD (python main.py --auto-loop) runs without error.",
+    )
+    args = parser.parse_args()
+
+    app = StrategySchedulerApp()
+    app.run(run_now=args.run_now or args.once, exit_after_run=args.once)
+
+
+if __name__ == "__main__":
+    main()

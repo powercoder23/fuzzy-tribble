@@ -266,4 +266,7 @@ class TradeSuggester:
                 f"| {r['n_agree']}✓/{r['n_disagree']}✗ [{r['agree']}] IV {r['iv_zone']}"
             )
         lines.append("\nℹ️ Discount supplies the contract; scanners rank conviction. Confirm entry.")
-        if notifications.notify("\n".join(l
+        if notifications.notify("\n".join(lines), parse_mode=None):
+            logger.info("trade-suggester: alert sent")
+        else:
+            logger.info("trade-suggester: alert skipped; no channel configured")

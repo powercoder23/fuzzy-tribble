@@ -223,3 +223,24 @@ services:
     depends_on:
       - iv-collector
     command: python composite_runner.py
+
+  # Sonar-Laplace scanner — smoothed dynamic S/R (Ehlers SuperSmoother / Laplace
+  # filter) over the intraday spot series -> trend, reversals, breakouts.
+  # Reads iv_history.db only. Zero broker calls. Intraday.
+  # To run manually: docker-compose --profile sonar up sonar
+  sonar:
+    build:
+      context: .
+      dockerfile: Dockerfile.scanner
+    container_name: sonar-scanner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - shared-data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python sonar_laplace_runner.py

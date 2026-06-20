@@ -369,4 +369,22 @@ def _safe(module, fnname, key):
 # Consumer helper — any strategy can gate on the latest composite conviction.
 # --------------------------------------------------------------------------- #
 def get_latest_composite(security_id: str, db_path: str | None = None) -> dict:
-    path = db_path or iv_store.DB_
+    path = db_path or iv_store.DB_PATH
+    try:
+        with sqlite3.connect(path) as conn:
+            cur = conn.execute(
+                f"""SELECT direction, score, grade, n_factors, contributing,
+                           iv_zone, vix_regime, timestamp
+                    FROM {cfg.PERSIST_TABLE}
+                    WHERE security_id = ?
+                    ORDER BY timestamp DESC LIMIT 1""",
+                (str(security_id),),
+            )
+            row = cur.fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    if not row:
+        return {}
+    keys = ["direction", "score", "grade", "n_factors", "contributing",
+            "iv_zone", "vix_regime", "timestamp"]
+    return dict(zip(keys, row))

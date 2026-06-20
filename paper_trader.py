@@ -485,4 +485,42 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
 
 
 def monitor(book, scanner, now=None, bot_token=None, chat_id=None, square_off=False):
-    """Re-price every open paper trade and advance its
+    """Re-price every open paper trade and advance its exit state machine."""
+    now = now or datetime.now()
+    date = now.date().isoformat()
+    closed = []
+    for trade in book.open_trades(date):
+        quote = None
+        try:
+            quote = scanner.get_current_option_premium(
+                trade["security_id"], trade["exchange_segment"],
+                trade["expiry"], trade["strike"], trade["side"],
+            )
+        except Exception:
+            logger.exception("Re-price failed for trade %s", trade.get("id"))
+        if not quote or quote.get("last") in (None, 0):
+            # No usable price; only act if we must square off (use last known).
+            if not square_off:
+                continue
+            last_price = trade.get("last_price") or trade["entry"]
+        else:
+            last_price = quote.get("last") or quote.get("mid") or trade["entry"]
+
+        events = apply_tick(trade, last_price, square_off=square_off)
+        # Alerts are entry-only + EOD (see below) to cut noise — no per-fill pings.
+        # Fills are still persisted; the EOD summary reports each exit with reasons.
+        book.save_runtime(trade, now)
+        if events and trade.get("status") == "closed":
+            closed.append(trade)
+    return closed
+
+
+def run_eod(book, scanner=None, now=None, bot_token=None, chat_id=None):
+    """Force square-off any still-open trades, then send the EOD summary."""
+    now = now or datetime.now()
+    date = now.date().isoformat()
+    if scanner is not None:
+        monitor(book, scanner, now=now, bot_token=bot_token, chat_id=chat_id, square_off=True)
+    summary = format_eod_summary(book.all_trades(date), date)
+    send_telegram(summary, bot_token, chat_id)
+    return summary

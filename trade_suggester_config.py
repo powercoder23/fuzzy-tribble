@@ -41,4 +41,9 @@ VIX_LOW_BOOST    = float(os.getenv("TS_VIX_BOOST", "0.05"))
 TOP_N_ALERT   = int(os.getenv("TS_TOP_N", "8"))
 OUTPUT_CSV    = "data/trade_suggestions.csv"
 # Alerts are entry-only by design (the paper-trade entry alert is the signal).
-# The suggester still writes its ranked CSV every cycle; set 
+# The suggester still writes its ranked CSV every cycle; set TS_ALERT=true to
+# also push the ranked list to Telegram.
+ALERT         = os.getenv("TS_ALERT", "false").strip().lower() == "true"
+
+# Confidence tags by number of agreeing directional scanners.
+HIGH_CONF_AGREE = int(os.getenv("TS_HIGH_AGREE", "3"))   # >=3 agree -> HIGH

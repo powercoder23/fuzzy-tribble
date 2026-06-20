@@ -55,4 +55,85 @@ def place_bracket_order(dhan, strike_data: dict, lots: int, lot_size: int,
         sl_response = dhan.place_order(
             security_id=option_sec_id, exchange_segment=dhan.NSE_FNO,
             transaction_type=dhan.SELL, quantity=qty,
-            order_type=dhan.SL_M, product_type=dhan.INTRA,
+            order_type=dhan.SL_M, product_type=dhan.INTRA, price=0,
+            trigger_price=sl_price,
+        )
+        if sl_response.get("status") != "success":
+            logger.error("%sSL order failed — placing emergency market sell: %s", label, sl_response)
+            dhan.place_order(
+                security_id=option_sec_id, exchange_segment=dhan.NSE_FNO,
+                transaction_type=dhan.SELL, quantity=qty,
+                order_type=dhan.MARKET, product_type=dhan.INTRA, price=0,
+            )
+            if notify:
+                try:
+                    notify(f"⚠️ {label}SL order failed for {strike_data.get('side')} "
+                           f"{strike_data.get('strike')} — emergency exit placed")
+                except Exception:
+                    logger.exception("notify failed")
+            return {"status": "sl_failed_emergency_exit"}
+
+        return {
+            "status": "ok",
+            "buy_order_id": response.get("orderId", ""),
+            "sl_order_id": sl_response.get("orderId", ""),
+        }
+    except Exception:
+        logger.exception("%splace_bracket_order exception", label)
+        return {"status": "exception"}
+
+
+class OrderManager:
+    """Owns the trade book and the open-position lifecycle (paper backend)."""
+
+    def __init__(self, book: "paper_trader.PaperTradeBook | None" = None):
+        self.book = book or paper_trader.PaperTradeBook()
+
+    # ---- intake: a scanner hands booked signals to the manager ------------- #
+    def submit_signals(self, opportunities, now=None, lot_size_fn=None):
+        """Book the top qualifying signals (caps / dedup / cutoff enforced by
+        paper_trader.process_signals). Applies the composite entry gate first
+        (no-op unless GATE_MODE=hard). Returns the list of opened signals."""
+        opportunities = self._apply_entry_gate(opportunities)
+        opened = paper_trader.process_signals(
+            self.book, opportunities, now=now, lot_size_fn=lot_size_fn
+        )
+        if opened:
+            logger.info("OrderManager: accepted %d new position(s)", len(opened))
+        return opened
+
+    @staticmethod
+    def _apply_entry_gate(opportunities):
+        """In GATE_MODE=hard, drop candidates the composite gate rejects.
+        off/soft -> unchanged (fail-open). Safe with DataFrame, list, or None."""
+        try:
+            import entry_gate, entry_gate_config
+            if entry_gate_config.GATE_MODE != "hard" or opportunities is None:
+                return opportunities
+            rows = opportunities.to_dict("records") if hasattr(opportunities, "to_dict") else list(opportunities)
+            kept = [r for r in rows
+                    if entry_gate.passes(r.get("security_id"), r.get("type") or r.get("side"))]
+            dropped = len(rows) - len(kept)
+            if dropped:
+                logger.info("OrderManager: entry gate dropped %d candidate(s)", dropped)
+            return kept
+        except Exception:
+            logger.exception("entry gate failed; passing candidates through")
+            return opportunities
+
+    # ---- lifecycle: manager re-prices + exits ALL open positions ----------- #
+    def track(self, scanner, now=None, square_off=False):
+        """Re-price every open position and advance its exit state machine.
+        Called on the OrderManager's own (faster) cadence."""
+        closed = paper_trader.monitor(self.book, scanner, now=now, square_off=square_off)
+        if closed:
+            logger.info("OrderManager: closed %d position(s) this tick", len(closed))
+        return closed
+
+    def square_off_all(self, scanner, now=None):
+        """Force-close all remaining open positions (square-off time)."""
+        return paper_trader.monitor(self.book, scanner, now=now, square_off=True)
+
+    def eod(self, scanner=None, now=None):
+        """Square off stragglers and send the realized-P&L summary."""
+        return paper_trader.run_eod(self.book, scanner, now=now)

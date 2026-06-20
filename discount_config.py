@@ -153,4 +153,9 @@ CACHE_DAILY_CANDLES = True          # fetch daily candles once per day per stock
 # many option-chain requests in the trailing 30 min (leaves room for iv-collector).
 CHAIN_CALLS_30MIN_BUDGET = 1500
 
-# --- "Strong liquidity" 
+# --- "Strong liquidity" annotation thresholds ---------------------------
+# Cosmetic only: drives the human-readable reason text on an alert.
+STRONG_LIQUIDITY = {
+    "oi": 10000,
+    "volume": 1000,
+}
