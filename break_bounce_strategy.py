@@ -680,6 +680,9 @@ class BreakBounceStrategyRunner:
         self._journal      = MomentumTradeJournal(filepath=TRADE_LOG_PATH)
         # OI Validation Layer (lazy; only built when OI_VALIDATION_ENABLED).
         self._oi_validator = None
+        # DataProvider for bulk candle cache (5m/15m). Initialised in
+        # _ensure_components(); default None so attribute always exists.
+        self._provider = None
         # {security_id: {symbol, breakout_direction, breakout_level, trade_placed, setup_voided}}
         self._stock_states: dict = {}
         # {security_id: {yesterday_high, yesterday_low, date, symbol, segment}}
@@ -697,6 +700,16 @@ class BreakBounceStrategyRunner:
             self._scanner_obj.telegram_bot_token,
             self._scanner_obj.telegram_chat_id,
         )
+        try:
+            from data_provider import DataProvider
+            self._provider = DataProvider(self._scanner_obj)
+            self._provider.start()
+            logger.info("BreakBounceStrategyRunner: DataProvider started")
+        except Exception as exc:
+            logger.warning(
+                "DataProvider unavailable for Runner — falling back to direct fetch: %s", exc
+            )
+            self._provider = None
         logger.info("BreakBounceStrategyRunner components initialised")
 
     def _exchange_segment(self, symbol: str) -> str:
