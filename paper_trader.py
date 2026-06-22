@@ -464,6 +464,17 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
     rows = [r for r in rows if r.get("strategy") == VOLATILITY_STRATEGY]
     rows.sort(key=lambda r: (r.get("score") or 0), reverse=True)
 
+    # Sonar-Laplace direction gate:
+    # FLAT        -> skip (whipsaw / no trend)
+    # BREAKOUT_UP / REVERSAL_UP   -> force CALL
+    # BREAKDOWN   / REVERSAL_DOWN -> force PUT
+    # SOFT_BULL / SOFT_BEAR / no data -> keep scanner original side
+    try:
+        from sonar_laplace_scanner import get_latest_sonar
+        _sonar_available = True
+    except Exception:
+        _sonar_available = False
+
     cap = INTRADAY["max_signals_per_day"]
     opened = []
     for row in rows:
@@ -472,10 +483,27 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
         symbol, strike, side = row.get("symbol"), row.get("strike"), row.get("type")
         if symbol is None or strike is None or side is None:
             continue
+
+        # Sonar gate
+        if _sonar_available:
+            sec_id = str(row.get("security_id") or "")
+            sonar  = get_latest_sonar(sec_id) if sec_id else {}
+            signal = sonar.get("signal", "")
+            bias   = sonar.get("bias", "")
+            if signal == "FLAT":
+                logger.info("Sonar FLAT — skipping %s", symbol)
+                continue
+            if signal in ("BREAKOUT_UP", "REVERSAL_UP") and bias == "CE":
+                side = "CALL"
+            elif signal in ("BREAKDOWN", "REVERSAL_DOWN") and bias == "PE":
+                side = "PUT"
+
         if book.has_trade_today(date, symbol, strike, side):
             continue
         if not row.get("entry") or not row.get("t1"):
             continue
+        row = dict(row)
+        row["type"] = side
         sig = signal_from_row(row, lot_size_fn)
         book.open_trade(sig, now)
         send_telegram(format_signal_alert(sig), bot_token, chat_id)

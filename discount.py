@@ -2042,21 +2042,32 @@ class DiscountedPremiumScanner:
         )
         return "volatility" if is_volatility_trade else None
 
-    def select_top_trades(self, opportunities, limit=500, max_per_direction=260):
-        """Pick the highest-conviction trades with a per-direction cap."""
+    def select_top_trades(self, opportunities, limit=500, max_per_direction=260,
+                          max_per_symbol=1):
+        """Pick the highest-conviction trades with per-direction and per-symbol caps.
+
+        max_per_symbol=1 (default) ensures the scanner emits at most one option
+        per underlying — the highest-scoring strike/side — so paper_trader never
+        opens multiple legs on the same stock in one session.
+        """
         if isinstance(opportunities, pd.DataFrame):
             rows = opportunities.sort_values("score", ascending=False).to_dict("records")
         else:
             rows = sorted(opportunities, key=lambda item: item["score"], reverse=True)
 
         selected = []
-        direction_counts = {}
+        direction_counts: dict = {}
+        symbol_counts: dict = {}
         for row in rows:
+            symbol = row.get("symbol")
             direction = row.get("type")
+            if symbol_counts.get(symbol, 0) >= max_per_symbol:
+                continue
             if direction_counts.get(direction, 0) >= max_per_direction:
                 continue
             selected.append(row)
             direction_counts[direction] = direction_counts.get(direction, 0) + 1
+            symbol_counts[symbol] = symbol_counts.get(symbol, 0) + 1
             if len(selected) >= limit:
                 break
         return selected
