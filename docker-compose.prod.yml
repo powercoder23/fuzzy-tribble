@@ -205,3 +205,43 @@ services:
     depends_on:
       - iv-collector
     command: python smart_money_runner.py
+
+  # Sonar-Laplace — Ehlers SuperSmoother trend/reversal/breakout signals.
+  # Reads 5-min candles via DataProvider. Zero broker calls. Intraday.
+  sonar:
+    build:
+      context: .
+      dockerfile: Dockerfile.scanner
+    container_name: sonar-scanner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python sonar_laplace_runner.py
+
+  # Composite — morning confluence + multi-scanner signal aggregator.
+  # Fuses gap, OI buildup, IV rank into A+ morning option-buy picks.
+  composite:
+    build:
+      context: .
+      dockerfile: Dockerfile.scanner
+    container_name: composite-scanner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python composite_runner.py
