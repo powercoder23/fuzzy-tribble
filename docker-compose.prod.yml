@@ -207,11 +207,14 @@ services:
     command: python smart_money_runner.py
 
   # Sonar-Laplace — Ehlers SuperSmoother trend/reversal/breakout signals.
-  # Reads 5-min candles via DataProvider. Zero broker calls. Intraday.
+  # Reads 5-min candles via DataProvider (broker fetch per name). Intraday.
   sonar:
     build:
       context: .
-      dockerfile: Dockerfile.scanner
+      # Full image: sonar reads candles via DataProvider -> DiscountedPremiumScanner
+      # -> upstox_adapter, so it needs the broker SDK + scipy (not in the lean
+      # scanner image). See discount.py / upstox_adapter.py imports.
+      dockerfile: Dockerfile
     container_name: sonar-scanner
     restart: unless-stopped
     env_file: .env
