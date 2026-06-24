@@ -700,16 +700,16 @@ class BreakBounceStrategyRunner:
             self._scanner_obj.telegram_bot_token,
             self._scanner_obj.telegram_chat_id,
         )
-        try:
-            from data_provider import DataProvider
-            self._provider = DataProvider(self._scanner_obj)
-            self._provider.start()
-            logger.info("BreakBounceStrategyRunner: DataProvider started")
-        except Exception as exc:
+        # Reuse the Scanner's DataProvider (already started in BreakBounceScanner.__init__).
+        # Do NOT create a second DataProvider — that spins up 4 pollers instead of 2
+        # and both caches stay empty (no subscriptions → both fall back to direct fetch).
+        self._provider = getattr(self._bb_scanner, "_provider", None)
+        if self._provider is not None:
+            logger.info("BreakBounceStrategyRunner: reusing Scanner DataProvider")
+        else:
             logger.warning(
-                "DataProvider unavailable for Runner — falling back to direct fetch: %s", exc
+                "BreakBounceStrategyRunner: Scanner DataProvider unavailable — direct fetch fallback"
             )
-            self._provider = None
         logger.info("BreakBounceStrategyRunner components initialised")
 
     def _exchange_segment(self, symbol: str) -> str:
@@ -1133,6 +1133,38 @@ class BreakBounceStrategyRunner:
                     ),
                 }
                 self._journal.log_entry(trade)
+
+                # ── Paper trade: log to paper_trades.db for P&L tracking ──────
+                try:
+                    import paper_trader as _pt
+                    _sl_amt = premium * BB_RISK["sl_pct"]
+                    _t2     = round(premium + _sl_amt * BB_RISK["target_ratio"] * 2, 1)
+                    _bb_signal = {
+                        "symbol":            symbol,
+                        "security_id":       sec_id,
+                        "exchange_segment":  exchange_segment,
+                        "side":              side,
+                        "strike":            strike_data.get("strike"),
+                        "expiry":            expiry,
+                        "entry":             premium,
+                        "sl":                sl,
+                        "t1":                target,
+                        "t2":                _t2,
+                        "lot_size":          lot_size,
+                        "score":             None,
+                        "iv":                strike_data.get("iv"),
+                        "hv":                None,
+                        "iv_rank":           None,
+                        "dte":               None,
+                    }
+                    _book = getattr(self, "_paper_book", None)
+                    if _book is None:
+                        self._paper_book = _pt.PaperTradeBook()
+                        _book = self._paper_book
+                    _book.open_trade(_bb_signal)
+                    logger.info("B&B paper trade logged: %s %s %s", symbol, side, strike_data.get("strike"))
+                except Exception as _e:
+                    logger.warning("B&B paper trade failed (non-fatal): %s", _e)
 
                 risk_data = {
                     "qty":      lots * lot_size,

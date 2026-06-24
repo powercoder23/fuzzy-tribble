@@ -502,6 +502,12 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
             continue
         if not row.get("entry") or not row.get("t1"):
             continue
+        # Min premium gate — skip cheap/illiquid far-OTM options
+        min_prem = INTRADAY.get("min_premium", 5.0)
+        if float(row.get("entry") or 0) < min_prem:
+            logger.info("Min premium filter — skipping %s %s @ ₹%.2f < ₹%.2f",
+                        symbol, side, float(row.get("entry") or 0), min_prem)
+            continue
         row = dict(row)
         row["type"] = side
         sig = signal_from_row(row, lot_size_fn)

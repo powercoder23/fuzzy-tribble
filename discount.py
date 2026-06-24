@@ -308,7 +308,7 @@ class DiscountedPremiumScanner:
                 "fno_symbols": None,
                 "fno_symbols_day": None,
                 "expiries": {},
-                "option_chain": {},
+                # "option_chain" cache removed — live chains are never cached (expired data uses expired_data_cache)
                 "metrics": {
                     "total_calls": 0,
                     "cache_hits": 0,
@@ -325,7 +325,7 @@ class DiscountedPremiumScanner:
             state["fno_symbols"] = None
             state["fno_symbols_day"] = None
             state["expiries"] = {}
-            state["option_chain"] = {}
+            # option_chain cache removed — no longer needed
             state["metrics"] = {
                 "total_calls": 0,
                 "cache_hits": 0,
@@ -575,36 +575,25 @@ class DiscountedPremiumScanner:
     
     def get_option_chain(self, underlying_security_id, underlying_segment, expiry):
         """
-        Fetch real-time option chain for a specific expiry
-        
+        Fetch real-time option chain for a specific expiry.
+
+        NO caching — option chain data is live and must be fresh on every
+        call. Caching is only appropriate for expired-option historical data
+        (handled separately via expired_data_cache / expired_options_cache_dir).
+
         Args:
             underlying_security_id: Security ID (e.g., 13 for NIFTY)
             underlying_segment: "IDX_I" for indices, "NSE_FNO" for stocks
             expiry: Expiry date in "YYYY-MM-DD" format
-        
+
         Returns:
             dict: Option chain data
         """
-        cache_key = (str(underlying_security_id), underlying_segment, expiry)
-        cache_label = f"{underlying_security_id} option chain {expiry}"
-
-        def fetcher():
+        try:
             return self.dhan.option_chain(
                 under_security_id=underlying_security_id,
                 under_exchange_segment=underlying_segment,
                 expiry=expiry,
-            )
-
-        def validator(response):
-            return isinstance(response, dict) and "data" in response
-
-        try:
-            return self.get_cached_or_fetch(
-                self.runtime_state["option_chain"],
-                cache_key,
-                fetcher,
-                cache_label,
-                validator=validator,
             )
         except Exception:
             logger.exception(
