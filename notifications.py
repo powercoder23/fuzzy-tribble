@@ -119,10 +119,14 @@ def notify(text, *, bot_token=None, chat_id=None, webhook_url=None, parse_mode="
 
     Discord fires only when Telegram fails or is not configured. Returns True if
     any channel accepted the message.
+
+    When ALERTS_DISCORD_ONLY is truthy, Telegram is skipped entirely and alerts
+    go straight to Discord.
     """
-    if send_telegram(text, bot_token=bot_token, chat_id=chat_id, parse_mode=parse_mode):
+    discord_only = os.getenv("ALERTS_DISCORD_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
+    if not discord_only and send_telegram(text, bot_token=bot_token, chat_id=chat_id, parse_mode=parse_mode):
         return True
     if send_discord(text, webhook_url=webhook_url, convert_html=bool(parse_mode)):
-        logger.info("Alert delivered via Discord fallback")
+        logger.info("Alert delivered via Discord%s", "" if discord_only else " fallback")
         return True
     return False
