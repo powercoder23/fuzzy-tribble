@@ -618,6 +618,10 @@ class DiscountedPremiumScanner:
     def get_current_option_premium(self, security_id, exchange_segment, expiry, strike, side):
         """Re-price a single option leg for the paper-trade monitor.
 
+        IMPORTANT: Always fetches a FRESH option chain — never uses the
+        runtime cache — so that SL/T1 levels are checked against real
+        live prices, not a stale snapshot from the opening scan.
+
         Args:
             security_id: underlying security id
             exchange_segment: "IDX_I" or "NSE_FNO"
@@ -630,8 +634,19 @@ class DiscountedPremiumScanner:
         """
         side_key = "ce" if str(side).upper() in ("CALL", "CE") else "pe"
         try:
-            chain_response = self.get_option_chain(security_id, exchange_segment, expiry)
-            if chain_response.get("status") != "success":
+            # Fetch FRESH chain — bypass runtime cache so monitor always
+            # sees current LTP, not the stale opening-scan snapshot.
+            try:
+                chain_response = self.dhan.option_chain(
+                    under_security_id=security_id,
+                    under_exchange_segment=exchange_segment,
+                    expiry=expiry,
+                )
+            except Exception as _fetch_exc:
+                logger.warning("get_current_option_premium: fresh fetch failed for %s — %s", security_id, _fetch_exc)
+                return None
+            if not chain_response or chain_response.get("status") != "success":
+                logger.warning("get_current_option_premium: bad status for %s: %s", security_id, chain_response.get("status"))
                 return None
             chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
             spot = chain_data.get("last_price")
