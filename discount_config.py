@@ -131,8 +131,8 @@ INTRADAY = {
     "square_off": "15:20",        # force-close any open paper trade
     "monitor_until": "15:20",     # keep re-pricing open trades until square-off
     "eod_summary_at": "15:25",    # send realized-P&L summary
-    "max_signals_per_day": 5,     # reduced from 15 → max 5 paper trades per day (per-symbol cap)
-    "min_premium": 5.0,           # skip options trading below ₹5 (illiquid/far-OTM junk)
+    "max_signals_per_day": 5,     # max 5 paper trades per day (per-symbol cap)
+    "min_premium": 5.0,           # skip options trading below ₹5 (far-OTM junk)
 }
 
 # --- Universe (DISCOUNT SCANNER ONLY) -----------------------------------

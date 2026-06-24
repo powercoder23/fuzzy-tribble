@@ -308,7 +308,7 @@ class DiscountedPremiumScanner:
                 "fno_symbols": None,
                 "fno_symbols_day": None,
                 "expiries": {},
-                "option_chain": {},
+                # "option_chain" cache removed — live chains are never cached (expired data uses expired_data_cache)
                 "metrics": {
                     "total_calls": 0,
                     "cache_hits": 0,
@@ -325,7 +325,7 @@ class DiscountedPremiumScanner:
             state["fno_symbols"] = None
             state["fno_symbols_day"] = None
             state["expiries"] = {}
-            state["option_chain"] = {}
+            # option_chain cache removed — no longer needed
             state["metrics"] = {
                 "total_calls": 0,
                 "cache_hits": 0,
@@ -575,36 +575,25 @@ class DiscountedPremiumScanner:
     
     def get_option_chain(self, underlying_security_id, underlying_segment, expiry):
         """
-        Fetch real-time option chain for a specific expiry
-        
+        Fetch real-time option chain for a specific expiry.
+
+        NO caching — option chain data is live and must be fresh on every
+        call. Caching is only appropriate for expired-option historical data
+        (handled separately via expired_data_cache / expired_options_cache_dir).
+
         Args:
             underlying_security_id: Security ID (e.g., 13 for NIFTY)
             underlying_segment: "IDX_I" for indices, "NSE_FNO" for stocks
             expiry: Expiry date in "YYYY-MM-DD" format
-        
+
         Returns:
             dict: Option chain data
         """
-        cache_key = (str(underlying_security_id), underlying_segment, expiry)
-        cache_label = f"{underlying_security_id} option chain {expiry}"
-
-        def fetcher():
+        try:
             return self.dhan.option_chain(
                 under_security_id=underlying_security_id,
                 under_exchange_segment=underlying_segment,
                 expiry=expiry,
-            )
-
-        def validator(response):
-            return isinstance(response, dict) and "data" in response
-
-        try:
-            return self.get_cached_or_fetch(
-                self.runtime_state["option_chain"],
-                cache_key,
-                fetcher,
-                cache_label,
-                validator=validator,
             )
         except Exception:
             logger.exception(
@@ -618,10 +607,6 @@ class DiscountedPremiumScanner:
     def get_current_option_premium(self, security_id, exchange_segment, expiry, strike, side):
         """Re-price a single option leg for the paper-trade monitor.
 
-        IMPORTANT: Always fetches a FRESH option chain — never uses the
-        runtime cache — so that SL/T1 levels are checked against real
-        live prices, not a stale snapshot from the opening scan.
-
         Args:
             security_id: underlying security id
             exchange_segment: "IDX_I" or "NSE_FNO"
@@ -634,19 +619,8 @@ class DiscountedPremiumScanner:
         """
         side_key = "ce" if str(side).upper() in ("CALL", "CE") else "pe"
         try:
-            # Fetch FRESH chain — bypass runtime cache so monitor always
-            # sees current LTP, not the stale opening-scan snapshot.
-            try:
-                chain_response = self.dhan.option_chain(
-                    under_security_id=security_id,
-                    under_exchange_segment=exchange_segment,
-                    expiry=expiry,
-                )
-            except Exception as _fetch_exc:
-                logger.warning("get_current_option_premium: fresh fetch failed for %s — %s", security_id, _fetch_exc)
-                return None
-            if not chain_response or chain_response.get("status") != "success":
-                logger.warning("get_current_option_premium: bad status for %s: %s", security_id, chain_response.get("status"))
+            chain_response = self.get_option_chain(security_id, exchange_segment, expiry)
+            if chain_response.get("status") != "success":
                 return None
             chain_data = unwrap_dhan_payload(chain_response.get("data") or {})
             spot = chain_data.get("last_price")
