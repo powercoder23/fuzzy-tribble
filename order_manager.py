@@ -89,6 +89,8 @@ class OrderManager:
 
     def __init__(self, book: "paper_trader.PaperTradeBook | None" = None):
         self.book = book or paper_trader.PaperTradeBook()
+        self._warned: set = set()          # (trade_id, risk_type) — dedup intraday alerts
+        self._warned_date: str | None = None
 
     # ---- intake: a scanner hands booked signals to the manager ------------- #
     def submit_signals(self, opportunities, now=None, lot_size_fn=None):
@@ -198,7 +200,111 @@ class OrderManager:
         closed = paper_trader.monitor(self.book, scanner, now=now, square_off=square_off)
         if closed:
             logger.info("OrderManager: closed %d position(s) this tick", len(closed))
+        # Risk alerts on surviving open positions (OI contradiction + Sonar reversal).
+        if not square_off:
+            today = (now or datetime.now()).date().isoformat()
+            self._check_position_risks(self.book.open_trades(today))
         return closed
+
+    def _check_position_risks(self, open_trades: list) -> None:
+        """
+        Check each open position for OI contradiction and Sonar reversal.
+
+        Fires a Telegram warning the FIRST time each risk is detected per trade.
+        Deduplicates within the trading day via self._warned so the same risk
+        does not spam on every 5-min tick.
+
+        Signals checked (zero broker calls — reads iv_history.db only):
+          • OI buildup contradiction: position is CE but OI building PE (or vice-versa)
+          • Sonar reversal: Sonar shows BREAKDOWN/REVERSAL_DOWN on a CE position
+            or BREAKOUT_UP/REVERSAL_UP on a PE position
+        """
+        if not open_trades:
+            return
+
+        today = datetime.now().date().isoformat()
+        if self._warned_date != today:
+            self._warned = set()
+            self._warned_date = today
+
+        try:
+            import sqlite3
+            import notifications
+            from collectors import iv_store
+
+            for trade in open_trades:
+                tid    = trade.get("id")
+                symbol = trade.get("symbol", "")
+                side   = "CE" if str(trade.get("side", "")).upper() in ("CE", "CALL") else "PE"
+                sec_id = str(trade.get("security_id") or "")
+                entry  = float(trade.get("entry") or 0)
+                last   = float(trade.get("last_price") or entry)
+                strike = trade.get("strike", 0)
+                risk_lines = []
+
+                # ── OI contradiction ─────────────────────────────────────── #
+                try:
+                    with sqlite3.connect(iv_store.DB_PATH) as conn:
+                        row = conn.execute(
+                            """SELECT bias, classification, price_chg_pct, oi_chg_pct
+                               FROM oi_buildup_history
+                               WHERE symbol = ?
+                                 AND date(timestamp) = date('now', 'localtime')
+                                 AND bias NOT IN ('-', 'FLAT', '')
+                               ORDER BY timestamp DESC LIMIT 1""",
+                            (symbol,),
+                        ).fetchone()
+                    if row:
+                        oi_bias, oi_class, px_chg, oi_chg = row
+                        if oi_bias and oi_bias != side:
+                            key = (tid, f"oi_{oi_bias}")
+                            if key not in self._warned:
+                                self._warned.add(key)
+                                risk_lines.append(
+                                    f"📊 OI {oi_class} (px {px_chg:+.1f}% | OI {oi_chg:+.1f}%)"
+                                    f" → {oi_bias} bias vs your {side}"
+                                )
+                except Exception:
+                    logger.debug("OI risk check failed for %s", symbol)
+
+                # ── Sonar reversal ───────────────────────────────────────── #
+                try:
+                    from sonar_laplace_scanner import get_latest_sonar
+                    sonar    = get_latest_sonar(sec_id) if sec_id else {}
+                    s_bias   = sonar.get("bias")
+                    s_signal = sonar.get("signal", "")
+                    bearish  = {"BREAKDOWN", "REVERSAL_DOWN"}
+                    bullish  = {"BREAKOUT_UP", "REVERSAL_UP"}
+                    contra   = (side == "CE" and s_signal in bearish) or                                (side == "PE" and s_signal in bullish)
+                    if s_bias and contra:
+                        key = (tid, f"sonar_{s_signal}")
+                        if key not in self._warned:
+                            self._warned.add(key)
+                            risk_lines.append(
+                                f"📡 Sonar {s_signal} → {s_bias}"
+                                f" | last {sonar.get('last', 0):.1f}"
+                                f" (S {sonar.get('support', 0)} / R {sonar.get('resistance', 0)})"
+                            )
+                except Exception:
+                    logger.debug("Sonar risk check failed for %s", symbol)
+
+                if risk_lines:
+                    pnl_pct  = ((last - entry) / entry * 100) if entry else 0
+                    pnl_sign = "+" if pnl_pct >= 0 else ""
+                    msg = (
+                        f"🚨 <b>POSITION RISK</b> • <b>{symbol}</b> {side} {int(strike)}\n"
+                        + "\n".join(risk_lines)
+                        + f"\nEntry ₹{entry:.2f} | Now ₹{last:.2f}"
+                        f" ({pnl_sign}{pnl_pct:.1f}%) — consider early exit"
+                    )
+                    notifications.notify(msg)
+                    logger.info(
+                        "Position risk alert: %s %s — %s",
+                        symbol, side, "; ".join(risk_lines),
+                    )
+
+        except Exception:
+            logger.exception("_check_position_risks failed (non-fatal)")
 
     def square_off_all(self, scanner, now=None):
         """Force-close all remaining open positions (square-off time)."""
