@@ -17,6 +17,7 @@ the same submit/track/eod surface without touching strategy code.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 import paper_trader
 
@@ -92,8 +93,10 @@ class OrderManager:
     # ---- intake: a scanner hands booked signals to the manager ------------- #
     def submit_signals(self, opportunities, now=None, lot_size_fn=None):
         """Book the top qualifying signals (caps / dedup / cutoff enforced by
-        paper_trader.process_signals). Applies the composite entry gate first
-        (no-op unless GATE_MODE=hard). Returns the list of opened signals."""
+        paper_trader.process_signals). Applies the pre-market quality gate
+        (IVR / IV-HV / OTM% / PCR / position-cap) and the composite entry
+        gate before reaching paper_trader. Returns the list of opened signals."""
+        opportunities = self._apply_pre_market_gate(opportunities, self.book)
         opportunities = self._apply_entry_gate(opportunities)
         opened = paper_trader.process_signals(
             self.book, opportunities, now=now, lot_size_fn=lot_size_fn
@@ -101,6 +104,73 @@ class OrderManager:
         if opened:
             logger.info("OrderManager: accepted %d new position(s)", len(opened))
         return opened
+
+    def _apply_pre_market_gate(self, opportunities, book=None):
+        """
+        Apply the 5-gate pre-market quality filter before booking.
+
+        Gates: IVR cap | IV/HV ratio | OTM% cap | PCR direction | position cap.
+        Mode is config-driven (PMG_GATE_MODE env var):
+          off  → always pass through unchanged
+          soft → evaluate and log failures, never block
+          hard → drop candidates that fail any gate
+
+        Fail-open: any exception passes candidates through unchanged.
+        Safe with DataFrame, list-of-dicts, or None.
+        """
+        try:
+            import pre_market_gate
+            import pre_market_gate_config as pmg_cfg
+
+            if pmg_cfg.GATE_MODE == "off" or opportunities is None:
+                return opportunities
+
+            rows = (
+                opportunities.to_dict("records")
+                if hasattr(opportunities, "to_dict")
+                else list(opportunities)
+            )
+
+            # Current open positions — gate 5 uses this as the base count.
+            today = datetime.now().date().isoformat()
+            open_count = len(book.open_trades(today)) if book else 0
+
+            kept = []
+            accepted_this_batch = 0   # running tally within this submit call
+
+            for r in rows:
+                result = pre_market_gate.evaluate(
+                    security_id   = r.get("security_id"),
+                    symbol        = r.get("symbol", ""),
+                    side          = r.get("side") or r.get("type", ""),
+                    spot          = r.get("spot"),
+                    strike        = r.get("strike"),
+                    iv            = r.get("iv"),
+                    hv            = r.get("hv"),
+                    iv_rank       = r.get("iv_rank"),
+                    open_positions= open_count + accepted_this_batch,
+                )
+                if result["allow"]:
+                    kept.append(r)
+                    accepted_this_batch += 1
+                else:
+                    logger.info(
+                        "OrderManager: pre_market_gate blocked %s %s — %s",
+                        r.get("symbol"), r.get("side") or r.get("type"),
+                        result["reason"],
+                    )
+
+            dropped = len(rows) - len(kept)
+            if dropped:
+                logger.info(
+                    "OrderManager: pre_market_gate dropped %d / %d candidate(s)",
+                    dropped, len(rows),
+                )
+            return kept
+
+        except Exception:
+            logger.exception("pre_market_gate failed; passing candidates through unchanged")
+            return opportunities
 
     @staticmethod
     def _apply_entry_gate(opportunities):
