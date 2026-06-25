@@ -294,7 +294,8 @@ class BreakBounceScanner:
             if not yh or not yl:
                 return {**no_breakout, "reason": "no_levels"}
 
-            df = (self._provider.intraday_candles(security_id, exchange_segment, interval=15)
+            df = (self._provider.intraday_candles(security_id, exchange_segment, interval=15,
+                                                   max_age=870)   # 14.5 min — expire before next 15m candle
                   if self._provider is not None
                   else self._intraday_fetcher.get_intraday_candles(
                       security_id, exchange_segment, interval_minutes=15))
@@ -376,7 +377,8 @@ class BreakBounceScanner:
             "security_id": security_id, "sl_level": 0.0, "reason": "",
         }
         try:
-            df = (self._provider.intraday_candles(security_id, exchange_segment, interval=5)
+            df = (self._provider.intraday_candles(security_id, exchange_segment, interval=5,
+                                                   max_age=270)   # 4.5 min — expire before next 5m scan
                   if self._provider is not None
                   else self._intraday_fetcher.get_intraday_candles(
                       security_id, exchange_segment, interval_minutes=5))

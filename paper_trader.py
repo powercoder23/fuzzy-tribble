@@ -541,9 +541,16 @@ def monitor(book, scanner, now=None, bot_token=None, chat_id=None, square_off=Fa
             last_price = quote.get("last") or quote.get("mid") or trade["entry"]
 
         events = apply_tick(trade, last_price, square_off=square_off)
-        # Alerts are entry-only + EOD (see below) to cut noise — no per-fill pings.
-        # Fills are still persisted; the EOD summary reports each exit with reasons.
         book.save_runtime(trade, now)
+        # Mid-session fill alerts — fire on every actionable event so the
+        # trader knows in real time when a SL/T1/T2 is hit.
+        for event in ("SL", "T1", "T2", "BE"):
+            if event in events:
+                send_telegram(
+                    format_fill_update(trade, event),
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                )
         if events and trade.get("status") == "closed":
             closed.append(trade)
     return closed

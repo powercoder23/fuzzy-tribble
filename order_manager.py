@@ -17,6 +17,7 @@ the same submit/track/eod surface without touching strategy code.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 import paper_trader
 
@@ -88,12 +89,16 @@ class OrderManager:
 
     def __init__(self, book: "paper_trader.PaperTradeBook | None" = None):
         self.book = book or paper_trader.PaperTradeBook()
+        self._warned: set = set()          # (trade_id, risk_type) — dedup intraday alerts
+        self._warned_date: str | None = None
 
     # ---- intake: a scanner hands booked signals to the manager ------------- #
     def submit_signals(self, opportunities, now=None, lot_size_fn=None):
         """Book the top qualifying signals (caps / dedup / cutoff enforced by
-        paper_trader.process_signals). Applies the composite entry gate first
-        (no-op unless GATE_MODE=hard). Returns the list of opened signals."""
+        paper_trader.process_signals). Applies the pre-market quality gate
+        (IVR / IV-HV / OTM% / PCR / position-cap) and the composite entry
+        gate before reaching paper_trader. Returns the list of opened signals."""
+        opportunities = self._apply_pre_market_gate(opportunities, self.book)
         opportunities = self._apply_entry_gate(opportunities)
         opened = paper_trader.process_signals(
             self.book, opportunities, now=now, lot_size_fn=lot_size_fn
@@ -101,6 +106,73 @@ class OrderManager:
         if opened:
             logger.info("OrderManager: accepted %d new position(s)", len(opened))
         return opened
+
+    def _apply_pre_market_gate(self, opportunities, book=None):
+        """
+        Apply the 5-gate pre-market quality filter before booking.
+
+        Gates: IVR cap | IV/HV ratio | OTM% cap | PCR direction | position cap.
+        Mode is config-driven (PMG_GATE_MODE env var):
+          off  → always pass through unchanged
+          soft → evaluate and log failures, never block
+          hard → drop candidates that fail any gate
+
+        Fail-open: any exception passes candidates through unchanged.
+        Safe with DataFrame, list-of-dicts, or None.
+        """
+        try:
+            import pre_market_gate
+            import pre_market_gate_config as pmg_cfg
+
+            if pmg_cfg.GATE_MODE == "off" or opportunities is None:
+                return opportunities
+
+            rows = (
+                opportunities.to_dict("records")
+                if hasattr(opportunities, "to_dict")
+                else list(opportunities)
+            )
+
+            # Current open positions — gate 5 uses this as the base count.
+            today = datetime.now().date().isoformat()
+            open_count = len(book.open_trades(today)) if book else 0
+
+            kept = []
+            accepted_this_batch = 0   # running tally within this submit call
+
+            for r in rows:
+                result = pre_market_gate.evaluate(
+                    security_id   = r.get("security_id"),
+                    symbol        = r.get("symbol", ""),
+                    side          = r.get("side") or r.get("type", ""),
+                    spot          = r.get("spot"),
+                    strike        = r.get("strike"),
+                    iv            = r.get("iv"),
+                    hv            = r.get("hv"),
+                    iv_rank       = r.get("iv_rank"),
+                    open_positions= open_count + accepted_this_batch,
+                )
+                if result["allow"]:
+                    kept.append(r)
+                    accepted_this_batch += 1
+                else:
+                    logger.info(
+                        "OrderManager: pre_market_gate blocked %s %s — %s",
+                        r.get("symbol"), r.get("side") or r.get("type"),
+                        result["reason"],
+                    )
+
+            dropped = len(rows) - len(kept)
+            if dropped:
+                logger.info(
+                    "OrderManager: pre_market_gate dropped %d / %d candidate(s)",
+                    dropped, len(rows),
+                )
+            return kept
+
+        except Exception:
+            logger.exception("pre_market_gate failed; passing candidates through unchanged")
+            return opportunities
 
     @staticmethod
     def _apply_entry_gate(opportunities):
@@ -128,7 +200,111 @@ class OrderManager:
         closed = paper_trader.monitor(self.book, scanner, now=now, square_off=square_off)
         if closed:
             logger.info("OrderManager: closed %d position(s) this tick", len(closed))
+        # Risk alerts on surviving open positions (OI contradiction + Sonar reversal).
+        if not square_off:
+            today = (now or datetime.now()).date().isoformat()
+            self._check_position_risks(self.book.open_trades(today))
         return closed
+
+    def _check_position_risks(self, open_trades: list) -> None:
+        """
+        Check each open position for OI contradiction and Sonar reversal.
+
+        Fires a Telegram warning the FIRST time each risk is detected per trade.
+        Deduplicates within the trading day via self._warned so the same risk
+        does not spam on every 5-min tick.
+
+        Signals checked (zero broker calls — reads iv_history.db only):
+          • OI buildup contradiction: position is CE but OI building PE (or vice-versa)
+          • Sonar reversal: Sonar shows BREAKDOWN/REVERSAL_DOWN on a CE position
+            or BREAKOUT_UP/REVERSAL_UP on a PE position
+        """
+        if not open_trades:
+            return
+
+        today = datetime.now().date().isoformat()
+        if self._warned_date != today:
+            self._warned = set()
+            self._warned_date = today
+
+        try:
+            import sqlite3
+            import notifications
+            from collectors import iv_store
+
+            for trade in open_trades:
+                tid    = trade.get("id")
+                symbol = trade.get("symbol", "")
+                side   = "CE" if str(trade.get("side", "")).upper() in ("CE", "CALL") else "PE"
+                sec_id = str(trade.get("security_id") or "")
+                entry  = float(trade.get("entry") or 0)
+                last   = float(trade.get("last_price") or entry)
+                strike = trade.get("strike", 0)
+                risk_lines = []
+
+                # ── OI contradiction ─────────────────────────────────────── #
+                try:
+                    with sqlite3.connect(iv_store.DB_PATH) as conn:
+                        row = conn.execute(
+                            """SELECT bias, classification, price_chg_pct, oi_chg_pct
+                               FROM oi_buildup_history
+                               WHERE symbol = ?
+                                 AND date(timestamp) = date('now', 'localtime')
+                                 AND bias NOT IN ('-', 'FLAT', '')
+                               ORDER BY timestamp DESC LIMIT 1""",
+                            (symbol,),
+                        ).fetchone()
+                    if row:
+                        oi_bias, oi_class, px_chg, oi_chg = row
+                        if oi_bias and oi_bias != side:
+                            key = (tid, f"oi_{oi_bias}")
+                            if key not in self._warned:
+                                self._warned.add(key)
+                                risk_lines.append(
+                                    f"📊 OI {oi_class} (px {px_chg:+.1f}% | OI {oi_chg:+.1f}%)"
+                                    f" → {oi_bias} bias vs your {side}"
+                                )
+                except Exception:
+                    logger.debug("OI risk check failed for %s", symbol)
+
+                # ── Sonar reversal ───────────────────────────────────────── #
+                try:
+                    from sonar_laplace_scanner import get_latest_sonar
+                    sonar    = get_latest_sonar(sec_id) if sec_id else {}
+                    s_bias   = sonar.get("bias")
+                    s_signal = sonar.get("signal", "")
+                    bearish  = {"BREAKDOWN", "REVERSAL_DOWN"}
+                    bullish  = {"BREAKOUT_UP", "REVERSAL_UP"}
+                    contra   = (side == "CE" and s_signal in bearish) or                                (side == "PE" and s_signal in bullish)
+                    if s_bias and contra:
+                        key = (tid, f"sonar_{s_signal}")
+                        if key not in self._warned:
+                            self._warned.add(key)
+                            risk_lines.append(
+                                f"📡 Sonar {s_signal} → {s_bias}"
+                                f" | last {sonar.get('last', 0):.1f}"
+                                f" (S {sonar.get('support', 0)} / R {sonar.get('resistance', 0)})"
+                            )
+                except Exception:
+                    logger.debug("Sonar risk check failed for %s", symbol)
+
+                if risk_lines:
+                    pnl_pct  = ((last - entry) / entry * 100) if entry else 0
+                    pnl_sign = "+" if pnl_pct >= 0 else ""
+                    msg = (
+                        f"🚨 <b>POSITION RISK</b> • <b>{symbol}</b> {side} {int(strike)}\n"
+                        + "\n".join(risk_lines)
+                        + f"\nEntry ₹{entry:.2f} | Now ₹{last:.2f}"
+                        f" ({pnl_sign}{pnl_pct:.1f}%) — consider early exit"
+                    )
+                    notifications.notify(msg)
+                    logger.info(
+                        "Position risk alert: %s %s — %s",
+                        symbol, side, "; ".join(risk_lines),
+                    )
+
+        except Exception:
+            logger.exception("_check_position_risks failed (non-fatal)")
 
     def square_off_all(self, scanner, now=None):
         """Force-close all remaining open positions (square-off time)."""
