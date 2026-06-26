@@ -469,6 +469,9 @@ class IVCollector:
                 self._pass_log    = []
                 self._fail_counts = Counter()
                 self._eod_sent    = False
+                # Clear expiry cache so Friday picks up the new expiry
+                # after Thursday's contracts expire.
+                self._expiry_cache.clear()
                 _last_reset_date  = now.date()
 
             if now.weekday() >= 5:
