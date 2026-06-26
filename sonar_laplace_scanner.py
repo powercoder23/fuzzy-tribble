@@ -249,7 +249,7 @@ def get_latest_sonar(security_id: str, db_path: str | None = None) -> dict:
     try:
         with sqlite3.connect(path) as conn:
             cur = conn.execute(
-                f"""SELECT trend, signal, bias, support, resistance, slope_pct, timestamp
+                f"""SELECT trend, signal, bias, support, resistance, slope_pct, timestamp, last
                     FROM {cfg.PERSIST_TABLE} WHERE security_id=?
                     ORDER BY timestamp DESC LIMIT 1""",
                 (str(security_id),),
@@ -259,5 +259,5 @@ def get_latest_sonar(security_id: str, db_path: str | None = None) -> dict:
         return {}
     if not row:
         return {}
-    keys = ["trend", "signal", "bias", "support", "resistance", "slope_pct", "timestamp"]
+    keys = ["trend", "signal", "bias", "support", "resistance", "slope_pct", "timestamp", "last"]
     return dict(zip(keys, row))

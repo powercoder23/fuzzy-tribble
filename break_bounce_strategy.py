@@ -1163,8 +1163,15 @@ class BreakBounceStrategyRunner:
                     if _book is None:
                         self._paper_book = _pt.PaperTradeBook()
                         _book = self._paper_book
-                    _book.open_trade(_bb_signal)
-                    logger.info("B&B paper trade logged: %s %s %s", symbol, side, strike_data.get("strike"))
+                    _min_prem = _pt.INTRADAY.get("min_premium", 5.0)
+                    if premium < _min_prem:
+                        logger.info(
+                            "B&B paper trade skipped — premium ₹%.2f < min ₹%.2f",
+                            premium, _min_prem,
+                        )
+                    else:
+                        _book.open_trade(_bb_signal)
+                        logger.info("B&B paper trade logged: %s %s %s", symbol, side, strike_data.get("strike"))
                 except Exception as _e:
                     logger.warning("B&B paper trade failed (non-fatal): %s", _e)
 
@@ -1327,6 +1334,14 @@ class BreakBounceStrategyRunner:
         try:
             self._ensure_components()
             self._force_exit_all_positions()
+            # Square off any open B&B paper trades and send fill alerts.
+            if getattr(self, "_paper_book", None) is not None:
+                import paper_trader as _pt
+                try:
+                    _pt.monitor(self._paper_book, self._scanner_obj,
+                                now=datetime.now(), square_off=True)
+                except Exception:
+                    logger.warning("B&B paper EOD square-off failed (non-fatal)")
             stats = self._journal.get_today_stats()
             self._notifier.send_daily_summary(stats, self.risk_manager.summary())
             self.risk_manager.reset_daily()

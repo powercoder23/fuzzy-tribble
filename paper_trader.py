@@ -544,7 +544,7 @@ def monitor(book, scanner, now=None, bot_token=None, chat_id=None, square_off=Fa
         book.save_runtime(trade, now)
         # Mid-session fill alerts — fire on every actionable event so the
         # trader knows in real time when a SL/T1/T2 is hit.
-        for event in ("SL", "T1", "T2", "BE"):
+        for event in ("SL", "T1", "T2", "BE", "TIME"):
             if event in events:
                 send_telegram(
                     format_fill_update(trade, event),

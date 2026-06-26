@@ -26,6 +26,9 @@ GATE_MODE = os.getenv("PMG_GATE_MODE", "hard").strip().lower()
 # ── Gate 1: IV Rank cap ──────────────────────────────────────────────────── #
 MAX_IVR = float(os.getenv("PMG_MAX_IVR", "35"))
 
+# If iv_rank is absent from the signal, skip this gate rather than block.
+SKIP_IVR_IF_MISSING = os.getenv("PMG_SKIP_IVR_IF_MISSING", "true").strip().lower() == "true"
+
 # ── Gate 2: IV / HV ratio ────────────────────────────────────────────────── #
 # IV above realised vol → sellers' edge, not buyers'. Block when ratio > 1.0.
 MAX_IV_HV_RATIO = float(os.getenv("PMG_MAX_IV_HV_RATIO", "1.0"))

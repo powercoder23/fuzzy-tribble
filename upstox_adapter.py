@@ -420,7 +420,8 @@ class UpstoxDhanAdapter:
             return {"status": "failure", "remarks": str(exc)}
 
     def historical_daily_data(self, security_id, exchange_segment,
-                              instrument_type, from_date, to_date,  # noqa: ARG002
+                              instrument_type,  # noqa: ARG002
+                              from_date, to_date,
                               oi=False, **_kwargs) -> dict:
         """Fetch daily OHLCV; returns Dhan-compatible list-of-dicts payload."""
         inst_key = _underlying_key_from_security_id(security_id, exchange_segment)
@@ -428,12 +429,10 @@ class UpstoxDhanAdapter:
             logger.warning("historical_daily_data: no instrument_key for security_id=%s", security_id)
             return {"status": "failure", "remarks": "instrument_key not found"}
         try:
-            resp = self._history_api.get_historical_candle_data(
-                instrument_key=inst_key,
-                unit="days",
-                interval=1,
-                to_date=to_date,
-            )
+            kwargs = dict(instrument_key=inst_key, unit="days", interval=1, to_date=to_date)
+            if from_date:
+                kwargs["from_date"] = from_date
+            resp = self._history_api.get_historical_candle_data(**kwargs)
             candles = resp.data.candles if resp and resp.data else []
             col = _candles_to_dhan_columnar(candles)
             # Convert to list-of-dicts (Dhan historical_daily_data format)

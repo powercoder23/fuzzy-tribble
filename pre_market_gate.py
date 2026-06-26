@@ -169,7 +169,7 @@ def evaluate(
         gates.append(g)
         if not ok:
             failures.append(g["reason"])
-    elif cfg.SKIP_IV_HV_IF_MISSING:
+    elif cfg.SKIP_IVR_IF_MISSING:
         gates.append(_gate("ivr", True, None, cfg.MAX_IVR, "IVR missing — skipped (fail-open)"))
     else:
         g = _gate("ivr", False, None, cfg.MAX_IVR, "IVR missing — blocked")
@@ -195,19 +195,26 @@ def evaluate(
         failures.append(g["reason"])
 
     # ── Gate 3: OTM% ─────────────────────────────────────────────────────── #
-    if spot and strike:
-        otm = _otm_pct(side, float(spot), float(strike))
-        if otm is not None:
-            ok = otm <= cfg.MAX_OTM_PCT
-            g  = _gate("otm_pct", ok, round(otm, 2), cfg.MAX_OTM_PCT,
-                       f"OTM {otm:.1f}% {'≤' if ok else '>'} {cfg.MAX_OTM_PCT}%"
-                       f" (spot {spot} → strike {strike})")
-            gates.append(g)
-            if not ok:
-                failures.append(g["reason"])
+    if spot is not None and strike is not None:
+        spot_f, strike_f = float(spot), float(strike)
+        if spot_f > 0 and strike_f > 0:
+            otm = _otm_pct(side, spot_f, strike_f)
+            if otm is not None:
+                ok = otm <= cfg.MAX_OTM_PCT
+                g  = _gate("otm_pct", ok, round(otm, 2), cfg.MAX_OTM_PCT,
+                           f"OTM {otm:.1f}% {'≤' if ok else '>'} {cfg.MAX_OTM_PCT}%"
+                           f" (spot {spot} → strike {strike})")
+                gates.append(g)
+                if not ok:
+                    failures.append(g["reason"])
+            else:
+                gates.append(_gate("otm_pct", True, None, cfg.MAX_OTM_PCT,
+                                   "OTM% calc failed — skipped"))
         else:
-            gates.append(_gate("otm_pct", True, None, cfg.MAX_OTM_PCT,
-                               "OTM% calc failed — skipped"))
+            g = _gate("otm_pct", False, spot, cfg.MAX_OTM_PCT,
+                      f"spot/strike is zero — blocked (spot={spot}, strike={strike})")
+            gates.append(g)
+            failures.append(g["reason"])
     else:
         gates.append(_gate("otm_pct", True, None, cfg.MAX_OTM_PCT,
                            "spot/strike missing — skipped"))

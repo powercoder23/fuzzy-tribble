@@ -87,8 +87,11 @@ def place_bracket_order(dhan, strike_data: dict, lots: int, lot_size: int,
 class OrderManager:
     """Owns the trade book and the open-position lifecycle (paper backend)."""
 
-    def __init__(self, book: "paper_trader.PaperTradeBook | None" = None):
+    def __init__(self, book: "paper_trader.PaperTradeBook | None" = None,
+                 bot_token: str | None = None, chat_id: str | None = None):
         self.book = book or paper_trader.PaperTradeBook()
+        self.bot_token = bot_token
+        self.chat_id = chat_id
         self._warned: set = set()          # (trade_id, risk_type) — dedup intraday alerts
         self._warned_date: str | None = None
 
@@ -197,7 +200,10 @@ class OrderManager:
     def track(self, scanner, now=None, square_off=False):
         """Re-price every open position and advance its exit state machine.
         Called on the OrderManager's own (faster) cadence."""
-        closed = paper_trader.monitor(self.book, scanner, now=now, square_off=square_off)
+        closed = paper_trader.monitor(
+            self.book, scanner, now=now, square_off=square_off,
+            bot_token=self.bot_token, chat_id=self.chat_id,
+        )
         if closed:
             logger.info("OrderManager: closed %d position(s) this tick", len(closed))
         # Risk alerts on surviving open positions (OI contradiction + Sonar reversal).
@@ -238,7 +244,8 @@ class OrderManager:
                 side   = "CE" if str(trade.get("side", "")).upper() in ("CE", "CALL") else "PE"
                 sec_id = str(trade.get("security_id") or "")
                 entry  = float(trade.get("entry") or 0)
-                last   = float(trade.get("last_price") or entry)
+                _lp    = trade.get("last_price")
+                last   = float(_lp if _lp is not None else entry)
                 strike = trade.get("strike", 0)
                 risk_lines = []
 
@@ -259,11 +266,12 @@ class OrderManager:
                         if oi_bias and oi_bias != side:
                             key = (tid, f"oi_{oi_bias}")
                             if key not in self._warned:
-                                self._warned.add(key)
                                 risk_lines.append(
-                                    f"📊 OI {oi_class} (px {px_chg:+.1f}% | OI {oi_chg:+.1f}%)"
+                                    f"📊 OI {oi_class} (px {float(px_chg or 0):+.1f}%"
+                                    f" | OI {float(oi_chg or 0):+.1f}%)"
                                     f" → {oi_bias} bias vs your {side}"
                                 )
+                                self._warned.add(key)
                 except Exception:
                     logger.debug("OI risk check failed for %s", symbol)
 
@@ -271,20 +279,25 @@ class OrderManager:
                 try:
                     from sonar_laplace_scanner import get_latest_sonar
                     sonar    = get_latest_sonar(sec_id) if sec_id else {}
+                    # Discard stale signals from previous sessions
+                    if sonar.get("timestamp", "")[:10] != today:
+                        sonar = {}
                     s_bias   = sonar.get("bias")
                     s_signal = sonar.get("signal", "")
                     bearish  = {"BREAKDOWN", "REVERSAL_DOWN"}
                     bullish  = {"BREAKOUT_UP", "REVERSAL_UP"}
-                    contra   = (side == "CE" and s_signal in bearish) or                                (side == "PE" and s_signal in bullish)
-                    if s_bias and contra:
+                    contra   = (side == "CE" and s_signal in bearish) or \
+                               (side == "PE" and s_signal in bullish)
+                    if contra:
                         key = (tid, f"sonar_{s_signal}")
                         if key not in self._warned:
-                            self._warned.add(key)
                             risk_lines.append(
                                 f"📡 Sonar {s_signal} → {s_bias}"
-                                f" | last {sonar.get('last', 0):.1f}"
-                                f" (S {sonar.get('support', 0)} / R {sonar.get('resistance', 0)})"
+                                f" | last {sonar.get('last') or 0:.1f}"
+                                f" (S {sonar.get('support') or 0}"
+                                f" / R {sonar.get('resistance') or 0})"
                             )
+                            self._warned.add(key)
                 except Exception:
                     logger.debug("Sonar risk check failed for %s", symbol)
 
@@ -297,7 +310,7 @@ class OrderManager:
                         + f"\nEntry ₹{entry:.2f} | Now ₹{last:.2f}"
                         f" ({pnl_sign}{pnl_pct:.1f}%) — consider early exit"
                     )
-                    notifications.notify(msg)
+                    notifications.notify(msg, bot_token=self.bot_token, chat_id=self.chat_id)
                     logger.info(
                         "Position risk alert: %s %s — %s",
                         symbol, side, "; ".join(risk_lines),

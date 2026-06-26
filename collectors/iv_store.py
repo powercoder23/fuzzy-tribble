@@ -171,7 +171,7 @@ def get_latest_snapshot(security_id: str) -> dict:
             return {}
         cols = [
             "security_id", "symbol", "timestamp", "spot_price", "atm_strike",
-            "atm_iv", "atm_call_oi", "atm_put_oi",
+            "atm_iv", "atm_call_iv", "atm_put_iv",
             "total_call_oi", "total_put_oi",
             "total_call_volume", "total_put_volume",
             "max_oi_strike_call", "max_oi_strike_put",
