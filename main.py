@@ -131,6 +131,34 @@ class StrategySchedulerApp:
         return self._lot_fn
 
     # --- jobs ---------------------------------------------------------------
+    def _market_is_open(self) -> bool:
+        """Return True only if the IV collector has written at least one
+        snapshot today. On NSE holidays the broker API returns errors or
+        nothing, so iv_history.db stays empty for today — which is our
+        signal that the exchange is closed. No hardcoded holiday list needed.
+        Fail-open: returns True if the DB is unreadable so we never silently
+        suppress trades on a live day due to a DB hiccup."""
+        try:
+            import sqlite3
+            from collectors import iv_store
+            today = datetime.now().date().isoformat()
+            with sqlite3.connect(iv_store.DB_PATH) as conn:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM iv_history "
+                    "WHERE date(timestamp,'localtime') = ?",
+                    (today,),
+                ).fetchone()[0]
+            if count == 0:
+                logger.info(
+                    "Market gate: 0 IV snapshots for %s — exchange likely closed. "
+                    "Skipping scan.", today,
+                )
+                return False
+            return True
+        except Exception:
+            logger.debug("_market_is_open: DB check failed — failing open")
+            return True
+
     def run_scan_cycle(self):
         """Scanner job (every scan_interval_min, 15): find signals and SUBMIT the
         top picks to the OrderManager. Does NOT manage open positions — that is
@@ -140,6 +168,8 @@ class StrategySchedulerApp:
         logger.info("%s", "=" * 70)
         try:
             now = datetime.now()
+            if not self._market_is_open():
+                return
             if now.strftime("%H:%M") >= INTRADAY["no_entry_after"]:
                 logger.info("Past entry cutoff %s — no new trades", INTRADAY["no_entry_after"])
                 return
