@@ -116,51 +116,75 @@ def symbols():
 # ── IV history for a symbol ───────────────────────────────────────────────── #
 @app.get("/api/iv/{symbol}")
 def iv_history(symbol: str, days: int = Query(30, ge=1, le=365)):
-    """Daily IV history + PCR + spot for the main chart."""
+    """Daily IV history + PCR + spot for the main chart. Falls back to
+    intraday data when daily history is not yet available."""
+    sym   = symbol.upper()
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    rows = _iv("""
-        SELECT timestamp, atm_iv, atm_call_iv, atm_put_iv,
-               spot_price, total_call_oi, total_put_oi,
-               total_call_volume, total_put_volume
-        FROM   iv_history
-        WHERE  symbol   = ?
-          AND  data_type = 'daily'
-          AND  date(timestamp) >= ?
-          AND  atm_iv   BETWEEN 1 AND 200
-        ORDER  BY timestamp ASC
-    """, (symbol.upper(), since))
+
+    def fetch(data_type):
+        return _iv("""
+            SELECT timestamp, atm_iv, atm_call_iv, atm_put_iv,
+                   spot_price, total_call_oi, total_put_oi
+            FROM   iv_history
+            WHERE  symbol = ? AND data_type = ?
+              AND  date(timestamp) >= ?
+              AND  atm_iv IS NOT NULL AND atm_iv BETWEEN 1 AND 200
+            ORDER  BY timestamp ASC
+        """, (sym, data_type, since))
+
+    rows   = fetch("daily")
+    source = "daily"
+    if not rows:
+        # No daily history yet — fall back to intraday so the chart still renders
+        rows   = fetch("intraday")
+        source = "intraday"
 
     if not rows:
-        raise HTTPException(404, f"No daily IV data for {symbol}")
+        raise HTTPException(404, f"No IV data for {sym}")
 
-    # Compute IVR range from 252-day history
+    # Safe numeric helper
+    def num(v, d=0.0):
+        try:
+            return round(float(v), 2)
+        except (TypeError, ValueError):
+            return d
+
+    # IVR range from up to 252 daily samples (fall back to whatever exists)
     hist_all = _iv("""
         SELECT atm_iv FROM iv_history
-        WHERE  symbol = ? AND data_type = 'daily'
-          AND  atm_iv BETWEEN 1 AND 200
+        WHERE  symbol = ?
+          AND  atm_iv IS NOT NULL AND atm_iv BETWEEN 1 AND 200
         ORDER  BY timestamp DESC LIMIT 252
-    """, (symbol.upper(),))
-    iv_vals = [x["atm_iv"] for x in hist_all]
+    """, (sym,))
+    iv_vals = [x["atm_iv"] for x in hist_all if x["atm_iv"] is not None]
     iv_min  = round(min(iv_vals), 2) if iv_vals else None
     iv_max  = round(max(iv_vals), 2) if iv_vals else None
-    current = round(rows[-1]["atm_iv"], 2) if rows else None
+    current = num(rows[-1]["atm_iv"]) if rows else None
     iv_rank = round(
-        (current - iv_min) / (iv_max - iv_min) * 100
-        if (iv_min and iv_max and iv_max > iv_min) else 0, 1
-    )
+        (current - iv_min) / (iv_max - iv_min) * 100, 1
+    ) if (current is not None and iv_min is not None
+          and iv_max is not None and iv_max > iv_min) else None
 
-    timestamps = [r["timestamp"][:10] for r in rows]
+    fmt = "%H:%M" if source == "intraday" else "%Y-%m-%d"
+    def label(ts):
+        try:
+            return ts[11:16] if source == "intraday" else ts[:10]
+        except Exception:
+            return str(ts)
+
     return {
-        "symbol":      symbol.upper(),
+        "symbol":      sym,
         "days":        days,
-        "timestamps":  timestamps,
-        "atm_iv":      [round(r["atm_iv"], 2)         for r in rows],
-        "call_iv":     [round(r["atm_call_iv"] or 0, 2) for r in rows],
-        "put_iv":      [round(r["atm_put_iv"]  or 0, 2) for r in rows],
-        "spot":        [round(r["spot_price"]   or 0, 2) for r in rows],
+        "source":      source,
+        "timestamps":  [label(r["timestamp"]) for r in rows],
+        "atm_iv":      [num(r["atm_iv"])      for r in rows],
+        "call_iv":     [num(r["atm_call_iv"]) for r in rows],
+        "put_iv":      [num(r["atm_put_iv"])  for r in rows],
+        "spot":        [num(r["spot_price"])  for r in rows],
         "pcr":         [
             round(r["total_put_oi"] / r["total_call_oi"], 3)
-            if (r["total_call_oi"] or 0) > 0 else None
+            if (r["total_call_oi"] or 0) > 0 and r["total_put_oi"] is not None
+            else None
             for r in rows
         ],
         "iv_rank":     iv_rank,
