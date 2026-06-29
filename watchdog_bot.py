@@ -194,9 +194,10 @@ class ContextBuilder:
             r   = snap[0]
             pcr = (r["total_put_oi"] / r["total_call_oi"]
                    if r["total_call_oi"] else None)
+            pcr_str = f"{pcr:.2f}" if pcr else "N/A"
             parts.append(f"Latest IV: {r['atm_iv']:.1f}%  "
                          f"Spot: ₹{r['spot_price']:.2f}  "
-                         f"PCR: {pcr:.2f if pcr else 'N/A'}")
+                         f"PCR: {pcr_str}")
 
         # IVR
         hist = _query(IV_DB, """
