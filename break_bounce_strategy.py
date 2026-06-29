@@ -1136,11 +1136,15 @@ class BreakBounceStrategyRunner:
                 }
                 self._journal.log_entry(trade)
 
-                # ── Paper trade: log to paper_trades.db for P&L tracking ──────
+                # ── Paper trade: route through the shared OrderManager ────────
+                # B&B keeps its OWN selection (pattern/liquidity/affordability)
+                # and its OWN daily cap; this path only adds the shared quality
+                # gates (pre-market + breadth) and tags the trade so it flows
+                # through the same monitor / fill alerts / auto-exit / EOD /
+                # analytics as discount trades. The exit model is B&B's fixed
+                # single target (full exit, no runner): t1 == t2, book 100%.
                 try:
-                    import paper_trader as _pt
-                    _sl_amt = premium * BB_RISK["sl_pct"]
-                    _t2     = round(premium + _sl_amt * BB_RISK["target_ratio"] * 2, 1)
+                    from order_manager import OrderManager
                     _bb_signal = {
                         "symbol":            symbol,
                         "security_id":       sec_id,
@@ -1148,32 +1152,28 @@ class BreakBounceStrategyRunner:
                         "side":              side,
                         "strike":            strike_data.get("strike"),
                         "expiry":            expiry,
+                        "spot":              spot,
                         "entry":             premium,
                         "sl":                sl,
                         "t1":                target,
-                        "t2":                _t2,
+                        "t2":                target,   # fixed single target — full exit, no runner
+                        "t1_book_fraction":  1.0,
                         "lot_size":          lot_size,
-                        "score":             None,
                         "iv":                strike_data.get("iv"),
-                        "hv":                None,
-                        "iv_rank":           None,
-                        "dte":               None,
+                        "strategy":          "Break & Bounce",
                     }
-                    _book = getattr(self, "_paper_book", None)
-                    if _book is None:
-                        self._paper_book = _pt.PaperTradeBook()
-                        _book = self._paper_book
-                    _min_prem = _pt.INTRADAY.get("min_premium", 5.0)
-                    if premium < _min_prem:
-                        logger.info(
-                            "B&B paper trade skipped — premium ₹%.2f < min ₹%.2f",
-                            premium, _min_prem,
-                        )
+                    _om = getattr(self, "_order_manager", None)
+                    if _om is None:
+                        self._order_manager = OrderManager()
+                        _om = self._order_manager
+                    if _om.submit_external_signal(_bb_signal):
+                        logger.info("B&B paper trade booked via OrderManager: %s %s %s",
+                                    symbol, side, strike_data.get("strike"))
                     else:
-                        _book.open_trade(_bb_signal)
-                        logger.info("B&B paper trade logged: %s %s %s", symbol, side, strike_data.get("strike"))
+                        logger.info("B&B paper trade not booked (gate/guard): %s %s",
+                                    symbol, side)
                 except Exception as _e:
-                    logger.warning("B&B paper trade failed (non-fatal): %s", _e)
+                    logger.warning("B&B paper booking failed (non-fatal): %s", _e)
 
                 risk_data = {
                     "qty":      lots * lot_size,
@@ -1334,12 +1334,14 @@ class BreakBounceStrategyRunner:
         try:
             self._ensure_components()
             self._force_exit_all_positions()
-            # Square off any open B&B paper trades and send fill alerts.
-            if getattr(self, "_paper_book", None) is not None:
-                import paper_trader as _pt
+            # Square off any open B&B paper trades in the shared book via the
+            # same OrderManager they were booked through. The discount container
+            # also squares off at 15:20 as a backstop; monitor() only acts on
+            # still-open trades, so this never double-closes.
+            _om = getattr(self, "_order_manager", None)
+            if _om is not None:
                 try:
-                    _pt.monitor(self._paper_book, self._scanner_obj,
-                                now=datetime.now(), square_off=True)
+                    _om.square_off_all(self._scanner_obj, now=datetime.now())
                 except Exception:
                     logger.warning("B&B paper EOD square-off failed (non-fatal)")
             stats = self._journal.get_today_stats()

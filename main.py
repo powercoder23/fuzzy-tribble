@@ -191,6 +191,15 @@ class StrategySchedulerApp:
         except Exception:
             logger.exception("EOD summary failed")
 
+    def run_sector_heatmap(self):
+        """Morning sector-breadth heatmap to the alert channel (zero broker
+        calls — reads iv_history spot snapshots + sector_mapping.db)."""
+        try:
+            import breadth
+            breadth.send_sector_heatmap()
+        except Exception:
+            logger.exception("Sector heatmap failed (non-fatal)")
+
     def run_directional_iv_scan(self):
         """Run the directional IV scan once (kept available, not scheduled)."""
         try:
@@ -211,6 +220,9 @@ class StrategySchedulerApp:
                 getattr(schedule.every(), day).at(run_time).do(self.run_monitor_cycle)
             getattr(schedule.every(), day).at(INTRADAY["square_off"]).do(self.run_square_off)
             getattr(schedule.every(), day).at(INTRADAY["eod_summary_at"]).do(self.run_eod_summary)
+            getattr(schedule.every(), day).at(
+                os.getenv("SECTOR_HEATMAP_AT", "09:50")
+            ).do(self.run_sector_heatmap)
         logger.info(
             "Scheduled discount scan %s..15:15 every %smin | OrderManager track every %smin "
             "until %s | square-off %s | EOD %s",

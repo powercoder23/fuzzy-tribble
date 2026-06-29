@@ -25,6 +25,41 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
+# Pure decision: does the latest OI-buildup read contradict an open position
+# strongly enough to auto-exit it? No DB / no API — unit-testable.
+# --------------------------------------------------------------------------- #
+def oi_contradicts(side, bias, strength, oi_chg_pct, pnl_pct, *,
+                   min_oi_chg_pct, require_strong, max_profit_pct):
+    """True when an open position should be auto-exited on OI contradiction.
+
+    side       : the position side ("CE"/"CALL" or "PE"/"PUT").
+    bias       : buyer-bias of the latest OI buildup ("CE" / "PE" / "-").
+    strength   : "strong" (fresh LONG/SHORT buildup) or "weak" (covering/unwind).
+    oi_chg_pct : aggregate call+put OI change vs day-open (%).
+    pnl_pct    : current premium P&L of the position (%); None to ignore.
+
+    Acts only when the buildup bias is the OPPOSITE side, (optionally) strong,
+    and the OI move clears `min_oi_chg_pct`. Skips a clear winner already up
+    more than `max_profit_pct`.
+    """
+    side = "CE" if str(side).upper() in ("CE", "CALL") else "PE"
+    if bias not in ("CE", "PE"):
+        return False
+    if bias == side:                      # OI agrees with us — hold
+        return False
+    if require_strong and str(strength).lower() != "strong":
+        return False
+    try:
+        if abs(float(oi_chg_pct or 0)) < float(min_oi_chg_pct):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if pnl_pct is not None and pnl_pct > max_profit_pct:
+        return False                      # let a clear winner run
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # Unified LIVE order path — single copy of the BUY -> SL_M -> emergency-exit
 # sequence that momentum_strategy and break_bounce_strategy each duplicated.
 # --------------------------------------------------------------------------- #
@@ -102,6 +137,7 @@ class OrderManager:
         (IVR / IV-HV / OTM% / PCR / position-cap) and the composite entry
         gate before reaching paper_trader. Returns the list of opened signals."""
         opportunities = self._apply_pre_market_gate(opportunities, self.book)
+        opportunities = self._apply_breadth_gate(opportunities)
         opportunities = self._apply_entry_gate(opportunities)
         opened = paper_trader.process_signals(
             self.book, opportunities, now=now, lot_size_fn=lot_size_fn
@@ -109,6 +145,37 @@ class OrderManager:
         if opened:
             logger.info("OrderManager: accepted %d new position(s)", len(opened))
         return opened
+
+    def submit_external_signal(self, signal, now=None):
+        """Book a single already-selected signal from a NON-discount strategy
+        (e.g. Break & Bounce) into the shared paper book.
+
+        The originating strategy owns its own selection (pattern, liquidity,
+        affordability) and its own daily cap. This path adds only the shared
+        *quality* gates — pre-market (IVR / IV-HV / OTM% / PCR / position cap)
+        and breadth — then books with the signal's own `strategy` tag so it
+        flows through the same monitor / fill alerts / auto-exit / EOD /
+        analytics as discount trades. It deliberately does NOT apply the
+        discount's Sonar side-override or the discount's shared 5-trade cap.
+
+        Returns the booked signal dict, or None if a gate or guard rejected it.
+        """
+        sig = dict(signal)
+        sig.setdefault("strategy", "External")
+        kept = self._apply_pre_market_gate([sig], self.book)
+        kept = self._apply_breadth_gate(kept)
+        if not kept:
+            logger.info("OrderManager: external %s %s rejected by quality gate",
+                        sig.get("symbol"), sig.get("side") or sig.get("type"))
+            return None
+        booked = paper_trader.book_signal(
+            self.book, kept[0], now=now,
+            bot_token=self.bot_token, chat_id=self.chat_id,
+        )
+        if booked:
+            logger.info("OrderManager: external signal booked %s %s [%s]",
+                        sig.get("symbol"), sig.get("side"), sig.get("strategy"))
+        return booked
 
     def _apply_pre_market_gate(self, opportunities, book=None):
         """
@@ -178,6 +245,55 @@ class OrderManager:
             return opportunities
 
     @staticmethod
+    def _apply_breadth_gate(opportunities):
+        """Drop counter-trend candidates by market & sector breadth.
+
+        Mode is config-driven (BREADTH_GATE_MODE):
+          off  → pass through unchanged
+          soft → evaluate and log would-be blocks, never drop
+          hard → drop CE into a broadly-red tape/sector (and PE into green)
+
+        One breadth snapshot is computed per call (zero broker calls — reads
+        iv_history spot snapshots + sector_mapping.db). Fail-open on any error.
+        """
+        try:
+            import breadth
+            import breadth_config as bcfg
+            if bcfg.MODE == "off" or opportunities is None:
+                return opportunities
+
+            rows = (opportunities.to_dict("records")
+                    if hasattr(opportunities, "to_dict") else list(opportunities))
+            if not rows:
+                return opportunities
+
+            snap = breadth.compute()
+            if snap.market_pct is None:
+                return opportunities    # not enough data yet — fail open
+
+            kept = []
+            for r in rows:
+                side = r.get("side") or r.get("type")
+                block, reason = breadth.breadth_blocks(side, r.get("symbol", ""), snap, bcfg)
+                if block and bcfg.MODE == "hard":
+                    logger.info("OrderManager: breadth gate blocked %s %s — %s",
+                                r.get("symbol"), side, reason)
+                    continue
+                if block:   # soft
+                    logger.info("OrderManager: breadth gate (soft) would block %s %s — %s",
+                                r.get("symbol"), side, reason)
+                kept.append(r)
+
+            dropped = len(rows) - len(kept)
+            if dropped:
+                logger.info("OrderManager: breadth gate dropped %d / %d candidate(s)",
+                            dropped, len(rows))
+            return kept
+        except Exception:
+            logger.exception("breadth gate failed; passing candidates through")
+            return opportunities
+
+    @staticmethod
     def _apply_entry_gate(opportunities):
         """In GATE_MODE=hard, drop candidates the composite gate rejects.
         off/soft -> unchanged (fail-open). Safe with DataFrame, list, or None."""
@@ -206,10 +322,95 @@ class OrderManager:
         )
         if closed:
             logger.info("OrderManager: closed %d position(s) this tick", len(closed))
-        # Risk alerts on surviving open positions (OI contradiction + Sonar reversal).
+        # Risk-driven auto-exit (OI contradiction) THEN warn on whatever survives.
         if not square_off:
             today = (now or datetime.now()).date().isoformat()
+            auto_closed = self._auto_exit_on_oi_contradiction(
+                self.book.open_trades(today), scanner, now
+            )
+            if auto_closed:
+                closed = list(closed) + auto_closed
+            # Warn on positions that are STILL open (re-query post auto-exit).
             self._check_position_risks(self.book.open_trades(today))
+        return closed
+
+    def _auto_exit_on_oi_contradiction(self, open_trades, scanner, now=None) -> list:
+        """Close any open position whose latest OI-buildup read strongly
+        contradicts its side. Config-gated (auto_exit_config, default off):
+          off  → no-op
+          soft → log the would-be exit, don't close
+          hard → market-exit the contradicting position now
+
+        Reads oi_buildup_history only (zero broker calls). Fail-open: any
+        exception leaves positions untouched. Returns the trades it closed.
+        """
+        closed: list = []
+        if not open_trades:
+            return closed
+        try:
+            import sqlite3
+            import auto_exit_config as cfg
+            from collectors import iv_store
+
+            if cfg.MODE == "off":
+                return closed
+
+            for trade in open_trades:
+                symbol = trade.get("symbol", "")
+                side   = "CE" if str(trade.get("side", "")).upper() in ("CE", "CALL") else "PE"
+                entry  = float(trade.get("entry") or 0)
+                _lp    = trade.get("last_price")
+                last   = float(_lp if _lp is not None else entry)
+                pnl_pct = ((last - entry) / entry * 100.0) if entry else 0.0
+
+                try:
+                    with sqlite3.connect(iv_store.DB_PATH) as conn:
+                        row = conn.execute(
+                            """SELECT bias, strength, classification, oi_chg_pct
+                               FROM oi_buildup_history
+                               WHERE symbol = ?
+                                 AND date(timestamp) = date('now', 'localtime')
+                                 AND bias NOT IN ('-', 'FLAT', '')
+                               ORDER BY timestamp DESC LIMIT 1""",
+                            (symbol,),
+                        ).fetchone()
+                except Exception:
+                    logger.debug("auto-exit OI read failed for %s", symbol)
+                    continue
+                if not row:
+                    continue
+
+                bias, strength, classification, oi_chg = row
+                if not oi_contradicts(
+                    side, bias, strength, oi_chg, pnl_pct,
+                    min_oi_chg_pct=cfg.MIN_OI_CHG_PCT,
+                    require_strong=cfg.REQUIRE_STRONG,
+                    max_profit_pct=cfg.MAX_PROFIT_PCT,
+                ):
+                    continue
+
+                oi_chg_f = float(oi_chg or 0)
+                if cfg.MODE == "soft":
+                    logger.info(
+                        "AUTO-EXIT (soft) would close %s %s — %s OI %+.0f%% (pnl %+.1f%%)",
+                        symbol, side, classification, oi_chg_f, pnl_pct,
+                    )
+                    continue
+
+                reason = f"OI contradiction ({classification} {oi_chg_f:+.0f}% OI)"
+                t = paper_trader.close_position(
+                    self.book, scanner, trade, reason, now=now,
+                    bot_token=self.bot_token, chat_id=self.chat_id,
+                )
+                if t:
+                    closed.append(t)
+                    logger.info(
+                        "AUTO-EXIT closed %s %s @ ₹%.2f — %s",
+                        symbol, side, t.get("last_price") or last, reason,
+                    )
+
+        except Exception:
+            logger.exception("_auto_exit_on_oi_contradiction failed (non-fatal)")
         return closed
 
     def _check_position_risks(self, open_trades: list) -> None:

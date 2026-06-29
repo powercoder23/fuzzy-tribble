@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     entry REAL, sl REAL, t1 REAL, t2 REAL,
     t1_book_fraction REAL, lot_size INTEGER,
     score REAL, iv REAL, hv REAL, iv_rank REAL, dte INTEGER,
+    strategy TEXT,
     status TEXT, t1_done INTEGER DEFAULT 0, qty_frac REAL DEFAULT 1.0,
     booked_points REAL DEFAULT 0.0, runner_stop REAL, last_price REAL,
     exit_reason TEXT, realized_points REAL, realized_pct REAL, realized_rupees REAL
@@ -181,6 +182,15 @@ class PaperTradeBook:
             os.makedirs(parent, exist_ok=True)
         with self._conn() as conn:
             conn.execute(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self):
+        """Additive, idempotent migrations for DBs created before a column
+        existed (the prod DB is a long-lived volume)."""
+        with self._conn() as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(paper_trades)")}
+            if "strategy" not in cols:
+                conn.execute("ALTER TABLE paper_trades ADD COLUMN strategy TEXT")
 
     def _conn(self):
         conn = sqlite3.connect(self.db_path)
@@ -217,9 +227,9 @@ class PaperTradeBook:
                 """INSERT INTO paper_trades
                    (date, opened_at, symbol, security_id, exchange_segment, side,
                     strike, expiry, entry, sl, t1, t2, t1_book_fraction, lot_size,
-                    score, iv, hv, iv_rank, dte, status, t1_done, qty_frac,
+                    score, iv, hv, iv_rank, dte, strategy, status, t1_done, qty_frac,
                     booked_points, runner_stop, last_price)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     date, now.strftime("%Y-%m-%d %H:%M:%S"),
                     signal["symbol"], str(signal.get("security_id")),
@@ -229,6 +239,7 @@ class PaperTradeBook:
                     rt["t1_book_fraction"], rt["lot_size"],
                     signal.get("score"), signal.get("iv"), signal.get("hv"),
                     signal.get("iv_rank"), signal.get("dte"),
+                    signal.get("strategy", VOLATILITY_STRATEGY),
                     "open", 0, 1.0, 0.0, rt["runner_stop"], rt["entry"],
                 ),
             )
@@ -304,6 +315,7 @@ def format_fill_update(trade, event):
         "SL": "🛑 SL hit — closed",
         "BE": "➖ Runner stopped at breakeven",
         "TIME": "⏱ Squared off 15:20",
+        "RISK_EXIT": "🚪 Auto-exit — risk contradiction",
     }.get(event, event)
     side = "CE" if str(trade.get("side", "")).upper() in ("CALL", "CE") else "PE"
     bits = [f"{label} • <b>{trade['symbol']}</b> {side} {_fmt(trade['strike'],0)} @ ₹{_fmt(trade['last_price'])}"]
@@ -364,8 +376,20 @@ def format_eod_summary(trades, date):
         f"Trades {len(trades)} | Closed {len(closed)} | "
         f"Win {len(wins)} / Loss {len(losses)} / Flat {len(flats)} ({hit_rate:.0f}% hit)",
         f"<b>Net ₹{total_rupees:,.0f}</b> (1-lot basis)",
-        "─────────────",
     ]
+
+    # Per-strategy breakdown (only when more than one strategy traded today).
+    by_strat: dict = {}
+    for t in trades:
+        s = t.get("strategy") or VOLATILITY_STRATEGY
+        agg = by_strat.setdefault(s, {"n": 0, "rupees": 0.0})
+        agg["n"] += 1
+        agg["rupees"] += (t.get("realized_rupees") or 0)
+    if len(by_strat) > 1:
+        for s, agg in sorted(by_strat.items(), key=lambda kv: kv[1]["rupees"], reverse=True):
+            lines.append(f"  • {s}: {agg['n']} trade(s), ₹{agg['rupees']:,.0f}")
+
+    lines.append("─────────────")
     for t in sorted(trades, key=lambda x: (x.get("realized_rupees") or 0), reverse=True):
         side = "CE" if str(t.get("side", "")).upper() in ("CALL", "CE") else "PE"
         rr = t.get("realized_rupees")
@@ -437,6 +461,7 @@ def signal_from_row(row, lot_size_fn=None):
         "volume": row.get("volume"),
         "spot": row.get("spot"),
         "lot_size": lot,
+        "strategy": row.get("strategy", VOLATILITY_STRATEGY),
     }
 
 
@@ -518,6 +543,50 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
     return opened
 
 
+def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
+    """Book ONE already-vetted signal into paper_trades.db, regardless of
+    strategy. Unlike `process_signals` this applies NO discount-specific logic
+    (no Volatility-Play filter, no Sonar side-override, no shared daily cap) —
+    the caller owns selection. Enforces only the universal guards: entry cutoff,
+    per symbol+strike+side dedup, and the min-premium floor. Sends the standard
+    "PAPER TRADE TAKEN" alert. Returns the booked signal dict, or None.
+
+    Used by OrderManager.submit_external_signal so non-discount strategies
+    (e.g. Break & Bounce) land in the same book / EOD / monitor / risk pipeline
+    with their own `strategy` tag.
+    """
+    now = now or datetime.now()
+    date = now.date().isoformat()
+
+    if _hhmm(now) >= INTRADAY["no_entry_after"]:
+        logger.info("book_signal: past no_entry_after (%s) — skip %s",
+                    INTRADAY["no_entry_after"], signal.get("symbol"))
+        return None
+
+    symbol = signal.get("symbol")
+    strike = signal.get("strike")
+    side   = signal.get("side")
+    if symbol is None or strike is None or side is None:
+        return None
+    if not signal.get("entry") or not signal.get("t1"):
+        return None
+    if book.has_trade_today(date, symbol, strike, side):
+        logger.info("book_signal: %s %s %s already booked today", symbol, strike, side)
+        return None
+
+    min_prem = INTRADAY.get("min_premium", 5.0)
+    if float(signal.get("entry") or 0) < min_prem:
+        logger.info("book_signal: %s %s premium ₹%.2f < min ₹%.2f — skip",
+                    symbol, side, float(signal.get("entry") or 0), min_prem)
+        return None
+
+    book.open_trade(signal, now)
+    send_telegram(format_signal_alert(signal), bot_token, chat_id)
+    logger.info("book_signal: opened %s %s %s [%s]",
+                symbol, side, strike, signal.get("strategy", VOLATILITY_STRATEGY))
+    return signal
+
+
 def monitor(book, scanner, now=None, bot_token=None, chat_id=None, square_off=False):
     """Re-price every open paper trade and advance its exit state machine."""
     now = now or datetime.now()
@@ -554,6 +623,41 @@ def monitor(book, scanner, now=None, bot_token=None, chat_id=None, square_off=Fa
         if events and trade.get("status") == "closed":
             closed.append(trade)
     return closed
+
+
+def close_position(book, scanner, trade, reason, now=None,
+                   bot_token=None, chat_id=None, notify=True):
+    """Force-close ONE open paper trade at its current option LTP (market exit).
+
+    Used by risk-driven auto-exits (e.g. OI contradiction) that must close a
+    *specific* position immediately, independent of the SL/T1/T2 state machine.
+    Re-prices via the scanner; falls back to the last known price if the quote
+    is unavailable. Books the remaining quantity, finalizes with `reason`,
+    persists, and (by default) fires one fill alert. Returns the trade if it was
+    closed, else None.
+    """
+    now = now or datetime.now()
+    if trade.get("status") != "open":
+        return None
+
+    last_price = trade.get("last_price") or trade["entry"]
+    try:
+        quote = scanner.get_current_option_premium(
+            trade["security_id"], trade["exchange_segment"],
+            trade["expiry"], trade["strike"], trade["side"],
+        )
+        if quote and quote.get("last") not in (None, 0):
+            last_price = quote.get("last") or quote.get("mid") or last_price
+    except Exception:
+        logger.exception("close_position re-price failed for trade %s", trade.get("id"))
+
+    trade["last_price"] = float(last_price)
+    _book(trade, trade["qty_frac"], float(last_price))
+    _finalize(trade, reason)
+    book.save_runtime(trade, now)
+    if notify:
+        send_telegram(format_fill_update(trade, "RISK_EXIT"), bot_token, chat_id)
+    return trade
 
 
 def run_eod(book, scanner=None, now=None, bot_token=None, chat_id=None):
