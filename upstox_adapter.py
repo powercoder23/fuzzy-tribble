@@ -429,10 +429,18 @@ class UpstoxDhanAdapter:
             logger.warning("historical_daily_data: no instrument_key for security_id=%s", security_id)
             return {"status": "failure", "remarks": "instrument_key not found"}
         try:
-            kwargs = dict(instrument_key=inst_key, unit="days", interval=1, to_date=to_date)
+            # Upstox v3 SDK has two endpoints:
+            #   get_historical_candle_data(key, unit, interval, to_date)          — no range
+            #   get_historical_candle_data1(key, unit, interval, to_date, from_date) — with range
+            # from_date is a path param (positional), NOT a kwarg on the base method.
             if from_date:
-                kwargs["from_date"] = from_date
-            resp = self._history_api.get_historical_candle_data(**kwargs)
+                resp = self._history_api.get_historical_candle_data1(
+                    inst_key, "days", 1, to_date, from_date
+                )
+            else:
+                resp = self._history_api.get_historical_candle_data(
+                    inst_key, "days", 1, to_date
+                )
             candles = resp.data.candles if resp and resp.data else []
             col = _candles_to_dhan_columnar(candles)
             # Convert to list-of-dicts (Dhan historical_daily_data format)
