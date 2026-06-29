@@ -265,3 +265,18 @@ services:
     env_file:
       - .env
 
+  # ── Watchdog + Discord bot ────────────────────────────────────────────────
+  # Tails all container logs, alerts on errors, Claude-powered @bot commands.
+  # Requires: DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, ANTHROPIC_API_KEY in .env
+  watchdog-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.watchdog
+    container_name: watchdog-bot
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    env_file:
+      - .env
+
