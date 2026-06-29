@@ -1,0 +1,14 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    discord.py==2.3.2 \
+    docker==7.1.0 \
+    anthropic==0.49.0 \
+    requests \
+    schedule
+
+COPY watchdog_bot.py .
+
+CMD ["python", "-u", "watchdog_bot.py"]
