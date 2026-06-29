@@ -248,3 +248,20 @@ services:
     depends_on:
       - iv-collector
     command: python composite_runner.py
+
+  # ── Dashboard ─────────────────────────────────────────────────────────────
+  # Web dashboard — IV graph, paper trade P&L, universe overview.
+  # Access via Tailscale: http://<nas-ip>:8050
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: trading-dashboard
+    restart: unless-stopped
+    ports:
+      - "8050:8050"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+

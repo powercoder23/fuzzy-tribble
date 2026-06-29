@@ -1,0 +1,10 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir fastapi uvicorn[standard]==0.24.0
+
+COPY dashboard_app.py .
+COPY dashboard.html .
+
+CMD ["uvicorn", "dashboard_app:app", "--host", "0.0.0.0", "--port", "8050", "--workers", "1"]
