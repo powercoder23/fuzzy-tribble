@@ -654,8 +654,10 @@ function setView(v) {
 // ── IV Chart ───────────────────────────────────────────────────────────────
 async function loadIVChart(symbol) {
   currentSymbol = symbol;
-  $('chart-empty').style.display = 'none';
-  $('iv-chart').style.display = '';
+  // Show loading state — don't reveal canvas until we have data
+  $('chart-empty').textContent = 'Loading…';
+  $('chart-empty').style.display = 'flex';
+  $('iv-chart').style.display = 'none';
 
   try {
     let data;
@@ -664,6 +666,18 @@ async function loadIVChart(symbol) {
     } else {
       data = await api(`/api/iv/${symbol}?days=${currentRange}`);
     }
+
+    // Empty data guard — show message instead of blank chart
+    if (!data.timestamps || data.timestamps.length === 0) {
+      $('chart-empty').textContent = `No IV data for ${symbol} yet`;
+      $('chart-empty').style.display = 'flex';
+      $('iv-chart').style.display = 'none';
+      return;
+    }
+
+    // Data is good — now reveal the canvas
+    $('chart-empty').style.display = 'none';
+    $('iv-chart').style.display = '';
 
     // Update stats
     const iv = data.current_iv ?? (data.atm_iv ? data.atm_iv[data.atm_iv.length - 1] : null);
@@ -689,7 +703,7 @@ async function loadIVChart(symbol) {
     $('stat-pcr').className   = 'stat-value ' +
       (lastPcr > 1.2 ? 'cheap' : lastPcr < 0.6 ? 'rich' : '');
 
-    $('chart-meta').textContent = `${symbol} · ${data.timestamps?.length ?? 0} data points`;
+    $('chart-meta').textContent = `${symbol} · ${data.timestamps?.length ?? 0} pts` + (data.source === 'intraday' ? ' · intraday (no daily history yet)' : '');
 
     renderIVChart(data);
 
