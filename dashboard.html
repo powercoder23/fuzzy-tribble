@@ -3,9 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>fuzzy-tribble · dashboard</title>
+<title>ODT · Option Discount Trader</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   /* ── Tokens ────────────────────────────────────────────────── */
@@ -19,10 +19,12 @@
     --green:     #10b981;
     --red:       #ef4444;
     --blue:      #6366f1;
+    --purple:    #a855f7;
     --text:      #e2e8f0;
     --muted:     #4a5568;
     --mono:      'JetBrains Mono', monospace;
     --sans:      'Inter', sans-serif;
+    --sidebar-w: 210px;
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -35,516 +37,449 @@
     min-height: 100vh;
   }
 
-  /* ── Layout ────────────────────────────────────────────────── */
-  .topbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 14px 20px;
-    border-bottom: 1px solid var(--border);
+  /* ── Shell ─────────────────────────────────────────────────── */
+  .app-shell { display: flex; min-height: 100vh; }
+
+  .sidebar {
+    width: var(--sidebar-w);
+    flex-shrink: 0;
     background: var(--surface);
+    border-right: 1px solid var(--border);
+    padding: 18px 0 10px;
     position: sticky;
     top: 0;
-    z-index: 100;
+    height: 100vh;
+    overflow-y: auto;
   }
 
-  .logo {
-    font-family: var(--mono);
-    font-size: 13px;
-    color: var(--amber);
-    letter-spacing: 0.08em;
+  .sidebar-logo { padding: 0 20px 18px; }
+  .sidebar-logo .name { font-family: var(--mono); font-size: 17px; font-weight: 600; color: var(--amber); letter-spacing: 0.03em; }
+  .sidebar-logo .sub  { font-size: 10px; color: var(--muted); margin-top: 2px; }
+
+  .sidebar-nav { display: flex; flex-direction: column; margin-top: 6px; }
+  .nav-item {
+    display: flex; align-items: center; gap: 10px;
+    width: 100%; background: none; border: none;
+    border-right: 2px solid transparent;
+    color: var(--muted); font-family: var(--sans); font-size: 13px; font-weight: 500;
+    padding: 10px 20px; cursor: pointer; text-align: left; transition: all .15s;
   }
+  .nav-item .ic { font-size: 14px; width: 16px; text-align: center; }
+  .nav-item:hover { color: var(--text); }
+  .nav-item.active { color: var(--amber); background: rgba(245,158,11,0.07); border-right-color: var(--amber); }
 
-  .logo span { color: var(--muted); }
+  .content { flex: 1; min-width: 0; padding-bottom: 60px; }
 
-  .status-dot {
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    background: var(--muted);
-    display: inline-block;
-    margin-right: 6px;
-    transition: background 0.3s;
+  /* ── Topbar ────────────────────────────────────────────────── */
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 24px; border-bottom: 1px solid var(--border);
+    background: var(--surface); position: sticky; top: 0; z-index: 100;
+    flex-wrap: wrap; gap: 10px;
   }
-  .status-dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
-  .status-dot.stale { background: var(--amber); }
-
-  .status-label {
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--muted);
-  }
-
-  .main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 60px; }
-
-  /* ── Section ───────────────────────────────────────────────── */
-  .section { margin-bottom: 28px; }
-
-  .section-label {
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 0.15em;
-    text-transform: uppercase;
-    color: var(--muted);
-    margin-bottom: 12px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .section-label::after {
-    content: '';
-    flex: 1;
-    height: 1px;
-    background: var(--border);
-  }
-
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 18px 20px;
-  }
-
-  /* ── Controls ──────────────────────────────────────────────── */
-  .iv-controls {
-    display: flex;
-    gap: 10px;
-    align-items: center;
-    flex-wrap: wrap;
-    margin-bottom: 18px;
-  }
-
-  .stock-search {
-    flex: 1;
-    min-width: 180px;
-    max-width: 280px;
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    color: var(--text);
-    font-family: var(--mono);
-    font-size: 13px;
-    padding: 8px 12px;
-    outline: none;
-    transition: border-color 0.2s;
-  }
-  .stock-search:focus { border-color: var(--amber); }
+  .topbar h1 { font-size: 18px; font-weight: 600; }
 
   .range-group { display: flex; gap: 4px; }
-
   .range-btn {
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 11px;
-    font-weight: 500;
-    padding: 6px 10px;
-    cursor: pointer;
-    transition: all 0.15s;
-    letter-spacing: 0.05em;
+    background: var(--surface2); border: 1px solid var(--border); border-radius: 5px;
+    color: var(--muted); font-family: var(--mono); font-size: 11px; font-weight: 500;
+    padding: 6px 10px; cursor: pointer; transition: all .15s; letter-spacing: .05em;
   }
   .range-btn:hover { border-color: var(--amber-dim); color: var(--text); }
-  .range-btn.active {
-    background: var(--amber);
-    border-color: var(--amber);
-    color: #000;
-  }
+  .range-btn.active { background: var(--amber); border-color: var(--amber); color: #000; }
 
-  .view-toggle {
-    display: flex;
-    gap: 4px;
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 3px;
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 6px; }
+  .status-dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .status-dot.stale { background: var(--amber); }
+  .status-label { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+
+  .main { max-width: 1280px; margin: 0 auto; padding: 20px 20px 40px; }
+
+  /* ── Section / card ────────────────────────────────────────── */
+  .section { margin-bottom: 20px; }
+  .section-label {
+    font-size: 10px; font-weight: 600; letter-spacing: .15em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 10px; display: flex; align-items: center; gap: 8px;
   }
-  .view-btn {
-    background: none;
-    border: none;
-    color: var(--muted);
-    font-size: 11px;
-    font-family: var(--mono);
-    padding: 5px 10px;
-    border-radius: 4px;
-    cursor: pointer;
-    transition: all 0.15s;
+  .section-label::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+  .section-label a { color: var(--amber); text-decoration: none; font-size: 10px; letter-spacing: normal; text-transform: none; }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px; }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; align-items: start; }
+  @media (max-width: 900px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+
+  /* ── KPI strip ─────────────────────────────────────────────── */
+  .kpi-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 20px; }
+  .kpi-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+  .kpi-label { font-size: 10px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; margin-bottom: 6px; }
+  .kpi-value { font-family: var(--mono); font-size: 22px; font-weight: 600; line-height: 1; }
+  .kpi-sub { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 5px; }
+  .kpi-value.pos { color: var(--green); } .kpi-value.neg { color: var(--red); }
+  .kpi-value.amber { color: var(--amber); } .kpi-value.purple { color: var(--purple); }
+
+  /* ── Stat card (reused) ────────────────────────────────────── */
+  .iv-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .stat-card { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; }
+  .stat-label { font-size: 10px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; margin-bottom: 4px; }
+  .stat-value { font-family: var(--mono); font-size: 20px; font-weight: 500; color: var(--text); line-height: 1; }
+  .stat-value.cheap { color: var(--green); } .stat-value.normal { color: var(--amber); } .stat-value.rich { color: var(--red); }
+  .stat-sub { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 3px; }
+  .stat-value.blank { color: var(--muted); font-size: 13px; }
+
+  /* ── Controls (IV tab) ─────────────────────────────────────── */
+  .iv-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 18px; }
+  .stock-search {
+    flex: 1; min-width: 180px; max-width: 280px; background: var(--surface2);
+    border: 1px solid var(--border); border-radius: 6px; color: var(--text);
+    font-family: var(--mono); font-size: 13px; padding: 8px 12px; outline: none; transition: border-color .2s;
   }
+  .stock-search:focus { border-color: var(--amber); }
+  .view-toggle { display: flex; gap: 4px; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 3px; }
+  .view-btn { background: none; border: none; color: var(--muted); font-size: 11px; font-family: var(--mono); padding: 5px 10px; border-radius: 4px; cursor: pointer; transition: all .15s; }
   .view-btn.active { background: var(--surface); color: var(--amber); }
 
-  /* ── IV Stats row ──────────────────────────────────────────── */
-  .iv-stats {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-    gap: 10px;
-    margin-bottom: 18px;
-  }
+  .ivr-bar-wrap { margin-top: 6px; height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .ivr-bar-fill { height: 100%; border-radius: 2px; transition: width .4s ease; background: var(--muted); }
+  .ivr-bar-fill.cheap { background: var(--green); } .ivr-bar-fill.normal { background: var(--amber); } .ivr-bar-fill.rich { background: var(--red); }
 
-  .stat-card {
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 12px 14px;
-  }
+  .chart-wrap { position: relative; height: 280px; margin-bottom: 4px; }
+  @media (max-width: 600px) { .chart-wrap { height: 220px; } }
+  .chart-empty { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--muted); font-size: 13px; font-family: var(--mono); }
 
-  .stat-label {
-    font-size: 10px;
-    color: var(--muted);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    margin-bottom: 4px;
-  }
-
-  .stat-value {
-    font-family: var(--mono);
-    font-size: 20px;
-    font-weight: 500;
-    color: var(--text);
-    line-height: 1;
-  }
-
-  .stat-value.cheap  { color: var(--green); }
-  .stat-value.normal { color: var(--amber); }
-  .stat-value.rich   { color: var(--red); }
-
-  .stat-sub {
-    font-family: var(--mono);
-    font-size: 10px;
-    color: var(--muted);
-    margin-top: 3px;
-  }
-
-  /* ── IVR gauge ─────────────────────────────────────────────── */
-  .ivr-bar-wrap {
-    margin-top: 6px;
-    height: 4px;
-    background: var(--border);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-  .ivr-bar-fill {
-    height: 100%;
-    border-radius: 2px;
-    transition: width 0.4s ease;
-    background: var(--muted);
-  }
-  .ivr-bar-fill.cheap  { background: var(--green); }
-  .ivr-bar-fill.normal { background: var(--amber); }
-  .ivr-bar-fill.rich   { background: var(--red); }
-
-  /* ── Chart container ───────────────────────────────────────── */
-  .chart-wrap {
-    position: relative;
-    height: 280px;
-    margin-bottom: 4px;
-  }
-
-  @media (max-width: 600px) {
-    .chart-wrap { height: 220px; }
-  }
-
-  .chart-empty {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    height: 100%;
-    color: var(--muted);
-    font-size: 13px;
-    font-family: var(--mono);
-  }
-
-  /* ── Symbol table ──────────────────────────────────────────── */
-  .symbol-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
-    gap: 8px;
-    max-height: 320px;
-    overflow-y: auto;
-    padding-right: 4px;
-  }
-
-  .sym-chip {
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 10px 12px;
-    cursor: pointer;
-    transition: border-color 0.15s;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
+  /* ── Symbol grid (Universe) ───────────────────────────────── */
+  .symbol-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; max-height: 320px; overflow-y: auto; padding-right: 4px; }
+  .sym-chip { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; cursor: pointer; transition: border-color .15s; display: flex; justify-content: space-between; align-items: center; }
   .sym-chip:hover { border-color: var(--amber-dim); }
   .sym-chip.selected { border-color: var(--amber); }
+  .sym-name { font-family: var(--mono); font-size: 12px; font-weight: 500; color: var(--text); }
+  .sym-ivr { font-family: var(--mono); font-size: 11px; padding: 2px 6px; border-radius: 4px; font-weight: 500; }
+  .sym-ivr.cheap { background: rgba(16,185,129,.15); color: var(--green); }
+  .sym-ivr.normal { background: rgba(245,158,11,.15); color: var(--amber); }
+  .sym-ivr.rich { background: rgba(239,68,68,.15); color: var(--red); }
+  .sym-ivr.na { background: var(--surface); color: var(--muted); }
 
-  .sym-name {
-    font-family: var(--mono);
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text);
+  /* ── Tables ────────────────────────────────────────────────── */
+  .data-table { width: 100%; border-collapse: collapse; }
+  .data-table th {
+    font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
+    font-weight: 600; text-align: left; padding: 0 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap;
   }
+  .data-table td { padding: 10px 8px; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 12px; vertical-align: middle; }
+  .data-table tr:last-child td { border-bottom: none; }
+  .table-scroll { overflow-x: auto; }
 
-  .sym-ivr {
-    font-family: var(--mono);
-    font-size: 11px;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-weight: 500;
-  }
-  .sym-ivr.cheap  { background: rgba(16,185,129,0.15); color: var(--green); }
-  .sym-ivr.normal { background: rgba(245,158,11,0.15); color: var(--amber); }
-  .sym-ivr.rich   { background: rgba(239,68,68,0.15);  color: var(--red); }
-  .sym-ivr.na     { background: var(--surface); color: var(--muted); }
+  .tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 10px; font-weight: 600; letter-spacing: .05em; white-space: nowrap; }
+  .tag.ce, .tag.call { background: rgba(99,102,241,.2); color: #818cf8; }
+  .tag.pe, .tag.put  { background: rgba(239,68,68,.15); color: var(--red); }
+  .tag.win  { background: rgba(16,185,129,.15); color: var(--green); }
+  .tag.loss { background: rgba(239,68,68,.15); color: var(--red); }
+  .tag.open { background: rgba(245,158,11,.15); color: var(--amber); }
+  .tag.composite { background: rgba(168,85,247,.15); color: var(--purple); }
+  .tag.discount   { background: rgba(245,158,11,.15); color: var(--amber); }
+  .tag.smartmoney { background: rgba(16,185,129,.15); color: var(--green); }
+  .tag.blockdeal  { background: rgba(99,102,241,.15); color: var(--blue); }
+  .tag.delivery   { background: rgba(226,232,240,.12); color: var(--text); }
+  .tag.na { background: var(--surface2); color: var(--muted); }
 
-  /* ── Paper trades table ─────────────────────────────────────── */
-  .trades-table { width: 100%; border-collapse: collapse; }
-  .trades-table th {
-    font-size: 10px;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--muted);
-    font-weight: 600;
-    text-align: left;
-    padding: 0 8px 10px;
-    border-bottom: 1px solid var(--border);
-  }
-  .trades-table td {
-    padding: 10px 8px;
-    border-bottom: 1px solid var(--border);
-    font-family: var(--mono);
-    font-size: 12px;
-    vertical-align: middle;
-  }
-  .trades-table tr:last-child td { border-bottom: none; }
+  .pnl-pos { color: var(--green); } .pnl-neg { color: var(--red); }
 
-  .tag {
-    display: inline-block;
-    padding: 2px 7px;
-    border-radius: 4px;
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 0.05em;
-  }
-  .tag.ce  { background: rgba(99,102,241,0.2); color: #818cf8; }
-  .tag.pe  { background: rgba(239,68,68,0.15); color: var(--red); }
-  .tag.win { background: rgba(16,185,129,0.15); color: var(--green); }
-  .tag.loss { background: rgba(239,68,68,0.15); color: var(--red); }
-  .tag.open { background: rgba(245,158,11,0.15); color: var(--amber); }
+  /* ── Sub-tabs (Open/Closed etc.) ───────────────────────────── */
+  .subtabs { display: flex; gap: 6px; margin-bottom: 12px; }
+  .subtab { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; color: var(--muted); font-family: var(--mono); font-size: 11px; padding: 6px 12px; cursor: pointer; }
+  .subtab.active { background: var(--amber); border-color: var(--amber); color: #000; }
 
-  .pnl-pos { color: var(--green); }
-  .pnl-neg { color: var(--red); }
+  /* ── Activity feed ─────────────────────────────────────────── */
+  .activity-list { display: flex; flex-direction: column; gap: 2px; max-height: 380px; overflow-y: auto; }
+  .activity-row { display: flex; gap: 10px; padding: 9px 4px; border-bottom: 1px solid var(--border); align-items: flex-start; }
+  .activity-row:last-child { border-bottom: none; }
+  .activity-ic { font-size: 14px; width: 18px; flex-shrink: 0; text-align: center; }
+  .activity-body { flex: 1; min-width: 0; }
+  .activity-label { font-size: 12px; font-weight: 500; }
+  .activity-detail { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .activity-time { font-family: var(--mono); font-size: 10px; color: var(--muted); white-space: nowrap; padding-top: 1px; }
 
-  /* ── Scrollbar ─────────────────────────────────────────────── */
-  ::-webkit-scrollbar { width: 4px; }
+  /* ── IV Regime gauge ───────────────────────────────────────── */
+  .gauge-wrap { display: flex; flex-direction: column; align-items: center; padding: 6px 0; }
+  .gauge { width: 130px; height: 130px; border-radius: 50%; position: relative; display: flex; align-items: center; justify-content: center; }
+  .gauge-inner { width: 96px; height: 96px; border-radius: 50%; background: var(--surface); display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .gauge-pct { font-family: var(--mono); font-size: 20px; font-weight: 600; }
+  .gauge-label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-top: 2px; }
+  .gauge-sub { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 10px; text-align: center; }
+
+  /* ── Market snapshot grid ──────────────────────────────────── */
+  .snap-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .snap-cell { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; }
+  .snap-label { font-size: 10px; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; margin-bottom: 6px; }
+  .snap-value { font-family: var(--mono); font-size: 17px; font-weight: 500; }
+  .snap-sub { font-family: var(--mono); font-size: 11px; margin-top: 3px; }
+  .snap-blank { color: var(--muted); font-size: 12px; font-family: var(--sans); }
+
+  /* ── Loading / errors ──────────────────────────────────────── */
+  .loading { color: var(--muted); font-family: var(--mono); font-size: 12px; padding: 20px 0; text-align: center; }
+  .error-msg { color: var(--red); font-family: var(--mono); font-size: 12px; padding: 12px; background: rgba(239,68,68,.08); border: 1px solid rgba(239,68,68,.2); border-radius: 6px; }
+  .empty-state { color: var(--muted); font-family: var(--mono); font-size: 12px; padding: 14px 4px; }
+
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
   ::-webkit-scrollbar-track { background: var(--surface); }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
-  /* ── Loading ───────────────────────────────────────────────── */
-  .loading {
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 12px;
-    padding: 20px 0;
-    text-align: center;
-  }
+  /* ── Mobile bottom nav ─────────────────────────────────────── */
+  .bottom-nav { display: none; }
 
-  .error-msg {
-    color: var(--red);
-    font-family: var(--mono);
-    font-size: 12px;
-    padding: 12px;
-    background: rgba(239,68,68,0.08);
-    border: 1px solid rgba(239,68,68,0.2);
-    border-radius: 6px;
-  }
+  @media (max-width: 900px) {
+    .sidebar { display: none; }
+    .content { padding-bottom: 70px; }
+    .main { padding: 14px 12px 30px; }
+    .kpi-strip { grid-template-columns: repeat(2, 1fr); }
+    .topbar { padding: 12px 14px; }
+    .topbar h1 { font-size: 16px; }
 
-  /* ── Nav tabs ──────────────────────────────────────────────── */
-  .nav-tabs {
-    display: flex;
-    gap: 2px;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 20px;
+    .bottom-nav {
+      display: flex; position: fixed; bottom: 0; left: 0; right: 0; z-index: 200;
+      background: var(--surface); border-top: 1px solid var(--border);
+      padding: 6px 0 8px;
+    }
+    .bnav-item {
+      flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
+      background: none; border: none; color: var(--muted); font-family: var(--sans);
+      font-size: 10px; padding: 4px 2px; cursor: pointer;
+    }
+    .bnav-item .ic { font-size: 17px; }
+    .bnav-item.active { color: var(--amber); }
   }
-  .nav-tab {
-    background: none;
-    border: none;
-    border-bottom: 2px solid transparent;
-    color: var(--muted);
-    font-family: var(--sans);
-    font-size: 13px;
-    font-weight: 500;
-    padding: 10px 16px;
-    cursor: pointer;
-    transition: all 0.15s;
-    margin-bottom: -1px;
-  }
-  .nav-tab:hover { color: var(--text); }
-  .nav-tab.active { color: var(--amber); border-bottom-color: var(--amber); }
 </style>
 </head>
 <body>
 
-<!-- Top bar -->
-<div class="topbar">
-  <div class="logo">fuzzy<span>-</span>tribble <span>/ dashboard</span></div>
-  <div style="display:flex;align-items:center;gap:12px">
-    <span id="last-update" class="status-label">—</span>
-    <span class="status-dot" id="status-dot"></span>
+<div class="app-shell">
+
+  <!-- Sidebar (desktop) -->
+  <div class="sidebar">
+    <div class="sidebar-logo">
+      <div class="name">ODT</div>
+      <div class="sub">Option Discount Trader</div>
+    </div>
+    <div class="sidebar-nav" id="sidebar-nav">
+      <button class="nav-item active" data-tab="overview" onclick="showTab('overview')"><span class="ic">&#9679;</span>Overview</button>
+      <button class="nav-item" data-tab="iv" onclick="showTab('iv')"><span class="ic">&#9633;</span>IV Graph</button>
+      <button class="nav-item" data-tab="trades" onclick="showTab('trades')"><span class="ic">&#9642;</span>Paper Trades</button>
+      <button class="nav-item" data-tab="market" onclick="showTab('market')"><span class="ic">&#9650;</span>Market</button>
+      <button class="nav-item" data-tab="alerts" onclick="showTab('alerts')"><span class="ic">&#9873;</span>Alerts</button>
+      <button class="nav-item" data-tab="universe" onclick="showTab('universe')"><span class="ic">&#9673;</span>Universe</button>
+    </div>
   </div>
+
+  <div class="content">
+
+    <!-- Topbar -->
+    <div class="topbar">
+      <h1 id="topbar-title">Overview</h1>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <div class="range-group" id="range-group">
+          <button class="range-btn" onclick="setRangeDays(1)">Today</button>
+          <button class="range-btn" onclick="setRangeDays(7)">This Week</button>
+          <button class="range-btn active" onclick="setRangeDays(30)">This Month</button>
+          <button class="range-btn" onclick="setRangeDays(365)">All</button>
+        </div>
+        <span id="last-update" class="status-label">—</span>
+        <span class="status-dot" id="status-dot"></span>
+      </div>
+    </div>
+
+    <div class="main">
+
+      <!-- ═══════════════════════════════════════════════ -->
+      <!-- TAB: OVERVIEW                                   -->
+      <!-- ═══════════════════════════════════════════════ -->
+      <div id="tab-overview">
+
+        <div class="kpi-strip" id="kpi-strip">
+          <div class="loading">Loading overview…</div>
+        </div>
+
+        <div class="grid-2">
+          <div class="section" style="margin-bottom:0">
+            <div class="section-label">Today's Top Opportunities <a href="#" onclick="showTab('alerts');return false">View All →</a></div>
+            <div class="card table-scroll" id="opportunities-card"><div class="loading">Loading…</div></div>
+          </div>
+          <div class="section" style="margin-bottom:0">
+            <div class="section-label">Market Snapshot</div>
+            <div class="card" id="snapshot-card"><div class="loading">Loading…</div></div>
+          </div>
+        </div>
+
+        <div class="section"></div>
+
+        <div class="grid-2">
+          <div class="section" style="margin-bottom:0">
+            <div class="section-label">Recent Paper Trades</div>
+            <div class="card">
+              <div class="subtabs" id="ov-trade-subtabs">
+                <button class="subtab active" onclick="setOvTradeView('open')">Open</button>
+                <button class="subtab" onclick="setOvTradeView('closed')">Closed</button>
+              </div>
+              <div class="table-scroll" id="ov-trades-card"><div class="loading">Loading…</div></div>
+            </div>
+          </div>
+          <div class="section" style="margin-bottom:0">
+            <div class="section-label">P&amp;L Overview</div>
+            <div class="card">
+              <div class="iv-stats" id="ov-pnl-stats" style="margin-bottom:12px"></div>
+              <div class="chart-wrap" style="height:200px"><canvas id="ov-pnl-chart"></canvas></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section"></div>
+
+        <div class="grid-3">
+          <div class="section" style="margin-bottom:0">
+            <div class="section-label">Strategy Performance</div>
+            <div class="card table-scroll" id="strategy-card"><div class="loading">Loading…</div></div>
+          </div>
+          <div class="section" style="margin-bottom:0">
+            <div class="section-label">IV Regime Analysis</div>
+            <div class="card" id="regime-card"><div class="loading">Loading…</div></div>
+          </div>
+          <div class="section" style="margin-bottom:0">
+            <div class="section-label">Today's Activity</div>
+            <div class="card" id="activity-card"><div class="loading">Loading…</div></div>
+          </div>
+        </div>
+
+      </div><!-- /tab-overview -->
+
+
+      <!-- ═══════════════════════════════════════════════ -->
+      <!-- TAB: IV GRAPH                                   -->
+      <!-- ═══════════════════════════════════════════════ -->
+      <div id="tab-iv" style="display:none">
+        <div class="section">
+          <div class="section-label">IV Graph</div>
+          <div class="card">
+            <div class="iv-controls">
+              <input type="text" id="stock-input" class="stock-search" placeholder="Symbol — e.g. NIFTY" autocomplete="off" oninput="onSymbolInput(this.value)">
+              <div class="range-group" id="iv-range-group">
+                <button class="range-btn" onclick="setIvRange(7)">7D</button>
+                <button class="range-btn active" onclick="setIvRange(30)">30D</button>
+                <button class="range-btn" onclick="setIvRange(90)">90D</button>
+                <button class="range-btn" onclick="setIvRange(252)">1Y</button>
+              </div>
+              <div class="view-toggle">
+                <button class="view-btn active" id="vbtn-daily" onclick="setView('daily')">Daily</button>
+                <button class="view-btn" id="vbtn-intraday" onclick="setView('intraday')">Today</button>
+              </div>
+            </div>
+            <div id="sym-dropdown" style="position:relative;margin-bottom:12px;display:none">
+              <div id="sym-list" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;max-height:200px;overflow-y:auto;position:absolute;top:0;left:0;width:280px;z-index:50;"></div>
+            </div>
+            <div class="iv-stats" id="iv-stats">
+              <div class="stat-card"><div class="stat-label">Current IV</div><div class="stat-value" id="stat-iv">—</div><div class="stat-sub">ATM IV %</div></div>
+              <div class="stat-card"><div class="stat-label">IV Rank</div><div class="stat-value" id="stat-ivr">—</div><div class="ivr-bar-wrap"><div class="ivr-bar-fill" id="ivr-bar" style="width:0%"></div></div></div>
+              <div class="stat-card"><div class="stat-label">52W Range</div><div class="stat-value" id="stat-range" style="font-size:14px;padding-top:4px">—</div><div class="stat-sub" id="stat-samples">— samples</div></div>
+              <div class="stat-card"><div class="stat-label">PCR</div><div class="stat-value" id="stat-pcr">—</div><div class="stat-sub">Put / Call OI</div></div>
+            </div>
+            <div class="chart-wrap">
+              <div class="chart-empty" id="chart-empty">Select a symbol to view IV history</div>
+              <canvas id="iv-chart" style="display:none"></canvas>
+            </div>
+            <div style="font-size:10px;color:var(--muted);text-align:right;margin-top:6px;font-family:var(--mono)" id="chart-meta"></div>
+          </div>
+        </div>
+      </div><!-- /tab-iv -->
+
+
+      <!-- ═══════════════════════════════════════════════ -->
+      <!-- TAB: PAPER TRADES                               -->
+      <!-- ═══════════════════════════════════════════════ -->
+      <div id="tab-trades" style="display:none">
+        <div class="section">
+          <div class="section-label">Today's Trades</div>
+          <div class="card table-scroll" id="trades-today-card"><div class="loading">Loading trades…</div></div>
+        </div>
+        <div class="section">
+          <div class="section-label">30-Day P&amp;L</div>
+          <div class="card">
+            <div class="iv-stats" id="pnl-stats" style="margin-bottom:14px">
+              <div class="stat-card"><div class="stat-label">Total Trades</div><div class="stat-value" id="s-total">—</div></div>
+              <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value" id="s-wr">—</div></div>
+              <div class="stat-card"><div class="stat-label">Net P&amp;L</div><div class="stat-value" id="s-pnl">—</div></div>
+              <div class="stat-card"><div class="stat-label">Expectancy</div><div class="stat-value" id="s-exp">—</div><div class="stat-sub">₹ per trade</div></div>
+            </div>
+            <div class="chart-wrap" style="height:200px"><canvas id="pnl-chart"></canvas></div>
+          </div>
+        </div>
+        <div class="section">
+          <div class="section-label">Strategy Performance (30 days)</div>
+          <div class="card table-scroll" id="strategy-card-2"><div class="loading">Loading…</div></div>
+        </div>
+      </div><!-- /tab-trades -->
+
+
+      <!-- ═══════════════════════════════════════════════ -->
+      <!-- TAB: MARKET                                     -->
+      <!-- ═══════════════════════════════════════════════ -->
+      <div id="tab-market" style="display:none">
+        <div class="section">
+          <div class="section-label">Market Snapshot</div>
+          <div class="card" id="snapshot-card-2"><div class="loading">Loading…</div></div>
+        </div>
+      </div><!-- /tab-market -->
+
+
+      <!-- ═══════════════════════════════════════════════ -->
+      <!-- TAB: ALERTS                                     -->
+      <!-- ═══════════════════════════════════════════════ -->
+      <div id="tab-alerts" style="display:none">
+        <div class="section">
+          <div class="section-label">Today's Top Opportunities</div>
+          <div class="card table-scroll" id="opportunities-card-2"><div class="loading">Loading…</div></div>
+        </div>
+        <div class="section">
+          <div class="section-label">Activity Feed</div>
+          <div class="card" id="activity-card-2"><div class="loading">Loading…</div></div>
+        </div>
+      </div><!-- /tab-alerts -->
+
+
+      <!-- ═══════════════════════════════════════════════ -->
+      <!-- TAB: UNIVERSE                                   -->
+      <!-- ═══════════════════════════════════════════════ -->
+      <div id="tab-universe" style="display:none">
+        <div class="section">
+          <div class="section-label">IV Universe — <span id="uni-count">—</span> stocks</div>
+          <div class="card">
+            <div style="margin-bottom:12px"><input type="text" class="stock-search" id="uni-filter" placeholder="Filter symbols…" oninput="filterUniverse(this.value)" style="max-width:100%;width:100%"></div>
+            <div class="symbol-grid" id="universe-grid"><div class="loading">Loading universe…</div></div>
+          </div>
+        </div>
+      </div><!-- /tab-universe -->
+
+    </div><!-- /main -->
+  </div><!-- /content -->
+</div><!-- /app-shell -->
+
+<!-- Mobile bottom nav -->
+<div class="bottom-nav" id="bottom-nav">
+  <button class="bnav-item active" data-tab="overview" onclick="showTab('overview')"><span class="ic">&#9679;</span>Overview</button>
+  <button class="bnav-item" data-tab="trades" onclick="showTab('trades')"><span class="ic">&#9642;</span>Trades</button>
+  <button class="bnav-item" data-tab="alerts" onclick="showTab('alerts')"><span class="ic">&#9873;</span>Alerts</button>
+  <button class="bnav-item" data-tab="market" onclick="showTab('market')"><span class="ic">&#9650;</span>Market</button>
+  <button class="bnav-item" data-tab="universe" onclick="showTab('universe')"><span class="ic">&#8942;</span>More</button>
 </div>
-
-<div class="main">
-
-  <!-- Nav -->
-  <div class="nav-tabs">
-    <button class="nav-tab active" onclick="showTab('iv')">IV Graph</button>
-    <button class="nav-tab" onclick="showTab('trades')">Paper Trades</button>
-    <button class="nav-tab" onclick="showTab('universe')">Universe</button>
-  </div>
-
-  <!-- ═══════════════════════════════════════════════════════════ -->
-  <!-- TAB: IV GRAPH                                              -->
-  <!-- ═══════════════════════════════════════════════════════════ -->
-  <div id="tab-iv">
-
-    <div class="section">
-      <div class="section-label">IV Graph</div>
-      <div class="card">
-        <!-- Controls -->
-        <div class="iv-controls">
-          <input type="text" id="stock-input" class="stock-search"
-                 placeholder="Symbol — e.g. NIFTY" autocomplete="off"
-                 oninput="onSymbolInput(this.value)">
-          <div class="range-group" id="range-group">
-            <button class="range-btn" onclick="setRange(7)">7D</button>
-            <button class="range-btn active" onclick="setRange(30)">30D</button>
-            <button class="range-btn" onclick="setRange(90)">90D</button>
-            <button class="range-btn" onclick="setRange(252)">1Y</button>
-          </div>
-          <div class="view-toggle">
-            <button class="view-btn active" id="vbtn-daily" onclick="setView('daily')">Daily</button>
-            <button class="view-btn" id="vbtn-intraday" onclick="setView('intraday')">Today</button>
-          </div>
-        </div>
-
-        <!-- Autocomplete dropdown -->
-        <div id="sym-dropdown" style="position:relative;margin-bottom:12px;display:none">
-          <div id="sym-list" style="
-            background:var(--surface2);border:1px solid var(--border);
-            border-radius:6px;max-height:200px;overflow-y:auto;position:absolute;
-            top:0;left:0;width:280px;z-index:50;"></div>
-        </div>
-
-        <!-- IV Stats -->
-        <div class="iv-stats" id="iv-stats">
-          <div class="stat-card">
-            <div class="stat-label">Current IV</div>
-            <div class="stat-value" id="stat-iv">—</div>
-            <div class="stat-sub" id="stat-iv-sub">ATM IV %</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-label">IV Rank</div>
-            <div class="stat-value" id="stat-ivr">—</div>
-            <div class="ivr-bar-wrap"><div class="ivr-bar-fill" id="ivr-bar" style="width:0%"></div></div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-label">52W Range</div>
-            <div class="stat-value" id="stat-range" style="font-size:14px;padding-top:4px">—</div>
-            <div class="stat-sub" id="stat-samples">— samples</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-label">PCR</div>
-            <div class="stat-value" id="stat-pcr">—</div>
-            <div class="stat-sub">Put / Call OI</div>
-          </div>
-        </div>
-
-        <!-- Chart -->
-        <div class="chart-wrap">
-          <div class="chart-empty" id="chart-empty">Select a symbol to view IV history</div>
-          <canvas id="iv-chart" style="display:none"></canvas>
-        </div>
-        <div style="font-size:10px;color:var(--muted);text-align:right;margin-top:6px;font-family:var(--mono)" id="chart-meta"></div>
-      </div>
-    </div>
-
-  </div><!-- /tab-iv -->
-
-
-  <!-- ═══════════════════════════════════════════════════════════ -->
-  <!-- TAB: PAPER TRADES                                          -->
-  <!-- ═══════════════════════════════════════════════════════════ -->
-  <div id="tab-trades" style="display:none">
-
-    <div class="section">
-      <div class="section-label">Today's Trades</div>
-      <div class="card" id="trades-today-card">
-        <div class="loading">Loading trades…</div>
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="section-label">30-Day P&L</div>
-      <div class="card">
-        <div class="iv-stats" id="pnl-stats" style="margin-bottom:14px">
-          <div class="stat-card">
-            <div class="stat-label">Total Trades</div>
-            <div class="stat-value" id="s-total">—</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-label">Win Rate</div>
-            <div class="stat-value" id="s-wr">—</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-label">Net P&L</div>
-            <div class="stat-value" id="s-pnl">—</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-label">Expectancy</div>
-            <div class="stat-value" id="s-exp">—</div>
-            <div class="stat-sub">₹ per trade</div>
-          </div>
-        </div>
-        <div class="chart-wrap" style="height:200px">
-          <canvas id="pnl-chart"></canvas>
-        </div>
-      </div>
-    </div>
-
-  </div><!-- /tab-trades -->
-
-
-  <!-- ═══════════════════════════════════════════════════════════ -->
-  <!-- TAB: UNIVERSE                                              -->
-  <!-- ═══════════════════════════════════════════════════════════ -->
-  <div id="tab-universe" style="display:none">
-    <div class="section">
-      <div class="section-label">IV Universe — <span id="uni-count">—</span> stocks</div>
-      <div class="card">
-        <div style="margin-bottom:12px">
-          <input type="text" class="stock-search" id="uni-filter"
-                 placeholder="Filter symbols…" oninput="filterUniverse(this.value)"
-                 style="max-width:100%;width:100%">
-        </div>
-        <div class="symbol-grid" id="universe-grid">
-          <div class="loading">Loading universe…</div>
-        </div>
-      </div>
-    </div>
-  </div><!-- /tab-universe -->
-
-</div><!-- /main -->
-
 
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
+const TABS = ['overview','iv','trades','market','alerts','universe'];
 let currentSymbol = null;
-let currentRange  = 30;
-let currentView   = 'daily';
-let ivChart       = null;
-let pnlChart      = null;
-let allSymbols    = [];
+let currentIvRange = 30;
+let currentView    = 'daily';
+let rangeDays      = 30;          // header date-range selector (Today/Week/Month/All)
+let ovTradeView    = 'open';
+let ivChart = null, pnlChart = null, ovPnlChart = null;
+let allSymbols = [];
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -568,16 +503,44 @@ function fmtPnl(v) {
   return `${sign}₹${Math.round(v).toLocaleString('en-IN')}`;
 }
 
+function fmtNum(v, nd=2) {
+  return (v === null || v === undefined) ? '—' : Number(v).toFixed(nd);
+}
+
+function timeOf(ts) {
+  if (!ts) return '—';
+  const t = String(ts);
+  return t.length >= 16 ? t.slice(11,16) : t;
+}
+
+function blank(label) {
+  return `<span class="snap-blank">${label}</span>`;
+}
+
 // ── Tab switching ──────────────────────────────────────────────────────────
+const TAB_TITLES = { overview:'Overview', iv:'IV Graph', trades:'Paper Trades', market:'Market', alerts:'Alerts', universe:'Universe' };
+
 function showTab(name) {
-  ['iv','trades','universe'].forEach(t => {
-    $(`tab-${t}`).style.display = t === name ? '' : 'none';
+  TABS.forEach(t => { $(`tab-${t}`).style.display = t === name ? '' : 'none'; });
+  document.querySelectorAll('.nav-item, .bnav-item').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.tab === name);
   });
-  document.querySelectorAll('.nav-tab').forEach((btn, i) => {
-    btn.classList.toggle('active', ['iv','trades','universe'][i] === name);
-  });
-  if (name === 'trades'   && !pnlChart) loadTrades();
+  $('topbar-title').textContent = TAB_TITLES[name] || name;
+
+  if (name === 'overview') loadOverview();
+  if (name === 'trades')   { loadTrades(); loadStrategyPerformance('strategy-card-2'); }
   if (name === 'universe' && allSymbols.length === 0) loadUniverse();
+  if (name === 'market')   loadMarketSnapshot('snapshot-card-2');
+  if (name === 'alerts')   { loadOpportunities('opportunities-card-2'); loadActivity('activity-card-2'); }
+}
+
+// ── Header date-range selector ──────────────────────────────────────────────
+function setRangeDays(d) {
+  rangeDays = d;
+  document.querySelectorAll('#range-group .range-btn').forEach(b => {
+    b.classList.toggle('active', b.textContent === ({1:'Today',7:'This Week',30:'This Month',365:'All'})[d]);
+  });
+  loadOverview();
 }
 
 // ── Health / status bar ────────────────────────────────────────────────────
@@ -600,28 +563,302 @@ async function checkHealth() {
   }
 }
 
-// ── Symbol autocomplete ────────────────────────────────────────────────────
-let _symTimer = null;
+// ══════════════════════════════════════════════════════════════════════════
+// OVERVIEW TAB
+// ══════════════════════════════════════════════════════════════════════════
+async function loadOverview() {
+  loadKpis();
+  loadOpportunities('opportunities-card');
+  loadMarketSnapshot('snapshot-card');
+  loadOvTrades();
+  loadOvPnlChart();
+  loadStrategyPerformance('strategy-card');
+  loadIvRegime();
+  loadActivity('activity-card');
+}
 
+async function loadKpis() {
+  const el = $('kpi-strip');
+  try {
+    const o = await api(`/api/overview?days=${rangeDays}`);
+    const pf = o.profit_factor;
+    el.innerHTML = `
+      <div class="kpi-card">
+        <div class="kpi-label">Net P&amp;L (Paper)</div>
+        <div class="kpi-value ${o.net_rupees >= 0 ? 'pos' : 'neg'}">${fmtPnl(o.net_rupees)}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Win Rate</div>
+        <div class="kpi-value ${o.win_rate >= 50 ? 'pos' : 'neg'}">${o.win_rate}%</div>
+        <div class="kpi-sub">${o.closed_trades} closed</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Total Trades</div>
+        <div class="kpi-value">${o.total_trades}</div>
+        <div class="kpi-sub">${o.closed_trades} closed · ${o.open_trades} open</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Expectancy</div>
+        <div class="kpi-value ${o.expectancy >= 0 ? 'pos' : 'neg'}">${fmtPnl(o.expectancy)}</div>
+        <div class="kpi-sub">per trade</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Profit Factor</div>
+        <div class="kpi-value ${pf === null ? '' : (pf >= 1.5 ? 'pos' : pf >= 1 ? 'amber' : 'neg')}">${pf === null ? '—' : pf.toFixed(2)}</div>
+        <div class="kpi-sub">${pf === null ? 'no losses yet' : (pf >= 1.5 ? 'Good' : pf >= 1 ? 'Marginal' : 'Weak')}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Best Strategy</div>
+        <div class="kpi-value purple" style="font-size:16px">${o.best_strategy ? o.best_strategy.name : '—'}</div>
+        <div class="kpi-sub">${o.best_strategy ? `Win Rate: ${o.best_strategy.win_rate}%` : 'no closed trades yet'}</div>
+      </div>`;
+  } catch(e) {
+    el.innerHTML = `<div class="error-msg">Could not load overview: ${e.message}</div>`;
+  }
+}
+
+async function loadOpportunities(targetId) {
+  const el = $(targetId);
+  try {
+    const data = await api('/api/opportunities?limit=12');
+    if (!data.opportunities.length) {
+      el.innerHTML = '<div class="empty-state">No Composite Conviction data yet — this list is populated by the composite scanner (runs 20:15 / 22:45), so it may be empty earlier in the day or on a fresh install.</div>';
+      return;
+    }
+    const rows = data.opportunities.map(o => {
+      const dirTag = (o.direction === 'CE') ? 'BUY CALL' : (o.direction === 'PE') ? 'BUY PUT' : (o.direction || '—');
+      const dirCls = (o.direction === 'CE') ? 'ce' : (o.direction === 'PE') ? 'pe' : 'na';
+      const badges = [];
+      if (o.grade === 'STRONG' || (o.score||0) >= 70) badges.push('<span class="tag composite">COMPOSITE</span>');
+      if (o.smart_money_bias) badges.push('<span class="tag smartmoney">SMART MONEY</span>');
+      if (o.block_deal) badges.push('<span class="tag blockdeal">BLOCK DEAL</span>');
+      if (o.delivery_bias) badges.push('<span class="tag delivery">DELIVERY</span>');
+      return `<tr>
+        <td style="color:var(--text);font-weight:600">${o.symbol}</td>
+        <td><span class="stat-value" style="font-size:15px">${o.score ?? '—'}</span></td>
+        <td><span class="tag ${dirCls}">${dirTag}</span></td>
+        <td>${o.iv_rank ?? '—'}</td>
+        <td>${o.pcr ?? '—'}</td>
+        <td>${badges.join(' ') || '<span class="tag na">—</span>'}</td>
+        <td style="color:var(--muted);font-size:10px">${timeOf(o.composite_as_of)}</td>
+      </tr>`;
+    }).join('');
+    el.innerHTML = `<table class="data-table">
+      <thead><tr><th>Symbol</th><th>Score</th><th>Setup</th><th>IV Rank</th><th>PCR</th><th>Signals</th><th>As of</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  } catch(e) {
+    el.innerHTML = `<div class="error-msg">Could not load opportunities: ${e.message}</div>`;
+  }
+}
+
+async function loadMarketSnapshot(targetId) {
+  const el = $(targetId);
+  try {
+    const d = await api('/api/market-snapshot');
+    const vix = d.india_vix;
+    const nf  = d.nifty;
+    const bn  = d.banknifty;
+    const br  = d.breadth;
+    el.innerHTML = `
+      <div class="snap-grid">
+        <div class="snap-cell">
+          <div class="snap-label">NIFTY 50</div>
+          ${nf ? `<div class="snap-value">₹${fmtNum(nf.spot,2)}</div><div class="snap-sub" style="color:var(--muted)">PCR ${nf.pcr ?? '—'}</div>` : blank('Not tracked in this scan universe')}
+        </div>
+        <div class="snap-cell">
+          <div class="snap-label">BANKNIFTY</div>
+          ${bn ? `<div class="snap-value">₹${fmtNum(bn.spot,2)}</div><div class="snap-sub" style="color:var(--muted)">PCR ${bn.pcr ?? '—'}</div>` : blank('Not tracked in this scan universe')}
+        </div>
+        <div class="snap-cell">
+          <div class="snap-label">India VIX</div>
+          ${vix ? `<div class="snap-value">${fmtNum(vix.value,2)}</div><div class="snap-sub" style="color:${vix.pct_change>=0?'var(--red)':'var(--green)'}">${vix.pct_change>=0?'+':''}${fmtNum(vix.pct_change,2)}%</div>` : blank('No VIX data yet')}
+        </div>
+        <div class="snap-cell">
+          <div class="snap-label">Market Breadth</div>
+          ${br ? `<div class="snap-value">${br.advancers}↑ / ${br.decliners}↓</div><div class="snap-sub" style="color:var(--muted)">${br.market_pct?.toFixed(0) ?? '—'}% · F&amp;O universe only</div>` : blank('Not enough intraday names yet')}
+        </div>
+        <div class="snap-cell">
+          <div class="snap-label">FII (Cash)</div>
+          ${blank('Not collected in this system')}
+        </div>
+        <div class="snap-cell">
+          <div class="snap-label">DII (Cash)</div>
+          ${blank('Not collected in this system')}
+        </div>
+      </div>`;
+  } catch(e) {
+    el.innerHTML = `<div class="error-msg">Could not load market snapshot: ${e.message}</div>`;
+  }
+}
+
+function setOvTradeView(v) {
+  ovTradeView = v;
+  document.querySelectorAll('#ov-trade-subtabs .subtab').forEach((b,i) => b.classList.toggle('active', (i===0 && v==='open') || (i===1 && v==='closed')));
+  loadOvTrades();
+}
+
+async function loadOvTrades() {
+  const el = $('ov-trades-card');
+  try {
+    const today = await api('/api/paper-trades');
+    const trades = today.trades.filter(t => ovTradeView === 'open' ? t.status === 'open' : t.status !== 'open');
+    el.innerHTML = tradesTable(trades);
+  } catch(e) {
+    el.innerHTML = `<div class="error-msg">Could not load trades: ${e.message}</div>`;
+  }
+}
+
+function tradesTable(trades) {
+  if (!trades || !trades.length) return '<div class="empty-state">No trades in this view</div>';
+  const rows = trades.map(t => {
+    const side = (t.side || '').toUpperCase();
+    const pnl = t.realized_rupees, pct = t.realized_pct;
+    const status = t.status === 'open' ? 'open' : (pnl >= 0 ? 'win' : 'loss');
+    const pnlCell = pnl !== null && pnl !== undefined
+      ? `<span class="${pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtPnl(pnl)} (${pct > 0 ? '+' : ''}${(pct||0).toFixed(1)}%)</span>` : '—';
+    return `<tr>
+      <td style="color:var(--text);font-weight:500">${t.symbol}</td>
+      <td>${t.strategy || '—'}</td>
+      <td><span class="tag ${side.toLowerCase()}">${side}</span></td>
+      <td>₹${(t.entry||0).toFixed(2)}</td>
+      <td>₹${(t.last_price||0).toFixed(2)}</td>
+      <td>${pnlCell}</td>
+      <td><span class="tag ${status}">${status.toUpperCase()}</span></td>
+    </tr>`;
+  }).join('');
+  return `<table class="data-table"><thead><tr><th>Symbol</th><th>Strategy</th><th>Side</th><th>Entry</th><th>LTP</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function loadOvPnlChart() {
+  try {
+    const hist = await api(`/api/paper-trades/history?days=${Math.min(rangeDays, 90)}`);
+    renderPnlStatsInto('ov', hist.summary);
+    renderPnlChartInto('ov-pnl-chart', hist.daily, c => ovPnlChart = c, ovPnlChart);
+  } catch(e) {
+    $('ov-pnl-stats').innerHTML = `<div class="error-msg">${e.message}</div>`;
+  }
+}
+
+function renderPnlStatsInto(prefix, s) {
+  const el = $(`${prefix}-pnl-stats`);
+  if (!s) { el.innerHTML = ''; return; }
+  el.innerHTML = `
+    <div class="stat-card"><div class="stat-label">Net P&amp;L</div><div class="stat-value ${s.net_rupees>=0?'cheap':'rich'}">${fmtPnl(s.net_rupees)}</div></div>
+    <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value ${s.win_rate>=50?'cheap':'rich'}">${s.win_rate}%</div></div>
+    <div class="stat-card"><div class="stat-label">Trades</div><div class="stat-value">${s.total_trades}</div></div>
+    <div class="stat-card"><div class="stat-label">Expectancy</div><div class="stat-value ${s.expectancy>=0?'cheap':'rich'}">${fmtPnl(s.expectancy)}</div></div>`;
+}
+
+function renderPnlChartInto(canvasId, daily, setter, existing) {
+  if (existing) existing.destroy();
+  if (!daily || !daily.length) { setter(null); return; }
+  const ctx = $(canvasId).getContext('2d');
+  const chart = new Chart(ctx, {
+    data: {
+      labels: daily.map(d => d.date.slice(5)),
+      datasets: [
+        { type:'bar', label:'Daily P&L', data: daily.map(d=>d.net_rupees),
+          backgroundColor: daily.map(d => (d.net_rupees||0)>=0 ? 'rgba(16,185,129,0.5)' : 'rgba(239,68,68,0.5)'),
+          borderRadius: 3, yAxisID: 'y' },
+        { type:'line', label:'Cumulative', data: daily.map(d=>d.cumulative),
+          borderColor:'#f59e0b', borderWidth:1.5, pointRadius:0, fill:false, tension:0.3, yAxisID:'y' },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color:'#4a5568', font:{family:'JetBrains Mono',size:10}, boxWidth:16 } },
+        tooltip: { backgroundColor:'#0f0f1a', borderColor:'#1e1e35', borderWidth:1, titleColor:'#94a3b8', bodyColor:'#e2e8f0', bodyFont:{family:'JetBrains Mono',size:11}, padding:8 } },
+      scales: {
+        x: { ticks:{color:'#4a5568',font:{family:'JetBrains Mono',size:9},maxTicksLimit:10}, grid:{color:'#1e1e35'} },
+        y: { ticks:{color:'#64748b',font:{family:'JetBrains Mono',size:9}, callback:v=>'₹'+v.toLocaleString('en-IN')}, grid:{color:'#1a1a2e'} },
+      }
+    }
+  });
+  setter(chart);
+}
+
+async function loadStrategyPerformance(targetId) {
+  const el = $(targetId);
+  try {
+    const data = await api(`/api/strategy-performance?days=${rangeDays}`);
+    if (!data.strategies.length) { el.innerHTML = '<div class="empty-state">No closed trades in this window</div>'; return; }
+    const rows = data.strategies.map(s => `<tr>
+      <td style="color:var(--text);font-weight:500">${s.strategy}</td>
+      <td class="${s.net_rupees>=0?'pnl-pos':'pnl-neg'}">${fmtPnl(s.net_rupees)}</td>
+      <td>${s.win_rate}%</td>
+      <td>${s.profit_factor ?? '—'}</td>
+      <td>${s.trades}</td>
+    </tr>`).join('');
+    el.innerHTML = `<table class="data-table"><thead><tr><th>Strategy</th><th>Net P&amp;L</th><th>Win Rate</th><th>Profit Factor</th><th>Trades</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } catch(e) {
+    el.innerHTML = `<div class="error-msg">${e.message}</div>`;
+  }
+}
+
+async function loadIvRegime() {
+  const el = $('regime-card');
+  try {
+    // Prefer NIFTY as the benchmark if it's in the universe; else the first
+    // symbol with the most IV history (highest-liquidity proxy).
+    if (allSymbols.length === 0) allSymbols = await api('/api/symbols');
+    const bench = allSymbols.find(s => s.symbol === 'NIFTY') || allSymbols[0];
+    if (!bench) { el.innerHTML = '<div class="empty-state">No IV history yet</div>'; return; }
+    const d = await api(`/api/iv/${bench.symbol}?days=252`);
+    const rank = d.iv_rank ?? 0;
+    const cls = ivrClass(d.iv_rank);
+    const color = cls === 'cheap' ? '#10b981' : cls === 'rich' ? '#ef4444' : '#f59e0b';
+    el.innerHTML = `
+      <div class="gauge-wrap">
+        <div class="gauge" style="background: conic-gradient(${color} ${Math.min(rank,100)*3.6}deg, var(--border) 0deg)">
+          <div class="gauge-inner">
+            <div class="gauge-pct">${fmtNum(d.current_iv,1)}%</div>
+            <div class="gauge-label">Current IV</div>
+          </div>
+        </div>
+        <div class="gauge-sub">${bench.symbol} · IV Rank: ${fmtNum(d.iv_rank,1)}<br>(52W Range: ${fmtNum(d.iv_min_52w,1)} – ${fmtNum(d.iv_max_52w,1)})</div>
+      </div>`;
+  } catch(e) {
+    el.innerHTML = `<div class="empty-state">No IV history yet for a benchmark symbol</div>`;
+  }
+}
+
+const ACTIVITY_ICONS = { composite:'⬥', smart_money:'💰', oi_buildup:'📈', gap:'⚡', sonar:'📡', delivery:'📦' };
+
+async function loadActivity(targetId) {
+  const el = $(targetId);
+  try {
+    const data = await api('/api/activity?limit=20');
+    if (!data.events.length) { el.innerHTML = '<div class="empty-state">No scanner activity recorded yet</div>'; return; }
+    el.innerHTML = `<div class="activity-list">${data.events.map(e => `
+      <div class="activity-row">
+        <div class="activity-ic">${ACTIVITY_ICONS[e.type] || '•'}</div>
+        <div class="activity-body">
+          <div class="activity-label">${e.label} <span style="color:var(--muted);font-weight:400">· ${e.symbol}</span></div>
+          <div class="activity-detail">${e.detail}</div>
+        </div>
+        <div class="activity-time">${timeOf(e.ts)}</div>
+      </div>`).join('')}</div>`;
+  } catch(e) {
+    el.innerHTML = `<div class="error-msg">${e.message}</div>`;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// IV GRAPH TAB (existing behaviour, preserved)
+// ══════════════════════════════════════════════════════════════════════════
+let _symTimer = null;
 function onSymbolInput(val) {
   clearTimeout(_symTimer);
   val = val.trim().toUpperCase();
   if (!val) { $('sym-dropdown').style.display = 'none'; return; }
   const matches = allSymbols.filter(s => s.symbol.startsWith(val)).slice(0, 10);
   if (!matches.length) { $('sym-dropdown').style.display = 'none'; return; }
-
   $('sym-list').innerHTML = matches.map(s => `
-    <div onclick="selectSymbol('${s.symbol}')" style="
-      padding:9px 12px;cursor:pointer;display:flex;justify-content:space-between;
-      font-family:var(--mono);font-size:12px;border-bottom:1px solid var(--border)
-    " onmouseover="this.style.background='var(--surface)'"
-       onmouseout="this.style.background=''">
+    <div onclick="selectSymbol('${s.symbol}')" style="padding:9px 12px;cursor:pointer;display:flex;justify-content:space-between;font-family:var(--mono);font-size:12px;border-bottom:1px solid var(--border)"
+       onmouseover="this.style.background='var(--surface)'" onmouseout="this.style.background=''">
       <span>${s.symbol}</span>
-      <span class="sym-ivr ${ivrClass(s.iv_rank)}">
-        ${s.iv_rank !== null ? `IVR ${s.iv_rank}` : 'N/A'}
-      </span>
-    </div>
-  `).join('');
+      <span class="sym-ivr ${ivrClass(s.iv_rank)}">${s.iv_rank !== null ? `IVR ${s.iv_rank}` : 'N/A'}</span>
+    </div>`).join('');
   $('sym-dropdown').style.display = '';
 }
 
@@ -631,12 +868,10 @@ function selectSymbol(sym) {
   loadIVChart(sym);
 }
 
-// ── Range + view ───────────────────────────────────────────────────────────
-function setRange(days) {
-  currentRange = days;
-  document.querySelectorAll('.range-btn').forEach(b => {
-    b.classList.toggle('active', b.textContent === days + 'D' ||
-                                  (days === 252 && b.textContent === '1Y'));
+function setIvRange(days) {
+  currentIvRange = days;
+  document.querySelectorAll('#iv-range-group .range-btn').forEach(b => {
+    b.classList.toggle('active', b.textContent === days + 'D' || (days === 252 && b.textContent === '1Y'));
   });
   if (currentSymbol) loadIVChart(currentSymbol);
 }
@@ -645,291 +880,118 @@ function setView(v) {
   currentView = v;
   $('vbtn-daily').classList.toggle('active', v === 'daily');
   $('vbtn-intraday').classList.toggle('active', v === 'intraday');
-  const rangeGroup = $('range-group');
+  const rangeGroup = $('iv-range-group');
   rangeGroup.style.opacity = v === 'intraday' ? '0.3' : '1';
   rangeGroup.style.pointerEvents = v === 'intraday' ? 'none' : '';
   if (currentSymbol) loadIVChart(currentSymbol);
 }
 
-// ── IV Chart ───────────────────────────────────────────────────────────────
 async function loadIVChart(symbol) {
   currentSymbol = symbol;
   $('chart-empty').style.display = 'none';
   $('iv-chart').style.display = '';
-
   try {
     let data;
-    if (currentView === 'intraday') {
-      data = await api(`/api/iv/${symbol}/intraday`);
-    } else {
-      data = await api(`/api/iv/${symbol}?days=${currentRange}`);
-    }
+    if (currentView === 'intraday') data = await api(`/api/iv/${symbol}/intraday`);
+    else data = await api(`/api/iv/${symbol}?days=${currentIvRange}`);
 
-    // Update stats
     const iv = data.current_iv ?? (data.atm_iv ? data.atm_iv[data.atm_iv.length - 1] : null);
     const rank = data.iv_rank;
-    const cls  = ivrClass(rank);
+    const cls = ivrClass(rank);
 
-    $('stat-iv').textContent   = iv ? iv.toFixed(1) + '%' : '—';
-    $('stat-iv').className     = 'stat-value';
-    $('stat-ivr').textContent  = rank !== undefined && rank !== null ? rank.toFixed(1) : '—';
-    $('stat-ivr').className    = `stat-value ${cls}`;
-    $('ivr-bar').style.width   = `${Math.min(rank ?? 0, 100)}%`;
-    $('ivr-bar').className     = `ivr-bar-fill ${cls}`;
+    $('stat-iv').textContent = iv ? iv.toFixed(1) + '%' : '—';
+    $('stat-iv').className = 'stat-value';
+    $('stat-ivr').textContent = rank !== undefined && rank !== null ? rank.toFixed(1) : '—';
+    $('stat-ivr').className = `stat-value ${cls}`;
+    $('ivr-bar').style.width = `${Math.min(rank ?? 0, 100)}%`;
+    $('ivr-bar').className = `ivr-bar-fill ${cls}`;
 
     if (data.iv_min_52w && data.iv_max_52w) {
-      $('stat-range').textContent  = `${data.iv_min_52w.toFixed(1)} – ${data.iv_max_52w.toFixed(1)}`;
+      $('stat-range').textContent = `${data.iv_min_52w.toFixed(1)} – ${data.iv_max_52w.toFixed(1)}`;
       $('stat-samples').textContent = `${data.n_samples || '?'} samples`;
     }
 
-    // PCR — latest value
     const pcrArr = data.pcr || [];
     const lastPcr = pcrArr.filter(x => x !== null).slice(-1)[0];
     $('stat-pcr').textContent = lastPcr ? lastPcr.toFixed(2) : '—';
-    $('stat-pcr').className   = 'stat-value ' +
-      (lastPcr > 1.2 ? 'cheap' : lastPcr < 0.6 ? 'rich' : '');
-
+    $('stat-pcr').className = 'stat-value ' + (lastPcr > 1.2 ? 'cheap' : lastPcr < 0.6 ? 'rich' : '');
     $('chart-meta').textContent = `${symbol} · ${data.timestamps?.length ?? 0} data points`;
 
     renderIVChart(data);
-
   } catch(e) {
-    $('chart-empty').textContent = e.message.includes('404')
-      ? `No IV data for ${symbol}`
-      : `Error: ${e.message}`;
+    $('chart-empty').textContent = e.message.includes('404') ? `No IV data for ${symbol}` : `Error: ${e.message}`;
     $('chart-empty').style.display = 'flex';
-    $('iv-chart').style.display    = 'none';
+    $('iv-chart').style.display = 'none';
   }
 }
 
 function renderIVChart(data) {
   if (ivChart) ivChart.destroy();
-
-  const ctx  = $('iv-chart').getContext('2d');
-  const labels = data.timestamps;
-  const ivData  = data.atm_iv;
-  const spotData = data.spot;
-  const pcrData  = data.pcr;
-
+  const ctx = $('iv-chart').getContext('2d');
   ivChart = new Chart(ctx, {
     data: {
-      labels,
+      labels: data.timestamps,
       datasets: [
-        {
-          type: 'line',
-          label: 'ATM IV %',
-          data: ivData,
-          borderColor: '#f59e0b',
-          backgroundColor: 'rgba(245,158,11,0.07)',
-          borderWidth: 1.8,
-          pointRadius: 0,
-          pointHoverRadius: 4,
-          fill: true,
-          tension: 0.3,
-          yAxisID: 'y',
-        },
-        {
-          type: 'line',
-          label: 'Spot ₹',
-          data: spotData,
-          borderColor: '#6366f1',
-          borderWidth: 1.2,
-          pointRadius: 0,
-          pointHoverRadius: 3,
-          fill: false,
-          tension: 0.2,
-          borderDash: [4, 3],
-          yAxisID: 'y2',
-        },
-        {
-          type: 'line',
-          label: 'PCR',
-          data: pcrData,
-          borderColor: '#10b981',
-          borderWidth: 1.2,
-          pointRadius: 0,
-          pointHoverRadius: 3,
-          fill: false,
-          tension: 0.3,
-          borderDash: [2, 4],
-          yAxisID: 'y3',
-        },
+        { type:'line', label:'ATM IV %', data:data.atm_iv, borderColor:'#f59e0b', backgroundColor:'rgba(245,158,11,0.07)', borderWidth:1.8, pointRadius:0, pointHoverRadius:4, fill:true, tension:0.3, yAxisID:'y' },
+        { type:'line', label:'Spot ₹', data:data.spot, borderColor:'#6366f1', borderWidth:1.2, pointRadius:0, pointHoverRadius:3, fill:false, tension:0.2, borderDash:[4,3], yAxisID:'y2' },
+        { type:'line', label:'PCR', data:data.pcr, borderColor:'#10b981', borderWidth:1.2, pointRadius:0, pointHoverRadius:3, fill:false, tension:0.3, borderDash:[2,4], yAxisID:'y3' },
       ]
     },
     options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode:'index', intersect:false },
       plugins: {
-        legend: {
-          labels: {
-            color: '#4a5568',
-            font: { family: 'JetBrains Mono', size: 10 },
-            boxWidth: 20,
-            padding: 12,
-          }
-        },
-        tooltip: {
-          backgroundColor: '#0f0f1a',
-          borderColor: '#1e1e35',
-          borderWidth: 1,
-          titleColor: '#94a3b8',
-          bodyColor: '#e2e8f0',
-          titleFont: { family: 'JetBrains Mono', size: 10 },
-          bodyFont:  { family: 'JetBrains Mono', size: 11 },
-          padding: 10,
-        }
+        legend: { labels: { color:'#4a5568', font:{family:'JetBrains Mono',size:10}, boxWidth:20, padding:12 } },
+        tooltip: { backgroundColor:'#0f0f1a', borderColor:'#1e1e35', borderWidth:1, titleColor:'#94a3b8', bodyColor:'#e2e8f0', titleFont:{family:'JetBrains Mono',size:10}, bodyFont:{family:'JetBrains Mono',size:11}, padding:10 }
       },
       scales: {
-        x: {
-          ticks: {
-            color: '#4a5568',
-            font: { family: 'JetBrains Mono', size: 9 },
-            maxTicksLimit: 8,
-            maxRotation: 0,
-          },
-          grid: { color: '#1e1e35' },
-        },
-        y: {
-          position: 'left',
-          ticks: {
-            color: '#f59e0b',
-            font: { family: 'JetBrains Mono', size: 9 },
-            callback: v => v.toFixed(1) + '%',
-          },
-          grid: { color: '#1a1a2e' },
-        },
-        y2: {
-          position: 'right',
-          display: (spotData || []).some(x => x > 0),
-          ticks: {
-            color: '#6366f1',
-            font: { family: 'JetBrains Mono', size: 9 },
-            callback: v => '₹' + v.toLocaleString('en-IN'),
-          },
-          grid: { display: false },
-        },
-        y3: {
-          position: 'right',
-          display: false,  // PCR on tooltip only — avoids 3-axis clutter
-          grid: { display: false },
-        },
+        x: { ticks:{color:'#4a5568',font:{family:'JetBrains Mono',size:9},maxTicksLimit:8,maxRotation:0}, grid:{color:'#1e1e35'} },
+        y: { position:'left', ticks:{color:'#f59e0b',font:{family:'JetBrains Mono',size:9}, callback:v=>v.toFixed(1)+'%'}, grid:{color:'#1a1a2e'} },
+        y2: { position:'right', display:(data.spot||[]).some(x=>x>0), ticks:{color:'#6366f1',font:{family:'JetBrains Mono',size:9}, callback:v=>'₹'+v.toLocaleString('en-IN')}, grid:{display:false} },
+        y3: { position:'right', display:false, grid:{display:false} },
       }
     }
   });
 }
 
-// ── Paper Trades ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+// PAPER TRADES TAB (existing behaviour, preserved)
+// ══════════════════════════════════════════════════════════════════════════
 async function loadTrades() {
   try {
     const today = await api('/api/paper-trades');
-    renderTodayTrades(today.trades);
-
-    const hist  = await api('/api/paper-trades/history?days=30');
+    $('trades-today-card').innerHTML = tradesTable(today.trades);
+    const hist = await api('/api/paper-trades/history?days=30');
     renderPnlStats(hist.summary);
     renderPnlChart(hist.daily);
   } catch(e) {
-    $('trades-today-card').innerHTML =
-      `<div class="error-msg">Could not load trades: ${e.message}</div>`;
+    $('trades-today-card').innerHTML = `<div class="error-msg">Could not load trades: ${e.message}</div>`;
   }
-}
-
-function renderTodayTrades(trades) {
-  if (!trades || !trades.length) {
-    $('trades-today-card').innerHTML =
-      '<div style="color:var(--muted);font-family:var(--mono);font-size:12px;padding:8px 0">No trades today</div>';
-    return;
-  }
-  const rows = trades.map(t => {
-    const side = (t.side || '').toUpperCase();
-    const pnl  = t.realized_rupees;
-    const pct  = t.realized_pct;
-    const status = t.status === 'open' ? 'open' : pnl >= 0 ? 'win' : 'loss';
-    const pnlCell = pnl !== null
-      ? `<span class="${pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtPnl(pnl)} (${pct > 0 ? '+' : ''}${(pct||0).toFixed(1)}%)</span>`
-      : '—';
-    return `<tr>
-      <td style="color:var(--text);font-weight:500">${t.symbol}</td>
-      <td><span class="tag ${side.toLowerCase()}">${side}</span></td>
-      <td>${t.strike || '—'}</td>
-      <td>₹${(t.entry||0).toFixed(2)}</td>
-      <td>₹${(t.last_price||0).toFixed(2)}</td>
-      <td>${pnlCell}</td>
-      <td><span class="tag ${status}">${status.toUpperCase()}</span></td>
-    </tr>`;
-  }).join('');
-
-  $('trades-today-card').innerHTML = `
-    <table class="trades-table">
-      <thead><tr>
-        <th>Symbol</th><th>Side</th><th>Strike</th>
-        <th>Entry</th><th>LTP</th><th>P&L</th><th>Status</th>
-      </tr></thead>
-      <tbody>${rows}</tbody>
-    </table>`;
 }
 
 function renderPnlStats(s) {
   if (!s) return;
   $('s-total').textContent = s.total_trades;
-  $('s-wr').textContent    = s.win_rate + '%';
-  $('s-wr').className      = 'stat-value ' + (s.win_rate >= 50 ? 'cheap' : s.win_rate >= 35 ? 'normal' : 'rich');
-  $('s-pnl').textContent   = fmtPnl(s.net_rupees);
-  $('s-pnl').className     = 'stat-value ' + (s.net_rupees >= 0 ? 'cheap' : 'rich');
-  $('s-exp').textContent   = fmtPnl(s.expectancy);
-  $('s-exp').className     = 'stat-value ' + (s.expectancy >= 0 ? 'cheap' : 'rich');
+  $('s-wr').textContent = s.win_rate + '%';
+  $('s-wr').className = 'stat-value ' + (s.win_rate >= 50 ? 'cheap' : s.win_rate >= 35 ? 'normal' : 'rich');
+  $('s-pnl').textContent = fmtPnl(s.net_rupees);
+  $('s-pnl').className = 'stat-value ' + (s.net_rupees >= 0 ? 'cheap' : 'rich');
+  $('s-exp').textContent = fmtPnl(s.expectancy);
+  $('s-exp').className = 'stat-value ' + (s.expectancy >= 0 ? 'cheap' : 'rich');
 }
 
 function renderPnlChart(daily) {
-  if (pnlChart) pnlChart.destroy();
-  if (!daily || !daily.length) return;
-  const ctx = $('pnl-chart').getContext('2d');
-  pnlChart = new Chart(ctx, {
-    data: {
-      labels: daily.map(d => d.date.slice(5)),  // MM-DD
-      datasets: [
-        {
-          type: 'bar',
-          label: 'Daily P&L',
-          data: daily.map(d => d.net_rupees),
-          backgroundColor: daily.map(d => (d.net_rupees||0) >= 0
-            ? 'rgba(16,185,129,0.5)' : 'rgba(239,68,68,0.5)'),
-          borderRadius: 3,
-          yAxisID: 'y',
-        },
-        {
-          type: 'line',
-          label: 'Cumulative',
-          data: daily.map(d => d.cumulative),
-          borderColor: '#f59e0b',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          fill: false,
-          tension: 0.3,
-          yAxisID: 'y',
-        },
-      ]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { labels: { color: '#4a5568', font: { family: 'JetBrains Mono', size: 10 }, boxWidth: 16 } },
-        tooltip: { backgroundColor: '#0f0f1a', borderColor: '#1e1e35', borderWidth: 1,
-          titleColor: '#94a3b8', bodyColor: '#e2e8f0',
-          bodyFont: { family: 'JetBrains Mono', size: 11 }, padding: 8 } },
-      scales: {
-        x: { ticks: { color: '#4a5568', font: { family: 'JetBrains Mono', size: 9 }, maxTicksLimit: 10 }, grid: { color: '#1e1e35' } },
-        y: { ticks: { color: '#64748b', font: { family: 'JetBrains Mono', size: 9 }, callback: v => '₹' + v.toLocaleString('en-IN') }, grid: { color: '#1a1a2e' } },
-      }
-    }
-  });
+  renderPnlChartInto('pnl-chart', daily, c => pnlChart = c, pnlChart);
 }
 
-// ── Universe ───────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+// UNIVERSE TAB (existing behaviour, preserved)
+// ══════════════════════════════════════════════════════════════════════════
 let allUniverse = [];
-
 async function loadUniverse() {
   try {
     allUniverse = await api('/api/symbols');
+    allSymbols = allUniverse;
     $('uni-count').textContent = allUniverse.length;
     renderUniverse(allUniverse);
   } catch(e) {
@@ -938,19 +1000,12 @@ async function loadUniverse() {
 }
 
 function renderUniverse(syms) {
-  if (!syms.length) {
-    $('universe-grid').innerHTML = '<div class="loading">No symbols yet</div>';
-    return;
-  }
+  if (!syms.length) { $('universe-grid').innerHTML = '<div class="loading">No symbols yet</div>'; return; }
   $('universe-grid').innerHTML = syms.map(s => `
-    <div class="sym-chip ${s.symbol === currentSymbol ? 'selected' : ''}"
-         onclick="showTab('iv');selectSymbol('${s.symbol}')">
+    <div class="sym-chip ${s.symbol === currentSymbol ? 'selected' : ''}" onclick="showTab('iv');selectSymbol('${s.symbol}')">
       <span class="sym-name">${s.symbol}</span>
-      <span class="sym-ivr ${ivrClass(s.iv_rank)}">
-        ${s.iv_rank !== null && s.iv_rank !== undefined ? s.iv_rank.toFixed(0) : 'N/A'}
-      </span>
-    </div>
-  `).join('');
+      <span class="sym-ivr ${ivrClass(s.iv_rank)}">${s.iv_rank !== null && s.iv_rank !== undefined ? s.iv_rank.toFixed(0) : 'N/A'}</span>
+    </div>`).join('');
 }
 
 function filterUniverse(val) {
@@ -962,14 +1017,10 @@ function filterUniverse(val) {
 async function boot() {
   checkHealth();
   setInterval(checkHealth, 60000);
-
-  // Pre-load symbols for autocomplete
-  try {
-    allSymbols = await api('/api/symbols');
-  } catch(e) {}
+  try { allSymbols = await api('/api/symbols'); } catch(e) {}
+  loadOverview();
 }
 
-// Close autocomplete on outside click
 document.addEventListener('click', e => {
   if (!e.target.closest('#stock-input') && !e.target.closest('#sym-dropdown')) {
     $('sym-dropdown').style.display = 'none';

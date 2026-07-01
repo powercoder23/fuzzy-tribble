@@ -16,7 +16,7 @@ import schedule
 
 from config import Config
 from collectors import iv_store
-from sonar_laplace_config import OUTPUT_CSV, SCAN_TIMES
+from sonar_laplace_config import OUTPUT_CSV, SCAN_TIMES, ALERTS_ENABLED
 from sonar_laplace_scanner import SonarScanner
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -55,7 +55,10 @@ def run_sonar_scan():
         df.to_csv(OUTPUT_CSV, index=False)
         logger.info("Sonar results saved to %s", OUTPUT_CSV)
     scanner.persist(df)
-    scanner.send_telegram(df)
+    if ALERTS_ENABLED:
+        scanner.send_telegram(df)
+    else:
+        logger.info("Sonar-Laplace alerts disabled (SONAR_ALERTS_ENABLED=false) — scan persisted, no Telegram push")
     return df
 
 

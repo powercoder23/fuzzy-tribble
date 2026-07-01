@@ -14,6 +14,19 @@ GET  /api/iv/{symbol}/intraday  → today's intraday IV ticks
 GET  /api/paper-trades          → today's paper trades
 GET  /api/paper-trades/history  → last 30 days P&L summary
 GET  /api/health                → DB row counts + last update time
+GET  /api/overview              → header KPIs (net P&L, win rate, expectancy,
+                                   profit factor, best strategy, open/closed count)
+GET  /api/strategy-performance  → per-strategy net P&L / win rate / profit factor
+GET  /api/opportunities         → latest Composite Conviction list, enriched with
+                                   IV Rank / PCR / smart-money / delivery / block-deal
+GET  /api/market-snapshot       → India VIX, F&O-universe breadth, NIFTY/BANKNIFTY
+                                   spot+PCR if tracked. FII/DII and Max Pain are
+                                   NOT collected anywhere in this system — always null.
+GET  /api/activity              → merged recent events across the *_history tables
+
+Every field that isn't backed by a real collector (FII/DII cash flow, true Max
+Pain) is returned as null rather than estimated or faked — the frontend must
+render those as an explicit blank/"—" state, never a placeholder number.
 """
 
 from __future__ import annotations
@@ -256,6 +269,277 @@ def paper_trades_history(days: int = Query(30, ge=1, le=90)):
             "expectancy":   round(total_pnl / total_trades, 0) if total_trades else 0,
         },
     }
+
+
+# ── Overview KPIs (header strip) ─────────────────────────────────────────── #
+@app.get("/api/overview")
+def overview(days: int = Query(30, ge=1, le=365)):
+    """Net P&L, win rate, expectancy, profit factor, best strategy, open/closed
+    counts — everything the header KPI strip needs, over the trailing `days`."""
+    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    rows = _pt(
+        "SELECT status, realized_rupees, strategy FROM paper_trades WHERE date >= ?",
+        (since,),
+    )
+    closed = [r for r in rows if r["status"] == "closed"]
+    open_n = sum(1 for r in rows if r["status"] == "open")
+    wins   = [r for r in closed if (r["realized_rupees"] or 0) > 0]
+    losses = [r for r in closed if (r["realized_rupees"] or 0) < 0]
+    gross_win  = sum((r["realized_rupees"] or 0) for r in wins)
+    gross_loss = abs(sum((r["realized_rupees"] or 0) for r in losses))
+    net = sum((r["realized_rupees"] or 0) for r in closed)
+
+    by_strat: dict = {}
+    for r in closed:
+        s = r["strategy"] or "Unknown"
+        d = by_strat.setdefault(s, {"n": 0, "net": 0.0, "wins": 0})
+        d["n"] += 1
+        d["net"] += (r["realized_rupees"] or 0)
+        if (r["realized_rupees"] or 0) > 0:
+            d["wins"] += 1
+    best_strategy = None
+    if by_strat:
+        name, d = max(by_strat.items(), key=lambda kv: kv[1]["net"])
+        best_strategy = {
+            "name": name,
+            "win_rate": round(d["wins"] / d["n"] * 100, 1) if d["n"] else 0,
+            "net_rupees": round(d["net"], 0),
+        }
+
+    return {
+        "days": days,
+        "total_trades": len(rows),
+        "open_trades": open_n,
+        "closed_trades": len(closed),
+        "win_rate": round(len(wins) / len(closed) * 100, 1) if closed else 0,
+        "net_rupees": round(net, 0),
+        "expectancy": round(net / len(closed), 0) if closed else 0,
+        "profit_factor": round(gross_win / gross_loss, 2) if gross_loss else None,
+        "best_strategy": best_strategy,
+    }
+
+
+# ── Per-strategy performance ─────────────────────────────────────────────── #
+@app.get("/api/strategy-performance")
+def strategy_performance(days: int = Query(30, ge=1, le=365)):
+    """Net P&L / win rate / profit factor, grouped by the `strategy` tag on
+    each closed paper trade."""
+    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    rows = _pt(
+        "SELECT strategy, realized_rupees FROM paper_trades "
+        "WHERE date >= ? AND status='closed'",
+        (since,),
+    )
+    by_strat: dict = {}
+    for r in rows:
+        s = r["strategy"] or "Unknown"
+        d = by_strat.setdefault(
+            s, {"n": 0, "net": 0.0, "wins": 0, "gross_win": 0.0, "gross_loss": 0.0}
+        )
+        rr = r["realized_rupees"] or 0
+        d["n"] += 1
+        d["net"] += rr
+        if rr > 0:
+            d["wins"] += 1
+            d["gross_win"] += rr
+        elif rr < 0:
+            d["gross_loss"] += abs(rr)
+
+    out = []
+    for s, d in sorted(by_strat.items(), key=lambda kv: kv[1]["net"], reverse=True):
+        out.append({
+            "strategy": s,
+            "trades": d["n"],
+            "net_rupees": round(d["net"], 0),
+            "win_rate": round(d["wins"] / d["n"] * 100, 1) if d["n"] else 0,
+            "profit_factor": round(d["gross_win"] / d["gross_loss"], 2) if d["gross_loss"] else None,
+        })
+    return {"days": days, "strategies": out}
+
+
+# ── Latest-per-symbol helper (shared by opportunities + snapshot) ────────── #
+def _latest_per_symbol(table: str, cols: str) -> dict:
+    """{security_id: row} for the most recent row per security_id in `table`.
+    Returns {} if the table doesn't exist yet (fresh install) instead of raising."""
+    try:
+        rows = _iv(f"""
+            SELECT t.security_id, {cols}, t.timestamp AS _ts
+            FROM {table} t
+            INNER JOIN (
+                SELECT security_id, MAX(timestamp) AS mt FROM {table} GROUP BY security_id
+            ) latest ON latest.security_id = t.security_id AND latest.mt = t.timestamp
+        """)
+    except Exception:
+        return {}
+    return {r["security_id"]: r for r in rows}
+
+
+# ── Today's Top Opportunities (Composite Conviction, enriched) ──────────── #
+@app.get("/api/opportunities")
+def opportunities(limit: int = Query(12, ge=1, le=50)):
+    """Latest Composite Conviction score per symbol, enriched with IV Rank,
+    PCR/OI classification, and smart-money/delivery/block-deal flags.
+
+    Composite only refreshes on its own EOD cadence (20:15/22:45) — `as_of`
+    on every row is the real DB timestamp, so the frontend can show exactly
+    how stale it is instead of implying a live intraday trigger.
+    """
+    comp = _iv(f"""
+        SELECT c.security_id, c.symbol, c.direction, c.score, c.grade,
+               c.n_factors, c.contributing, c.iv_zone, c.vix_regime,
+               c.timestamp AS as_of
+        FROM composite_history c
+        INNER JOIN (
+            SELECT security_id, MAX(timestamp) AS mt FROM composite_history GROUP BY security_id
+        ) latest ON latest.security_id = c.security_id AND latest.mt = c.timestamp
+        ORDER BY c.score DESC
+        LIMIT ?
+    """, (limit,))
+
+    ivr_map = _latest_per_symbol("iv_rank_history", "iv_rank, zone")
+    oib_map = _latest_per_symbol("oi_buildup_history", "pcr, classification")
+    sm_map  = _latest_per_symbol("smart_money_history", "bias")
+    ds_map  = _latest_per_symbol("delivery_surge_history", "bias, surge_x")
+
+    # Block deals: deals table has no security_id, so match by symbol text
+    # over the last 2 calendar days.
+    since = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
+    try:
+        deal_syms = {
+            (r["symbol"] or "").strip().upper()
+            for r in _iv("SELECT DISTINCT symbol FROM deals WHERE date >= ?", (since,))
+        }
+    except Exception:
+        deal_syms = set()
+
+    out = []
+    for r in comp:
+        sid = r["security_id"]
+        ivr, oib, sm, ds = ivr_map.get(sid), oib_map.get(sid), sm_map.get(sid), ds_map.get(sid)
+        out.append({
+            "symbol": r["symbol"],
+            "direction": r["direction"],
+            "score": round(r["score"], 1) if r["score"] is not None else None,
+            "grade": r["grade"],
+            "contributing": r["contributing"],
+            "iv_zone": r["iv_zone"],
+            "vix_regime": r["vix_regime"],
+            "iv_rank": round(ivr["iv_rank"], 1) if ivr and ivr["iv_rank"] is not None else None,
+            "pcr": round(oib["pcr"], 2) if oib and oib["pcr"] is not None else None,
+            "oi_classification": oib["classification"] if oib else None,
+            "smart_money_bias": sm["bias"] if sm else None,
+            "delivery_bias": ds["bias"] if ds else None,
+            "block_deal": (r["symbol"] or "").strip().upper() in deal_syms,
+            "composite_as_of": r["as_of"],
+        })
+    return {"count": len(out), "opportunities": out}
+
+
+# ── Market snapshot ───────────────────────────────────────────────────────── #
+@app.get("/api/market-snapshot")
+def market_snapshot():
+    """India VIX, F&O-universe market/sector breadth, and NIFTY/BANKNIFTY
+    spot+PCR if those symbols happen to be in the tracked universe.
+
+    FII/DII cash-flow figures and true Max Pain are NOT computed anywhere in
+    this system (no collector for either) — both are always null here. Do
+    not estimate or backfill these; render an explicit blank state instead.
+    """
+    vix_rows = _iv("SELECT date, close, pct_change FROM vix_daily ORDER BY date DESC LIMIT 1")
+    vix = vix_rows[0] if vix_rows else None
+
+    snap = None
+    try:
+        import breadth
+        snap = breadth.compute(
+            db_path=str(IV_DB),
+            sector_db_path=str(DATA_DIR / "sector_mapping.db"),
+        )
+    except Exception:
+        snap = None
+
+    def _index_snapshot(sym: str):
+        rows = _iv("""
+            SELECT spot_price, total_call_oi, total_put_oi, timestamp
+            FROM iv_history WHERE symbol=? AND data_type='intraday'
+            ORDER BY timestamp DESC LIMIT 1
+        """, (sym,))
+        if not rows:
+            return None
+        r = rows[0]
+        pcr = (round(r["total_put_oi"] / r["total_call_oi"], 2)
+               if (r["total_call_oi"] or 0) > 0 else None)
+        return {"spot": r["spot_price"], "pcr": pcr, "as_of": r["timestamp"]}
+
+    return {
+        "india_vix": ({
+            "value": vix["close"], "pct_change": vix["pct_change"], "as_of": vix["date"],
+        } if vix else None),
+        "nifty": _index_snapshot("NIFTY"),
+        "banknifty": _index_snapshot("BANKNIFTY"),
+        "breadth": ({
+            "market_pct": snap.market_pct,
+            "advancers": snap.adv,
+            "decliners": snap.dec,
+            "as_of": snap.day,
+            "universe_note": "F&O scan universe only — not the full exchange",
+        } if snap and snap.total else None),
+        "fii_dii": None,   # not collected anywhere — deliberately blank
+        "max_pain": None,  # not computed anywhere — deliberately blank
+    }
+
+
+# ── Merged activity / alerts feed ─────────────────────────────────────────── #
+@app.get("/api/activity")
+def activity(limit: int = Query(20, ge=1, le=100)):
+    """Recent events merged across every *_history scanner table, sorted by
+    real timestamp. This is a log of what each scanner actually wrote, not a
+    synthetic live feed."""
+    events = []
+
+    def _add(table, cols, build):
+        try:
+            rows = _iv(f"SELECT {cols}, timestamp AS ts FROM {table} ORDER BY timestamp DESC LIMIT 30")
+        except Exception:
+            rows = []
+        for r in rows:
+            try:
+                events.append(build(r))
+            except Exception:
+                continue
+
+    _add("composite_history", "symbol, score, grade",
+         lambda r: {"ts": r["ts"], "type": "composite", "label": "Composite Trigger",
+                    "symbol": r["symbol"],
+                    "detail": f"Score {(r['score'] or 0):.0f} · {r['grade'] or ''}"})
+    _add("smart_money_history", "symbol, bias, net_value_cr",
+         lambda r: {"ts": r["ts"], "type": "smart_money",
+                    "label": f"Smart Money {r['bias'] or ''}".strip(),
+                    "symbol": r["symbol"],
+                    "detail": f"Net Rs.{(r['net_value_cr'] or 0):.1f}Cr"})
+    _add("oi_buildup_history", "symbol, classification, oi_chg_pct, price_chg_pct",
+         lambda r: {"ts": r["ts"], "type": "oi_buildup",
+                    "label": r["classification"] or "OI Buildup",
+                    "symbol": r["symbol"],
+                    "detail": f"OI {(r['oi_chg_pct'] or 0):+.1f}% · Px {(r['price_chg_pct'] or 0):+.1f}%"})
+    _add("gap_history", "symbol, direction, gap_pct",
+         lambda r: {"ts": r["ts"], "type": "gap",
+                    "label": f"Gap {r['direction'] or ''}".strip(),
+                    "symbol": r["symbol"],
+                    "detail": f"{(r['gap_pct'] or 0):+.1f}% gap"})
+    _add("sonar_history", "symbol, signal, bias, slope_pct",
+         lambda r: {"ts": r["ts"], "type": "sonar",
+                    "label": r["signal"] or "Sonar",
+                    "symbol": r["symbol"],
+                    "detail": f"{r['bias'] or ''} · slope {(r['slope_pct'] or 0):+.2f}%"})
+    _add("delivery_surge_history", "symbol, bias, surge_x, deliv_pct",
+         lambda r: {"ts": r["ts"], "type": "delivery",
+                    "label": f"Delivery Surge {r['bias'] or ''}".strip(),
+                    "symbol": r["symbol"],
+                    "detail": f"{(r['surge_x'] or 0):.1f}x avg · {(r['deliv_pct'] or 0):.0f}% deliv"})
+
+    events.sort(key=lambda e: e["ts"] or "", reverse=True)
+    return {"events": events[:limit]}
 
 
 # ── Health ────────────────────────────────────────────────────────────────── #

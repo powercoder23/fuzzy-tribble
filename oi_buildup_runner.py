@@ -15,7 +15,7 @@ import schedule
 
 from config import Config
 from collectors import iv_store
-from oi_buildup_config import OUTPUT_CSV, SCAN_TIMES
+from oi_buildup_config import OUTPUT_CSV, SCAN_TIMES, ALERTS_ENABLED
 from oi_buildup_scanner import OIBuildupScanner
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -50,7 +50,10 @@ def run_oi_buildup_scan():
         logger.info("OI Buildup results saved to %s", OUTPUT_CSV)
 
     scanner.persist(df)
-    scanner.send_telegram(df)
+    if ALERTS_ENABLED:
+        scanner.send_telegram(df)
+    else:
+        logger.info("OI Buildup alerts disabled (OIB_ALERTS_ENABLED=false) — scan persisted, no Telegram push")
     return df
 
 

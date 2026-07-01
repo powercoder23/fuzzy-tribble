@@ -29,3 +29,8 @@ OUTPUT_CSV    = str(Path("data") / "oi_buildup_opportunities.csv")
 PERSIST_TABLE = "oi_buildup_history"
 
 SCAN_TIMES = os.getenv("OIB_SCAN_TIMES", "09:45,11:30,13:30,15:15").split(",")
+
+# Scanning + persistence to oi_buildup_history always run regardless of this
+# flag. This only controls the external Telegram push — set to true to make
+# the scanner alert-visible again; default is internal-use-only (false).
+ALERTS_ENABLED = os.getenv("OIB_ALERTS_ENABLED", "false").strip().lower() == "true"

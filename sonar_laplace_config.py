@@ -42,3 +42,9 @@ PERSIST_TABLE = "sonar_history"
 # Intraday scanner — align with the other intraday screeners.
 SCAN_TIMES = os.getenv("SONAR_SCAN_TIMES",
                        "09:50,10:15,10:45,11:30,13:30,15:00").split(",")
+
+# Scanning + persistence to sonar_history always run regardless of this flag,
+# and paper_trader's Sonar side-override gate (get_latest_sonar) is unaffected
+# either way — it reads sonar_history directly, not Telegram. This only
+# controls the external Telegram push; default is internal-use-only (false).
+ALERTS_ENABLED = os.getenv("SONAR_ALERTS_ENABLED", "false").strip().lower() == "true"
