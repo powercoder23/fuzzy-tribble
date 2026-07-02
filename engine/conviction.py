@@ -26,8 +26,11 @@ FACTOR_WEIGHTS = {
 # Gate stack — hard, unordered, any-fail = reject with reason
 # --------------------------------------------------------------------------- #
 def run_gates(regime: RegimeState, factors: dict, trigger: TriggerEvent,
-              risk_state: dict | None = None, now_hhmm: str | None = None) -> list[GateResult]:
-    """risk_state: {open_positions, day_pnl_pct, sl_hits_today} (executor-fed)."""
+              risk_state: dict | None = None, now_hhmm: str | None = None,
+              expected_move_pct: float | None = None) -> list[GateResult]:
+    """risk_state: {open_positions, day_pnl_pct, sl_hits_today} (executor-fed).
+    expected_move_pct: 1-day 1-sigma move from ATM IV; None = data unavailable,
+    gate not applied (fail-open)."""
     rs = risk_state or {}
     gates: list[GateResult] = []
 
@@ -58,6 +61,12 @@ def run_gates(regime: RegimeState, factors: dict, trigger: TriggerEvent,
     if now_hhmm is not None:
         gate("entry_cutoff", now_hhmm <= cfg.ENTRY_CUTOFF,
              "" if now_hhmm <= cfg.ENTRY_CUTOFF else f"past {cfg.ENTRY_CUTOFF}")
+
+    if expected_move_pct is not None:
+        gate("moves_enough", expected_move_pct >= cfg.MIN_EXPECTED_MOVE_PCT,
+             "" if expected_move_pct >= cfg.MIN_EXPECTED_MOVE_PCT
+             else f"expected move {expected_move_pct:.2f}% < {cfg.MIN_EXPECTED_MOVE_PCT}% "
+                  f"— theta outruns movement")
 
     gate("slots_free", rs.get("open_positions", 0) < cfg.MAX_CONCURRENT,
          "" if rs.get("open_positions", 0) < cfg.MAX_CONCURRENT else "max concurrent")

@@ -84,7 +84,10 @@ class EnginePipeline:
                         why=f"{symbol} — context {cs}, awaiting trigger"))
                 continue
 
-            gates = conviction.run_gates(regime, f, trig, risk_state, now_hhmm)
+            from engine import expected_move
+            em = expected_move.load(self.db_path, sid)
+            gates = conviction.run_gates(regime, f, trig, risk_state, now_hhmm,
+                                         expected_move_pct=em.get("em_pct"))
             ok, fail_reason = conviction.gates_pass(gates)
             if not ok:
                 rejected.append(Decision(
@@ -95,6 +98,9 @@ class EnginePipeline:
                 continue
 
             res = conviction.score(trig, f, regime)
+            if em:
+                res["breakdown"]["expected_move_pct"] = em.get("em_pct")
+                res["breakdown"]["est_atm_premium_pct"] = em.get("est_premium_pct")
             if res["grade"] is None:
                 rejected.append(Decision(
                     symbol, sid, REJECTED, direction=trig.direction, trigger=trig,

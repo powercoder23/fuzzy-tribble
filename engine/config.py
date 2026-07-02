@@ -47,6 +47,11 @@ GRADE_A = _f("ENGINE_GRADE_A", 60.0)
 GRADE_B = _f("ENGINE_GRADE_B", 45.0)
 GRADE_SIZE_MULT = {"A+": 1.0, "A": 1.0, "B": 0.5}
 
+# ---- expected move (buyer viability) ----------------------------------------
+# 1-day 1-sigma move (from ATM IV) below this % = dead-vol name, reject.
+# 0.8% is conservative; raise toward 1.2 when the journal shows theta losses.
+MIN_EXPECTED_MOVE_PCT = _f("ENGINE_MIN_EXPECTED_MOVE_PCT", 0.8)
+
 # ---- watchlist -------------------------------------------------------------
 WATCH_MIN_CONTEXT = _f("ENGINE_WATCH_MIN_CONTEXT", 55.0)  # context score to WATCH without trigger
 
