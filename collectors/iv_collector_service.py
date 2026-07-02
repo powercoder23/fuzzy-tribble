@@ -69,6 +69,8 @@ EOD_SLEEP      = 0.5   # seconds between stocks during EOD watchlist build
 
 class IVCollector:
 
+    SKEW_WING = 7  # strikes persisted each side of ATM for the dashboard skew chart
+
     def __init__(self):
         self._scanner: DiscountedPremiumScanner = None
         self._expiry_cache: dict = {}
@@ -191,6 +193,24 @@ class IVCollector:
                     data_type           = data_type,
                 )
 
+                # Per-strike skew snapshot (±SKEW_WING strikes around ATM) so
+                # the dashboard can draw a volatility-skew curve without any
+                # broker call of its own. Best-effort — never fails the pass.
+                try:
+                    skew_strikes = self._extract_skew(option_chain, atm_ctx.get("atm_strike"))
+                    if skew_strikes:
+                        iv_store.save_skew_snapshot(
+                            security_id = str(security_id),
+                            symbol      = symbol,
+                            timestamp   = snapshot_dt,
+                            expiry      = expiry,
+                            spot_price  = spot_price,
+                            atm_strike  = atm_ctx.get("atm_strike"),
+                            strikes     = skew_strikes,
+                        )
+                except Exception:
+                    logger.debug("skew snapshot failed | %s", symbol, exc_info=True)
+
                 # NOTE: the 'daily' row is NO LONGER written here. Writing it on
                 # the first intraday fetch (09:15-09:50) built an IV history of
                 # OPENING prints, biasing IV Rank/Percentile (review §2.1a).
@@ -208,6 +228,38 @@ class IVCollector:
 
         logger.warning("_collect_one gave up | %s | %s", symbol, last_err)
         return False
+
+    @staticmethod
+    def _extract_skew(option_chain: dict, atm_strike) -> list[dict]:
+        """[{strike, ce_iv, pe_iv, ce_oi, pe_oi}] for ±SKEW_WING strikes
+        around ATM. Strikes with no IV on either side are dropped."""
+        if not option_chain or atm_strike is None:
+            return []
+        rows = []
+        for key, data in option_chain.items():
+            if not isinstance(data, dict):
+                continue
+            try:
+                strike = float(key)
+            except (TypeError, ValueError):
+                continue
+            ce = data.get("ce") or {}
+            pe = data.get("pe") or {}
+            rows.append({
+                "strike": strike,
+                "ce_iv":  ce.get("implied_volatility") or None,
+                "pe_iv":  pe.get("implied_volatility") or None,
+                "ce_oi":  ce.get("oi"),
+                "pe_oi":  pe.get("oi"),
+            })
+        if not rows:
+            return []
+        rows.sort(key=lambda r: r["strike"])
+        atm = float(atm_strike)
+        idx = min(range(len(rows)), key=lambda i: abs(rows[i]["strike"] - atm))
+        wing = IVCollector.SKEW_WING
+        window = rows[max(0, idx - wing): idx + wing + 1]
+        return [r for r in window if (r["ce_iv"] or r["pe_iv"])]
 
     # ── full sweep passes ─────────────────────────────────────────────────────
 
@@ -392,6 +444,11 @@ class IVCollector:
             logger.info("\n%s", msg)
         except Exception:
             logger.exception("EOD summary failed")
+        # Housekeeping: skew snapshots are a near-term visual — keep 7 days.
+        try:
+            iv_store.prune_skew_snapshots(days=7)
+        except Exception:
+            logger.exception("skew prune failed")
 
     # ── main loop ─────────────────────────────────────────────────────────────
 

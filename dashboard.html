@@ -381,6 +381,10 @@
                 <button class="view-btn active" id="vbtn-daily" onclick="setView('daily')">Daily</button>
                 <button class="view-btn" id="vbtn-intraday" onclick="setView('intraday')">Today</button>
               </div>
+              <div class="view-toggle">
+                <button class="view-btn active" id="cbtn-iv" onclick="setChartMode('iv')">IV Chart</button>
+                <button class="view-btn" id="cbtn-skew" onclick="setChartMode('skew')">Volatility Skew</button>
+              </div>
             </div>
             <div id="sym-dropdown" style="position:relative;margin-bottom:12px;display:none">
               <div id="sym-list" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;max-height:200px;overflow-y:auto;position:absolute;top:0;left:0;width:280px;z-index:50;"></div>
@@ -486,6 +490,7 @@ const TABS = ['overview','iv','trades','market','alerts','universe'];
 let currentSymbol = null;
 let currentIvRange = 30;
 let currentView    = 'daily';
+let chartMode      = 'iv';        // 'iv' (history) | 'skew' (IV vs strike)
 let rangeDays      = 30;          // header date-range selector (Today/Week/Month/All)
 let ovTradeView    = 'open';
 let ivChart = null, pnlChart = null, ovPnlChart = null;
@@ -991,8 +996,23 @@ function setView(v) {
   if (currentSymbol) loadIVChart(currentSymbol);
 }
 
+function setChartMode(m) {
+  chartMode = m;
+  $('cbtn-iv').classList.toggle('active', m === 'iv');
+  $('cbtn-skew').classList.toggle('active', m === 'skew');
+  // Range + Daily/Today controls only apply to the history chart
+  const skew = m === 'skew';
+  [$('iv-range-group'), $('vbtn-daily').parentElement].forEach(el => {
+    el.style.opacity = skew ? '0.3' : '1';
+    el.style.pointerEvents = skew ? 'none' : '';
+  });
+  if (!skew) { setView(currentView); return; }   // restores dimming + reloads
+  if (currentSymbol) loadIVChart(currentSymbol);
+}
+
 async function loadIVChart(symbol) {
   currentSymbol = symbol;
+  if (chartMode === 'skew') return loadSkewChart(symbol);
   $('chart-empty').style.display = 'none';
   $('iv-chart').style.display = '';
   try {
@@ -1054,6 +1074,81 @@ function renderIVChart(data) {
         y: { position:'left', ticks:{color:'#f59e0b',font:{family:'JetBrains Mono',size:9}, callback:v=>v.toFixed(1)+'%'}, grid:{color:'#1a1a2e'} },
         y2: { position:'right', display:(data.spot||[]).some(x=>x>0), ticks:{color:'#6366f1',font:{family:'JetBrains Mono',size:9}, callback:v=>'₹'+v.toLocaleString('en-IN')}, grid:{display:false} },
         y3: { position:'right', display:false, grid:{display:false} },
+      }
+    }
+  });
+}
+
+// ── Volatility Skew view (IV vs strike, latest collector snapshot) ─────────
+async function loadSkewChart(symbol) {
+  $('chart-empty').style.display = 'none';
+  $('iv-chart').style.display = '';
+  try {
+    const d = await api(`/api/iv/${symbol}/skew`);
+    const strikes = d.strikes || [];
+    if (!strikes.length) throw new Error('404 empty');
+
+    // Stats cards: reuse Current IV card for ATM IV, PCR card for skew tilt
+    const atmRow = strikes.reduce((a, b) =>
+      Math.abs(b.strike - d.atm_strike) < Math.abs(a.strike - d.atm_strike) ? b : a);
+    const atmIv = atmRow.ce_iv && atmRow.pe_iv ? (atmRow.ce_iv + atmRow.pe_iv) / 2 : (atmRow.ce_iv || atmRow.pe_iv);
+    $('stat-iv').textContent = atmIv ? atmIv.toFixed(1) + '%' : '—';
+    // Skew tilt: OTM put IV minus OTM call IV (positive = put skew / fear)
+    const otmPut  = strikes.filter(s => s.strike < d.atm_strike && s.pe_iv).slice(0, 3);
+    const otmCall = strikes.filter(s => s.strike > d.atm_strike && s.ce_iv).slice(-3);
+    let tilt = null;
+    if (otmPut.length && otmCall.length) {
+      const avg = (arr, k) => arr.reduce((s, x) => s + x[k], 0) / arr.length;
+      tilt = avg(otmPut, 'pe_iv') - avg(otmCall, 'ce_iv');
+    }
+    $('chart-meta').textContent =
+      `${symbol} · skew as of ${timeOf(d.as_of)} · expiry ${d.expiry || '—'} · spot ₹${fmtNum(d.spot, 2)}` +
+      (tilt !== null ? ` · put−call tilt ${tilt >= 0 ? '+' : ''}${tilt.toFixed(1)}%` : '');
+
+    renderSkewChart(d);
+  } catch (e) {
+    $('chart-empty').textContent = e.message.includes('404')
+      ? `No skew data for ${symbol} yet — collected from the next iv-collector pass onward (restart iv-collector after this update)`
+      : `Error: ${e.message}`;
+    $('chart-empty').style.display = 'flex';
+    $('iv-chart').style.display = 'none';
+  }
+}
+
+function renderSkewChart(d) {
+  if (ivChart) ivChart.destroy();
+  const ctx = $('iv-chart').getContext('2d');
+  const labels = d.strikes.map(s => s.strike);
+  const datasets = [
+    { type:'line', label:'Call IV %', data:d.strikes.map(s => s.ce_iv), borderColor:'#6366f1', backgroundColor:'rgba(99,102,241,0.06)', borderWidth:1.8, pointRadius:2.5, pointHoverRadius:5, fill:false, tension:0.3, spanGaps:true },
+    { type:'line', label:'Put IV %', data:d.strikes.map(s => s.pe_iv), borderColor:'#ef4444', backgroundColor:'rgba(239,68,68,0.06)', borderWidth:1.8, pointRadius:2.5, pointHoverRadius:5, fill:false, tension:0.3, spanGaps:true },
+  ];
+  // Day-open snapshot as faint dashed lines — shows intraday skew drift
+  if (d.open_snapshot && d.open_snapshot.strikes?.length) {
+    const bySt = Object.fromEntries(d.open_snapshot.strikes.map(s => [s.strike, s]));
+    datasets.push(
+      { type:'line', label:'Call IV @ open', data:labels.map(k => bySt[k]?.ce_iv ?? null), borderColor:'rgba(99,102,241,0.35)', borderWidth:1, borderDash:[4,4], pointRadius:0, fill:false, tension:0.3, spanGaps:true },
+      { type:'line', label:'Put IV @ open', data:labels.map(k => bySt[k]?.pe_iv ?? null), borderColor:'rgba(239,68,68,0.35)', borderWidth:1, borderDash:[4,4], pointRadius:0, fill:false, tension:0.3, spanGaps:true },
+    );
+  }
+  ivChart = new Chart(ctx, {
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode:'index', intersect:false },
+      plugins: {
+        legend: { labels: { color:'#4a5568', font:{family:'JetBrains Mono',size:10}, boxWidth:20, padding:12 } },
+        tooltip: {
+          backgroundColor:'#0f0f1a', borderColor:'#1e1e35', borderWidth:1,
+          titleColor:'#94a3b8', bodyColor:'#e2e8f0',
+          titleFont:{family:'JetBrains Mono',size:10}, bodyFont:{family:'JetBrains Mono',size:11}, padding:10,
+          callbacks: { title: items => `Strike ${items[0].label}` + (Number(items[0].label) === d.atm_strike ? ' (ATM)' : '') }
+        }
+      },
+      scales: {
+        x: { title:{display:true,text:'Strike',color:'#4a5568',font:{family:'JetBrains Mono',size:9}},
+             ticks:{color: c => Number(labels[c.index]) === d.atm_strike ? '#f59e0b' : '#4a5568', font:{family:'JetBrains Mono',size:9}, maxRotation:0}, grid:{color:'#1e1e35'} },
+        y: { ticks:{color:'#94a3b8',font:{family:'JetBrains Mono',size:9}, callback:v=>v.toFixed(1)+'%'}, grid:{color:'#1a1a2e'} },
       }
     }
   });

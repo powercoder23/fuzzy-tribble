@@ -8,6 +8,7 @@ Both iv_collector_service and all strategy services import from here.
 Swap DB_PATH to a PostgreSQL URL in the future without touching strategy code.
 """
 
+import json
 import logging
 import sqlite3
 from datetime import datetime, timedelta
@@ -50,6 +51,30 @@ CREATE INDEX IF NOT EXISTS idx_iv_security_time
 ON iv_history(security_id, timestamp)
 """
 
+# Per-strike IV skew snapshots (±N strikes around ATM), one row per symbol per
+# collector pass. Strikes are stored as a JSON array of
+# {strike, ce_iv, pe_iv, ce_oi, pe_oi} — compact and schema-stable.
+# Written ONLY by iv_collector_service (sole-writer contract). Read by the
+# dashboard's /api/iv/{symbol}/skew endpoint.
+_CREATE_SKEW = """
+CREATE TABLE IF NOT EXISTS skew_snapshots (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    security_id  TEXT     NOT NULL,
+    symbol       TEXT,
+    timestamp    DATETIME NOT NULL,
+    expiry       TEXT,
+    spot_price   REAL,
+    atm_strike   REAL,
+    strikes_json TEXT     NOT NULL,
+    UNIQUE(security_id, timestamp)
+)
+"""
+
+_CREATE_SKEW_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_skew_symbol_time
+ON skew_snapshots(symbol, timestamp)
+"""
+
 _OPTIONAL_COLUMNS = {
     "atm_call_oi":         "REAL",
     "atm_put_oi":          "REAL",
@@ -88,6 +113,8 @@ def init_db() -> None:
     cur.execute("PRAGMA journal_mode=WAL")
     cur.execute(_CREATE_IV_HISTORY)
     cur.execute(_CREATE_INDEX)
+    cur.execute(_CREATE_SKEW)
+    cur.execute(_CREATE_SKEW_INDEX)
     _ensure_optional_columns(cur)
     conn.commit()
     conn.close()
@@ -184,6 +211,69 @@ def save_snapshot(
             conn.close()
         except Exception:
             pass
+
+
+def save_skew_snapshot(
+    *,
+    security_id: str,
+    symbol: str,
+    timestamp: datetime,
+    expiry: str = None,
+    spot_price: float = None,
+    atm_strike: float = None,
+    strikes: list = None,
+) -> bool:
+    """
+    Insert one per-strike skew snapshot. `strikes` is a list of
+    {strike, ce_iv, pe_iv, ce_oi, pe_oi} dicts (±N strikes around ATM).
+    Silently skips duplicates (same security_id + timestamp).
+    Written ONLY by iv_collector_service — sole-writer contract.
+    """
+    if not strikes:
+        return False
+    ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+    conn = None
+    try:
+        conn = connect()
+        cur = conn.execute("""
+            INSERT INTO skew_snapshots
+                (security_id, symbol, timestamp, expiry, spot_price,
+                 atm_strike, strikes_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(security_id, timestamp) DO NOTHING
+        """, (str(security_id), symbol, ts_str, expiry, spot_price,
+              atm_strike, json.dumps(strikes)))
+        inserted = cur.rowcount > 0
+        conn.commit()
+        return inserted
+    except Exception:
+        logger.exception("iv_store.save_skew_snapshot failed | security_id=%s ts=%s",
+                         security_id, ts_str)
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def prune_skew_snapshots(days: int = 7) -> int:
+    """Delete skew snapshots older than `days`. Skew is an intraday/near-term
+    visual — long history lives in iv_history, not here. Returns rows deleted."""
+    try:
+        conn = connect()
+        cur = conn.execute(
+            "DELETE FROM skew_snapshots WHERE timestamp < datetime('now', ?)",
+            (f"-{int(days)} days",))
+        deleted = cur.rowcount
+        conn.commit()
+        conn.close()
+        if deleted:
+            logger.info("iv_store: pruned %d skew snapshot(s) older than %dd", deleted, days)
+        return deleted
+    except Exception:
+        logger.exception("iv_store.prune_skew_snapshots failed")
+        return 0
 
 
 def promote_daily_from_last_intraday(date_str: str = None) -> int:

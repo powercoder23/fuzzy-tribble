@@ -11,6 +11,7 @@ GET  /                          → dashboard HTML
 GET  /api/symbols               → [{symbol, security_id, last_iv, iv_rank}]
 GET  /api/iv/{symbol}           → IV history + PCR + spot for chart
 GET  /api/iv/{symbol}/intraday  → today's intraday IV ticks
+GET  /api/iv/{symbol}/skew      → latest per-strike IV skew (+ day-open snapshot)
 GET  /api/paper-trades          → today's paper trades
 GET  /api/paper-trades/history  → last 30 days P&L summary
 GET  /api/health                → DB row counts + last update time
@@ -212,6 +213,57 @@ def iv_intraday(symbol: str):
             for r in rows
         ],
     }
+
+
+# ── Volatility skew for a symbol ─────────────────────────────────────────── #
+@app.get("/api/iv/{symbol}/skew")
+def iv_skew(symbol: str):
+    """Latest per-strike IV skew snapshot (written by iv-collector each pass),
+    plus the same day's FIRST snapshot so the frontend can show intraday
+    skew drift. 404 until the collector has run with skew support enabled."""
+    def _parse(j):
+        try:
+            return json.loads(j) or []
+        except Exception:
+            return []
+
+    try:
+        rows = _iv("""
+            SELECT timestamp, expiry, spot_price, atm_strike, strikes_json
+            FROM   skew_snapshots
+            WHERE  symbol = ?
+            ORDER  BY timestamp DESC LIMIT 1
+        """, (symbol.upper(),))
+    except sqlite3.OperationalError:
+        rows = []  # table appears on first collector run after the upgrade
+    if not rows:
+        raise HTTPException(
+            404, f"No skew data for {symbol} yet — per-strike snapshots are "
+                 "collected from the next iv-collector pass onward")
+
+    latest = rows[0]
+    day = latest["timestamp"][:10]
+    first = _iv("""
+        SELECT timestamp, strikes_json
+        FROM   skew_snapshots
+        WHERE  symbol = ? AND date(timestamp) = ?
+        ORDER  BY timestamp ASC LIMIT 1
+    """, (symbol.upper(), day))
+
+    out = {
+        "symbol":     symbol.upper(),
+        "as_of":      latest["timestamp"],
+        "expiry":     latest["expiry"],
+        "spot":       latest["spot_price"],
+        "atm_strike": latest["atm_strike"],
+        "strikes":    _parse(latest["strikes_json"]),
+    }
+    if first and first[0]["timestamp"] != latest["timestamp"]:
+        out["open_snapshot"] = {
+            "as_of":   first[0]["timestamp"],
+            "strikes": _parse(first[0]["strikes_json"]),
+        }
+    return out
 
 
 # ── Paper trades ─────────────────────────────────────────────────────────── #
