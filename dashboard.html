@@ -539,7 +539,7 @@ function showTab(name) {
 
   if (name === 'overview') loadOverview();
   if (name === 'trades')   { loadTrades(); loadStrategyPerformance('strategy-card-2'); }
-  if (name === 'universe' && allSymbols.length === 0) loadUniverse();
+  if (name === 'universe') loadUniverse();
   if (name === 'market')   loadMarketSnapshot('snapshot-card-2');
   if (name === 'alerts')   { loadOpportunities('opportunities-card-2'); loadActivity('activity-card-2'); }
 }
