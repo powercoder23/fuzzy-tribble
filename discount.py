@@ -2,6 +2,7 @@ import os
 import logging
 import math
 import sqlite3
+import threading
 from pathlib import Path
 
 import pandas as pd
@@ -337,17 +338,25 @@ class DiscountedPremiumScanner:
             logger.info("Reset scanner runtime caches for %s", today)
         return state
 
+    # Serializes API pacing across ALL scanner instances and threads (the scan
+    # thread, the monitor thread, and any DataProvider poller share runtime
+    # state — without this lock two threads can pass the elapsed check
+    # simultaneously and the rate limit is fiction; review §1.4).
+    _rate_lock = threading.Lock()
+
     def rate_limited_call(self, operation_name, func, *args, **kwargs):
-        # Upstox pace (config). Replaces the old Dhan 1.5s/3.1s throttle, which
-        # made a full ~200-stock scan take ~10-20 min — too slow for a 5-min
-        # cadence. Upstox allows 50/s, 500/min; we pace at UPSTOX_MAX_REQ_PER_SEC.
+        # Upstox pace (config). Upstox allows 50/s, 500/min; we pace at
+        # UPSTOX_MAX_REQ_PER_SEC.
         min_interval = UPSTOX_MIN_REQ_INTERVAL_SEC
-        elapsed = time.monotonic() - self.runtime_state["last_api_call_ts"]
-        if elapsed < min_interval:
-            time.sleep(min_interval - elapsed)
-        response = func(*args, **kwargs)
-        self.runtime_state["last_api_call_ts"] = time.monotonic()
-        self.runtime_state["metrics"]["total_calls"] += 1
+        with DiscountedPremiumScanner._rate_lock:
+            elapsed = time.monotonic() - self.runtime_state["last_api_call_ts"]
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+            try:
+                response = func(*args, **kwargs)
+            finally:
+                self.runtime_state["last_api_call_ts"] = time.monotonic()
+                self.runtime_state["metrics"]["total_calls"] += 1
         logger.debug("API call completed for %s", operation_name)
         return response
 
@@ -886,7 +895,12 @@ class DiscountedPremiumScanner:
             (df["atm_iv"] >= 1.0) &
             (df["atm_iv"] <= 200.0)
         ]
-        df = df.sort_values(["timestamp"]).tail(lookback_days)
+        # ONE value per calendar day (last row of the day). Without this,
+        # duplicate 'daily' rows shrink tail(252) from a year to ~2 weeks
+        # (review §2.1b) — lookback_days must mean DAYS, not rows.
+        df = df.sort_values("timestamp")
+        df = df.groupby(df["timestamp"].dt.date, as_index=False).last()
+        df = df.tail(lookback_days)
         return df["atm_iv"].tolist()
 
     def _expired_options_cache_path(self, security_id, exchange_segment, option_type, strike):
@@ -1578,79 +1592,53 @@ class DiscountedPremiumScanner:
 
     def persist_iv_snapshot(self, security_id, exchange_segment, security_name, expiry, spot_price, atm_context,
                             chain_metrics=None, store_intraday=None):
-        """Persist one ATM IV snapshot per day to build IV rank / percentile history."""
+        """SOLE-WRITER contract (collectors/iv_store.py line 1): only the
+        IV-collector writes iv_history. Strategy services (store_intraday=False)
+        are READ-ONLY here — the old behaviour of inserting a 'daily' row with a
+        second-precision timestamp on EVERY 15-min scan flooded the daily
+        history and made IV Rank meaningless (review §2.1b).
+
+        When a collector-owned scanner (store_intraday=True) calls this, the
+        write is delegated to iv_store.save_snapshot with a 5-min-floored
+        timestamp so the UNIQUE constraint actually dedups.
+        """
+        store_intraday = self.store_intraday if store_intraday is None else store_intraday
+        if not store_intraday:
+            return  # strategy services never write IV data
+
         atm_iv = atm_context.get("atm_iv")
-        if atm_iv is None or atm_iv <= 0 or atm_iv < 1 or atm_iv > 200:
+        if atm_iv is None or atm_iv < 1 or atm_iv > 200:
             return
 
-        store_intraday = self.store_intraday if store_intraday is None else store_intraday
-        snapshot_dt = datetime.now()
-        data_type = "intraday" if store_intraday else "daily"
         chain_metrics = chain_metrics or {}
-
-        snapshot = pd.DataFrame([{
-            "snapshot_date": snapshot_dt.date().isoformat(),
-            "snapshot_time": snapshot_dt.strftime("%H:%M:%S"),
-            "security_id": str(security_id),
-            "symbol": security_name,
-            "spot_price": spot_price,
-            "atm_strike": atm_context.get("atm_strike"),
-            "atm_iv": atm_iv,
-            "atm_call_iv": atm_context.get("atm_call_iv"),
-            "atm_put_iv": atm_context.get("atm_put_iv"),
-            "atm_call_oi": atm_context.get("atm_call_oi"),
-            "atm_put_oi": atm_context.get("atm_put_oi"),
-            "total_call_oi": chain_metrics.get("total_call_oi"),
-            "total_put_oi": chain_metrics.get("total_put_oi"),
-            "total_call_volume": chain_metrics.get("total_call_volume"),
-            "total_put_volume": chain_metrics.get("total_put_volume"),
-            "max_oi_strike_call": chain_metrics.get("max_oi_strike_call"),
-            "max_oi_strike_put": chain_metrics.get("max_oi_strike_put"),
-        }])
+        now = datetime.now()
+        floored = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
         try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            ensure_iv_history_schema(cursor)
-            cursor.execute("""
-            INSERT INTO iv_history (
-                security_id, symbol, timestamp,
-                spot_price, atm_strike,
-                atm_iv, atm_call_iv, atm_put_iv,
-                atm_call_oi, atm_put_oi,
-                total_call_oi, total_put_oi,
-                total_call_volume, total_put_volume,
-                max_oi_strike_call, max_oi_strike_put,
-                data_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(security_id, timestamp, data_type) DO NOTHING
-            """, (
-                str(security_id),
-                security_name,
-                f"{snapshot_dt.date().isoformat()} {snapshot_dt.strftime('%H:%M:%S')}",
-                spot_price,
-                atm_context.get("atm_strike"),
-                atm_iv,
-                atm_context.get("atm_call_iv"),
-                atm_context.get("atm_put_iv"),
-                atm_context.get("atm_call_oi"),
-                atm_context.get("atm_put_oi"),
-                chain_metrics.get("total_call_oi"),
-                chain_metrics.get("total_put_oi"),
-                chain_metrics.get("total_call_volume"),
-                chain_metrics.get("total_put_volume"),
-                chain_metrics.get("max_oi_strike_call"),
-                chain_metrics.get("max_oi_strike_put"),
-                data_type,
-            ))
-            conn.commit()
-            self.runtime_state["metrics"]["iv_snapshots"] += 1
+            from collectors import iv_store
+            saved = iv_store.save_snapshot(
+                security_id        = str(security_id),
+                symbol             = security_name,
+                timestamp          = floored,
+                spot_price         = spot_price,
+                atm_strike         = atm_context.get("atm_strike"),
+                atm_iv             = atm_iv,
+                atm_call_iv        = atm_context.get("atm_call_iv"),
+                atm_put_iv         = atm_context.get("atm_put_iv"),
+                atm_call_oi        = atm_context.get("atm_call_oi"),
+                atm_put_oi         = atm_context.get("atm_put_oi"),
+                total_call_oi      = chain_metrics.get("total_call_oi"),
+                total_put_oi       = chain_metrics.get("total_put_oi"),
+                total_call_volume  = chain_metrics.get("total_call_volume"),
+                total_put_volume   = chain_metrics.get("total_put_volume"),
+                max_oi_strike_call = chain_metrics.get("max_oi_strike_call"),
+                max_oi_strike_put  = chain_metrics.get("max_oi_strike_put"),
+                data_type          = "intraday",
+                fetched_at         = now,
+            )
+            if saved:
+                self.runtime_state["metrics"]["iv_snapshots"] += 1
         except Exception:
-            logger.exception("Failed to persist IV snapshot to SQLite: %s", DB_PATH)
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            logger.exception("Failed to persist IV snapshot via iv_store")
 
     def get_intraday_snapshots(self, security_id, limit=5):
         try:
@@ -2157,7 +2145,12 @@ class DiscountedPremiumScanner:
                 "strike_relevance": native_number(round(relevance_score, 2)),
             }
 
-        final_score = clip_score(40 + (raw_score * 0.55), floor=40.0, ceiling=95.0)
+        # Raw 0-100 composite, no affine floor. The old
+        # clip_score(40 + raw*0.55, floor=40, ceiling=95) guaranteed every
+        # option scored >= 40, which made min_discount_score=40 a no-op and
+        # compressed cross-sectional differences (review §3.3). Thresholds
+        # (e.g. main.py's min_discount_score=45) now bite on the true scale.
+        final_score = clip_score(raw_score)
         return {
             "score": round(final_score, 2),
             "component_scores": component_scores,

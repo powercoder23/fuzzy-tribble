@@ -59,19 +59,50 @@ _OPTIONAL_COLUMNS = {
     "total_put_volume":    "REAL",
     "max_oi_strike_call":  "REAL",
     "max_oi_strike_put":   "REAL",
+    # Actual wall-clock fetch time. `timestamp` is the pass-aligned (floored)
+    # label used for dedup/series alignment; a full sweep takes minutes, so
+    # cross-sectional consumers can use fetched_at to measure the real skew.
+    "fetched_at":          "TEXT",
 }
+
+# Multiple containers read/write this file over a shared volume. WAL + a busy
+# timeout are mandatory: the default rollback journal with concurrent writers
+# is exactly what corrupted iv_history.db (see ARCHITECTURE_REVIEW_P0.md §0).
+BUSY_TIMEOUT_MS = 30_000
+
+
+def connect(db_path: str | None = None) -> sqlite3.Connection:
+    """Open a connection with sane concurrency settings. ALL access to
+    iv_history.db (any module, any process) must go through here."""
+    conn = sqlite3.connect(db_path or DB_PATH, timeout=BUSY_TIMEOUT_MS / 1000)
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    return conn
 
 
 def init_db() -> None:
     """Create tables and indexes. Idempotent — safe to call on every startup."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect()
     cur = conn.cursor()
+    # WAL is a persistent DB property — setting it once here covers every
+    # future connection from every container.
+    cur.execute("PRAGMA journal_mode=WAL")
     cur.execute(_CREATE_IV_HISTORY)
     cur.execute(_CREATE_INDEX)
     _ensure_optional_columns(cur)
     conn.commit()
     conn.close()
-    logger.info("iv_store: DB initialised at %s", DB_PATH)
+    logger.info("iv_store: DB initialised at %s (WAL)", DB_PATH)
+
+
+def integrity_check(db_path: str | None = None) -> str:
+    """Run PRAGMA quick_check. Returns 'ok' or the first error line."""
+    try:
+        conn = connect(db_path)
+        result = conn.execute("PRAGMA quick_check").fetchone()[0]
+        conn.close()
+        return "ok" if result == "ok" else str(result).splitlines()[0]
+    except Exception as exc:  # noqa: BLE001
+        return f"unreadable: {exc}"
 
 
 def _ensure_optional_columns(cursor) -> None:
@@ -100,19 +131,26 @@ def save_snapshot(
     max_oi_strike_call: float = None,
     max_oi_strike_put: float = None,
     data_type: str = "daily",
+    fetched_at: datetime = None,
 ) -> bool:
     """
     Insert one IV snapshot row. Silently skips duplicates (same security_id +
     timestamp + data_type already exists). Returns True if inserted.
+
+    `timestamp` is the pass-aligned label; `fetched_at` (default: now) records
+    the true wall-clock fetch time so timestamp skew is measurable.
     """
-    if atm_iv is None or atm_iv <= 0 or atm_iv < 1 or atm_iv > 200:
+    if atm_iv is None or atm_iv < 1 or atm_iv > 200:
+        # Out-of-band IV — count it so silent data loss is visible in logs.
+        logger.warning("iv_store: rejected snapshot | security_id=%s atm_iv=%s",
+                       security_id, atm_iv)
         return False
 
     ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+    fetched_str = (fetched_at or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect()
         cur = conn.cursor()
-        _ensure_optional_columns(cur)
         cur.execute("""
             INSERT INTO iv_history (
                 security_id, symbol, timestamp,
@@ -122,8 +160,8 @@ def save_snapshot(
                 total_call_oi, total_put_oi,
                 total_call_volume, total_put_volume,
                 max_oi_strike_call, max_oi_strike_put,
-                data_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                data_type, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(security_id, timestamp, data_type) DO NOTHING
         """, (
             str(security_id), symbol, ts_str,
@@ -133,7 +171,7 @@ def save_snapshot(
             total_call_oi, total_put_oi,
             total_call_volume, total_put_volume,
             max_oi_strike_call, max_oi_strike_put,
-            data_type,
+            data_type, fetched_str,
         ))
         inserted = cur.rowcount > 0
         conn.commit()
@@ -146,6 +184,60 @@ def save_snapshot(
             conn.close()
         except Exception:
             pass
+
+
+def promote_daily_from_last_intraday(date_str: str = None) -> int:
+    """
+    Write the day's 'daily' rows by copying each symbol's LAST intraday
+    snapshot of the day. Called by the collector at EOD (~15:35).
+
+    This replaces the old behaviour of saving the daily row on the FIRST
+    intraday fetch (09:15-09:50): a history of OPENING IVs systematically
+    biased IV Rank / Percentile (see ARCHITECTURE_REVIEW_P0.md §2.1a).
+    Idempotent — symbols that already have a daily row for the date are
+    skipped. Returns the number of rows inserted.
+    """
+    if date_str is None:
+        date_str = datetime.now().date().isoformat()
+    try:
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO iv_history (
+                security_id, symbol, timestamp, spot_price, atm_strike,
+                atm_iv, atm_call_iv, atm_put_iv, atm_call_oi, atm_put_oi,
+                total_call_oi, total_put_oi, total_call_volume, total_put_volume,
+                max_oi_strike_call, max_oi_strike_put, data_type, fetched_at
+            )
+            SELECT i.security_id, i.symbol, i.timestamp, i.spot_price, i.atm_strike,
+                   i.atm_iv, i.atm_call_iv, i.atm_put_iv, i.atm_call_oi, i.atm_put_oi,
+                   i.total_call_oi, i.total_put_oi, i.total_call_volume, i.total_put_volume,
+                   i.max_oi_strike_call, i.max_oi_strike_put, 'daily', i.fetched_at
+            FROM   iv_history i
+            WHERE  i.data_type = 'intraday'
+              AND  DATE(i.timestamp) = ?
+              AND  i.id = (
+                     SELECT MAX(i2.id) FROM iv_history i2
+                     WHERE  i2.security_id = i.security_id
+                       AND  i2.data_type   = 'intraday'
+                       AND  DATE(i2.timestamp) = ?
+                   )
+              AND  NOT EXISTS (
+                     SELECT 1 FROM iv_history d
+                     WHERE  d.security_id = i.security_id
+                       AND  d.data_type   = 'daily'
+                       AND  DATE(d.timestamp) = ?
+                   )
+        """, (date_str, date_str, date_str))
+        inserted = cur.rowcount
+        conn.commit()
+        conn.close()
+        logger.info("iv_store: promoted %d daily row(s) for %s from last intraday",
+                    inserted, date_str)
+        return inserted
+    except Exception:
+        logger.exception("iv_store.promote_daily_from_last_intraday failed | %s", date_str)
+        return 0
 
 
 def get_latest_snapshot(security_id: str) -> dict:
@@ -183,14 +275,25 @@ def get_latest_snapshot(security_id: str) -> dict:
 
 
 def get_iv_history(security_id: str, days: int = 252) -> list[float]:
-    """Return a list of daily ATM IV values (oldest → newest) for IV Rank / Percentile."""
+    """Return a list of daily ATM IV values (oldest → newest) for IV Rank / Percentile.
+
+    Deduplicates to ONE value per calendar day (the last row of the day), so a
+    polluted history (multiple 'daily' rows per day — see review §2.1b) cannot
+    shrink the effective lookback window.
+    """
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect()
         df = pd.read_sql("""
             SELECT atm_iv FROM iv_history
             WHERE  security_id = ?
               AND  data_type   = 'daily'
               AND  atm_iv      BETWEEN 1.0 AND 200.0
+              AND  id = (
+                     SELECT MAX(i2.id) FROM iv_history i2
+                     WHERE  i2.security_id = iv_history.security_id
+                       AND  i2.data_type   = 'daily'
+                       AND  DATE(i2.timestamp) = DATE(iv_history.timestamp)
+                   )
             ORDER  BY timestamp ASC
         """, conn, params=(str(security_id),))
         conn.close()

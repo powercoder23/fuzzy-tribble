@@ -24,6 +24,7 @@ The exit math (`apply_tick`) is a pure function over a plain dict so it can be
 unit-tested with synthetic price paths — no DB or API needed.
 """
 
+import json
 import os
 import logging
 import sqlite3
@@ -86,20 +87,60 @@ def _book(trade, frac, price):
 
 
 def _finalize(trade, reason):
+    """Close the trade and compute NET realized P&L.
+
+    Honest-economics model (STRATEGY_REVIEW_P1.md §6.1):
+      * gross_points     — the raw state-machine P&L (old behaviour)
+      * slippage_points  — 2 × half_spread (entry crosses the spread once,
+                           exit once; partial exits approximated as one cross)
+      * costs_rupees     — full NSE fee schedule via costs.py (brokerage, STT,
+                           exchange txn, SEBI, stamp, IPFT, GST)
+      * realized_*       — NET of slippage and costs
+
+    Trades without half_spread/lot_size context (e.g. unit-test fixtures)
+    degrade gracefully to gross == net with zero costs.
+    """
     trade["status"] = "closed"
     trade["exit_reason"] = reason
-    pts = trade["booked_points"]
-    trade["realized_points"] = round(pts, 4)
-    trade["realized_pct"] = round(pts / trade["entry"] * 100.0, 2) if trade["entry"] else 0.0
-    trade["realized_rupees"] = round(pts * trade["lot_size"], 2)
+    gross = trade["booked_points"]
+    entry = trade["entry"]
+    lot = trade.get("lot_size", 1) or 1
+
+    half_spread = float(trade.get("half_spread") or 0.0)
+    slippage = 2.0 * half_spread
+
+    costs_total = 0.0
+    if lot > 1 and entry:
+        try:
+            import costs as _costs
+            buy_px = entry + half_spread
+            sell_px = max(entry + gross - half_spread, 0.0)
+            n_orders = 3 if trade.get("t1_done") else 2
+            costs_total = _costs.option_trade_costs(buy_px, sell_px, lot, n_orders)["total"]
+        except Exception:
+            logger.debug("costs unavailable — finalizing without fee model")
+
+    net = gross - slippage
+    trade["gross_points"] = round(gross, 4)
+    trade["slippage_points"] = round(slippage, 4)
+    trade["costs_rupees"] = round(costs_total, 2)
+    trade["realized_points"] = round(net, 4)
+    trade["realized_pct"] = round(net / entry * 100.0, 2) if entry else 0.0
+    trade["realized_rupees"] = round(net * lot - costs_total, 2)
 
 
 def apply_tick(trade, last_price, square_off=False):
     """Advance a paper trade by one observed `last_price`. Mutates `trade`.
 
     Returns a list of event tags among {"T1","T2","SL","BE","TIME"}.
-    Fills are modelled at the level price (sl/t1/t2/runner_stop) and at
-    last_price for the time square-off — a standard paper-trade simplification.
+
+    Fill model (review §3.5):
+      * Stops fill at min(level, observed price) — an option premium that GAPS
+        through the SL fills at the gapped price, not the level. Filling at the
+        level systematically overstated paper P&L versus live.
+      * Targets fill AT the level (conservative: a gap above T2 books T2).
+      * Prices are 5-min sampled LTPs, so intrabar touches between samples are
+        still missed — treat paper results as an estimate, not ground truth.
     """
     events = []
     if trade.get("status") != "open":
@@ -112,7 +153,7 @@ def apply_tick(trade, last_price, square_off=False):
     # --- Phase 1: before T1 -------------------------------------------------
     if not trade["t1_done"]:
         if last_price <= trade["sl"]:
-            _book(trade, 1.0, trade["sl"])
+            _book(trade, 1.0, min(trade["sl"], last_price))   # gap-aware fill
             _finalize(trade, "SL")
             events.append("SL")
             return events
@@ -131,7 +172,7 @@ def apply_tick(trade, last_price, square_off=False):
             events.append("T2")
             return events
         if last_price <= trade["runner_stop"]:
-            _book(trade, trade["qty_frac"], trade["runner_stop"])
+            _book(trade, trade["qty_frac"], min(trade["runner_stop"], last_price))
             _finalize(trade, "Runner BE")
             events.append("BE")
             return events
@@ -161,15 +202,28 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     strategy TEXT,
     status TEXT, t1_done INTEGER DEFAULT 0, qty_frac REAL DEFAULT 1.0,
     booked_points REAL DEFAULT 0.0, runner_stop REAL, last_price REAL,
-    exit_reason TEXT, realized_points REAL, realized_pct REAL, realized_rupees REAL
+    exit_reason TEXT, realized_points REAL, realized_pct REAL, realized_rupees REAL,
+    half_spread REAL, gross_points REAL, slippage_points REAL,
+    costs_rupees REAL, factors_json TEXT
 );
 """
 
 _RUNTIME_FIELDS = (
     "status", "t1_done", "qty_frac", "booked_points", "runner_stop",
     "last_price", "exit_reason", "realized_points", "realized_pct",
-    "realized_rupees", "closed_at",
+    "realized_rupees", "closed_at", "gross_points", "slippage_points",
+    "costs_rupees",
 )
+
+# Additive columns for DBs created before they existed (see _migrate).
+_MIGRATE_COLUMNS = {
+    "strategy":        "TEXT",
+    "half_spread":     "REAL",
+    "gross_points":    "REAL",
+    "slippage_points": "REAL",
+    "costs_rupees":    "REAL",
+    "factors_json":    "TEXT",
+}
 
 
 class PaperTradeBook:
@@ -189,11 +243,16 @@ class PaperTradeBook:
         existed (the prod DB is a long-lived volume)."""
         with self._conn() as conn:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(paper_trades)")}
-            if "strategy" not in cols:
-                conn.execute("ALTER TABLE paper_trades ADD COLUMN strategy TEXT")
+            for col, col_type in _MIGRATE_COLUMNS.items():
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE paper_trades ADD COLUMN {col} {col_type}")
 
     def _conn(self):
-        conn = sqlite3.connect(self.db_path)
+        # Accessed from both the scan thread (booking) and the monitor thread
+        # (re-pricing) — WAL + busy_timeout prevent writer starvation/locks.
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -228,8 +287,9 @@ class PaperTradeBook:
                    (date, opened_at, symbol, security_id, exchange_segment, side,
                     strike, expiry, entry, sl, t1, t2, t1_book_fraction, lot_size,
                     score, iv, hv, iv_rank, dte, strategy, status, t1_done, qty_frac,
-                    booked_points, runner_stop, last_price)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    booked_points, runner_stop, last_price,
+                    half_spread, factors_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     date, now.strftime("%Y-%m-%d %H:%M:%S"),
                     signal["symbol"], str(signal.get("security_id")),
@@ -241,6 +301,7 @@ class PaperTradeBook:
                     signal.get("iv_rank"), signal.get("dte"),
                     signal.get("strategy", VOLATILITY_STRATEGY),
                     "open", 0, 1.0, 0.0, rt["runner_stop"], rt["entry"],
+                    signal.get("half_spread"), signal.get("factors_json"),
                 ),
             )
             return cur.lastrowid
@@ -369,14 +430,23 @@ def format_eod_summary(trades, date):
     losses = [t for t in closed if (t.get("realized_rupees") or 0) < 0]
     flats = [t for t in closed if (t.get("realized_rupees") or 0) == 0]
     total_rupees = sum((t.get("realized_rupees") or 0) for t in closed)
+    total_costs = sum((t.get("costs_rupees") or 0) for t in closed)
+    total_slip = sum(
+        (t.get("slippage_points") or 0) * (t.get("lot_size") or 1) for t in closed
+    )
     hit_rate = (len(wins) / len(closed) * 100.0) if closed else 0.0
 
     lines = [
         f"<b>📒 Paper EOD — {date}</b>",
         f"Trades {len(trades)} | Closed {len(closed)} | "
         f"Win {len(wins)} / Loss {len(losses)} / Flat {len(flats)} ({hit_rate:.0f}% hit)",
-        f"<b>Net ₹{total_rupees:,.0f}</b> (1-lot basis)",
+        f"<b>Net ₹{total_rupees:,.0f}</b> (1-lot, after costs)",
     ]
+    if total_costs or total_slip:
+        lines.append(
+            f"Frictions: charges ₹{total_costs:,.0f} + spread ₹{total_slip:,.0f} "
+            f"(already deducted)"
+        )
 
     # Per-strategy breakdown (only when more than one strategy traded today).
     by_strat: dict = {}
@@ -431,6 +501,68 @@ def _hhmm(now):
     return now.strftime("%H:%M")
 
 
+def _half_spread_from_row(row) -> float:
+    """Half the bid/ask spread from the scan row; the honest entry/exit
+    slippage estimate. Falls back to a conservative % of entry when quotes
+    are missing (STRATEGY_REVIEW_P1.md §6.1)."""
+    try:
+        bid = float(row.get("bid") or 0)
+        ask = float(row.get("ask") or 0)
+        if ask > 0 and bid > 0 and ask >= bid:
+            return (ask - bid) / 2.0
+    except (TypeError, ValueError):
+        pass
+    fallback_pct = float(os.getenv("PAPER_FALLBACK_SPREAD_PCT", "0.02"))  # 2% full spread
+    entry = float(row.get("entry") or 0)
+    return entry * fallback_pct / 2.0
+
+
+def collect_factor_snapshot(row) -> str:
+    """JSON snapshot of every factor visible at entry, persisted per trade so
+    edge attribution is possible after the fact (STRATEGY_REVIEW_P1.md §5:
+    'without that, even 500 paper trades won't tell you WHICH component
+    carries the edge'). Fail-open: any unavailable factor is null."""
+    sec_id = str(row.get("security_id") or "")
+    snap = {
+        "score": row.get("score"),
+        "iv": row.get("iv"),
+        "hv": row.get("hv"),
+        "iv_rank": row.get("iv_rank"),
+        "spread_half": _half_spread_from_row(row),
+        "expected_move_ratio": row.get("expected_move_ratio"),
+        "pcr": row.get("pcr_value"),
+        "trade_type": row.get("trade_type"),
+    }
+    try:
+        from sonar_laplace_scanner import get_latest_sonar
+        s = get_latest_sonar(sec_id) if sec_id else {}
+        snap["sonar"] = {k: s.get(k) for k in ("signal", "trend", "bias", "slope_pct")} if s else None
+    except Exception:
+        snap["sonar"] = None
+    try:
+        from oi_buildup_scanner import get_latest_buildup
+        b = get_latest_buildup(sec_id) if sec_id else {}
+        snap["oi_buildup"] = {k: b.get(k) for k in ("classification", "bias", "strength", "oi_chg_pct")} if b else None
+    except Exception:
+        snap["oi_buildup"] = None
+    try:
+        from composite_scanner import get_latest_composite
+        c = get_latest_composite(sec_id) if sec_id else {}
+        snap["composite"] = {k: c.get(k) for k in ("score", "direction", "grade")} if c else None
+    except Exception:
+        snap["composite"] = None
+    try:
+        import breadth
+        bs = breadth.compute()
+        snap["breadth_market_pct"] = getattr(bs, "market_pct", None)
+    except Exception:
+        snap["breadth_market_pct"] = None
+    try:
+        return json.dumps(snap, default=str)
+    except Exception:
+        return "{}"
+
+
 def signal_from_row(row, lot_size_fn=None):
     """Map a scan opportunity dict/row to a paper-trade signal dict."""
     symbol = row.get("symbol")
@@ -441,6 +573,8 @@ def signal_from_row(row, lot_size_fn=None):
         except Exception:
             lot = 1
     return {
+        "half_spread": round(_half_spread_from_row(row), 4),
+        "factors_json": collect_factor_snapshot(row),
         "symbol": symbol,
         "security_id": row.get("security_id"),
         "exchange_segment": row.get("exchange_segment"),
@@ -489,11 +623,16 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
     rows = [r for r in rows if r.get("strategy") == VOLATILITY_STRATEGY]
     rows.sort(key=lambda r: (r.get("score") or 0), reverse=True)
 
-    # Sonar-Laplace direction gate:
-    # FLAT        -> skip (whipsaw / no trend)
-    # BREAKOUT_UP / REVERSAL_UP   -> force CALL
-    # BREAKDOWN   / REVERSAL_DOWN -> force PUT
-    # SOFT_BULL / SOFT_BEAR / no data -> keep scanner original side
+    # Sonar-Laplace direction gate (VETO, never a flip):
+    # FLAT                        -> skip (whipsaw / no trend)
+    # bullish signal + PUT setup  -> skip (contradiction)
+    # bearish signal + CALL setup -> skip (contradiction)
+    # agrees / SOFT_* / no data   -> keep scanner original side
+    #
+    # NOTE: the old behaviour FLIPPED the side ("force CALL") while keeping the
+    # row's entry/sl/t1/t2 — computed from the OTHER option's premium. Flipped
+    # trades booked with the wrong price plan and fired phantom SL/T1 events
+    # (review §3.2). Sides are never mutated any more.
     try:
         from sonar_laplace_scanner import get_latest_sonar
         _sonar_available = True
@@ -509,19 +648,21 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
         if symbol is None or strike is None or side is None:
             continue
 
-        # Sonar gate
+        # Sonar gate — veto only; the side (and its price plan) never changes.
         if _sonar_available:
             sec_id = str(row.get("security_id") or "")
             sonar  = get_latest_sonar(sec_id) if sec_id else {}
             signal = sonar.get("signal", "")
-            bias   = sonar.get("bias", "")
             if signal == "FLAT":
                 logger.info("Sonar FLAT — skipping %s", symbol)
                 continue
-            if signal in ("BREAKOUT_UP", "REVERSAL_UP") and bias == "CE":
-                side = "CALL"
-            elif signal in ("BREAKDOWN", "REVERSAL_DOWN") and bias == "PE":
-                side = "PUT"
+            side_norm = "CALL" if str(side).upper() in ("CALL", "CE") else "PUT"
+            bullish = signal in ("BREAKOUT_UP", "REVERSAL_UP")
+            bearish = signal in ("BREAKDOWN", "REVERSAL_DOWN")
+            if (bullish and side_norm == "PUT") or (bearish and side_norm == "CALL"):
+                logger.info("Sonar %s contradicts %s %s — skipping (no side-flip)",
+                            signal, symbol, side_norm)
+                continue
 
         if book.has_trade_today(date, symbol, strike, side):
             continue
@@ -533,8 +674,6 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
             logger.info("Min premium filter — skipping %s %s @ ₹%.2f < ₹%.2f",
                         symbol, side, float(row.get("entry") or 0), min_prem)
             continue
-        row = dict(row)
-        row["type"] = side
         sig = signal_from_row(row, lot_size_fn)
         book.open_trade(sig, now)
         send_telegram(format_signal_alert(sig), bot_token, chat_id)
@@ -579,6 +718,13 @@ def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
         logger.info("book_signal: %s %s premium ₹%.2f < min ₹%.2f — skip",
                     symbol, side, float(signal.get("entry") or 0), min_prem)
         return None
+
+    # External strategies (e.g. B&B) may not pre-fill the honest-economics
+    # fields — capture them here so every booked trade carries them.
+    if signal.get("half_spread") is None:
+        signal["half_spread"] = round(_half_spread_from_row(signal), 4)
+    if not signal.get("factors_json"):
+        signal["factors_json"] = collect_factor_snapshot(signal)
 
     book.open_trade(signal, now)
     send_telegram(format_signal_alert(signal), bot_token, chat_id)

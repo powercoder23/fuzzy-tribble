@@ -191,27 +191,11 @@ class IVCollector:
                     data_type           = data_type,
                 )
 
-                # Save daily record once per day (first successful fetch)
-                if data_type == "intraday" and not iv_store.daily_snapshot_exists_today(str(security_id)):
-                    iv_store.save_snapshot(
-                        security_id         = str(security_id),
-                        symbol              = symbol,
-                        timestamp           = snapshot_dt,
-                        spot_price          = spot_price,
-                        atm_strike          = atm_ctx.get("atm_strike"),
-                        atm_iv              = atm_ctx.get("atm_iv"),
-                        atm_call_iv         = atm_ctx.get("atm_call_iv"),
-                        atm_put_iv          = atm_ctx.get("atm_put_iv"),
-                        atm_call_oi         = atm_ctx.get("atm_call_oi"),
-                        atm_put_oi          = atm_ctx.get("atm_put_oi"),
-                        total_call_oi       = chain_metrics.get("total_call_oi"),
-                        total_put_oi        = chain_metrics.get("total_put_oi"),
-                        total_call_volume   = chain_metrics.get("total_call_volume"),
-                        total_put_volume    = chain_metrics.get("total_put_volume"),
-                        max_oi_strike_call  = chain_metrics.get("max_oi_strike_call"),
-                        max_oi_strike_put   = chain_metrics.get("max_oi_strike_put"),
-                        data_type           = "daily",
-                    )
+                # NOTE: the 'daily' row is NO LONGER written here. Writing it on
+                # the first intraday fetch (09:15-09:50) built an IV history of
+                # OPENING prints, biasing IV Rank/Percentile (review §2.1a).
+                # The daily row is now promoted from the LAST intraday snapshot
+                # at EOD — see iv_store.promote_daily_from_last_intraday().
 
                 logger.debug("IV saved | %s | iv=%.1f | saved=%s", symbol, atm_ctx["atm_iv"], saved)
                 return True
@@ -422,6 +406,20 @@ class IVCollector:
           after 15:30   → idle (60s sleep)
         """
         iv_store.init_db()
+
+        # Startup integrity alarm — a corrupted shared DB silently no-ops every
+        # fail-open scanner and gate downstream (review §0). Alert loudly.
+        db_health = iv_store.integrity_check()
+        if db_health != "ok":
+            msg = (f"🚨 <b>iv_history.db INTEGRITY FAILURE</b>\n{db_health}\n"
+                   "All fail-open scanners/gates are degraded. "
+                   "Restore from a clean snapshot (VACUUM INTO) before trusting signals.")
+            logger.error("iv_history.db integrity: %s", db_health)
+            try:
+                notifications.notify(msg)
+            except Exception:
+                logger.exception("integrity alert failed to send")
+
         scanner = self._ensure_scanner()
         logger.info("IVCollector started | fno_symbols=%d", len(scanner.fno_stocks))
 
@@ -469,6 +467,10 @@ class IVCollector:
                 self._pass_log    = []
                 self._fail_counts = Counter()
                 self._eod_sent    = False
+                # Expiry cache MUST reset daily: a cached expiry that lapsed
+                # overnight would make every chain fetch target an expired
+                # contract until restart (review §2.3).
+                self._expiry_cache = {}
                 _last_reset_date  = now.date()
 
             if now.weekday() >= 5:
@@ -493,6 +495,10 @@ class IVCollector:
 
             else:
                 if not self._eod_sent and t >= EOD_REPORT_TIME:
+                    # Promote each symbol's LAST intraday snapshot to the
+                    # 'daily' row (true EOD IV) before building the summary.
+                    if now.weekday() < 5:
+                        iv_store.promote_daily_from_last_intraday()
                     universe_size = len(scanner.fno_stocks) if scanner else 0
                     self._send_eod_summary(universe_size)
                     self._eod_sent = True

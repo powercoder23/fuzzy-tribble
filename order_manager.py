@@ -17,11 +17,19 @@ the same submit/track/eod surface without touching strategy code.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 
 import paper_trader
 
 logger = logging.getLogger(__name__)
+
+# ---- portfolio concentration limits (review §3.7) -------------------------- #
+# Dedup alone allows 5 same-sector same-direction CEs — one correlated bet at
+# 5x intended risk. These caps count OPEN positions + candidates in-batch.
+PORTFOLIO_MAX_SAME_DIRECTION = int(os.getenv("PORTFOLIO_MAX_SAME_DIRECTION", "3"))
+PORTFOLIO_MAX_PER_SECTOR     = int(os.getenv("PORTFOLIO_MAX_PER_SECTOR", "2"))
+PORTFOLIO_GATE_MODE          = os.getenv("PORTFOLIO_GATE_MODE", "hard").lower()  # off|soft|hard
 
 
 # --------------------------------------------------------------------------- #
@@ -129,6 +137,27 @@ class OrderManager:
         self.chat_id = chat_id
         self._warned: set = set()          # (trade_id, risk_type) — dedup intraday alerts
         self._warned_date: str | None = None
+        self._gate_alerted: set = set()    # (gate_name, date) — dedup gate-failure alerts
+
+    def _alert_gate_failure(self, gate_name: str) -> None:
+        """A gate that crashes fails OPEN — candidates pass unfiltered. That is
+        deliberate, but it must be LOUD (review §3.6): with a broken shared DB
+        every gate silently no-ops while trading continues. One Telegram alert
+        per gate per day."""
+        key = (gate_name, datetime.now().date().isoformat())
+        if key in self._gate_alerted:
+            return
+        self._gate_alerted.add(key)
+        try:
+            import notifications
+            notifications.notify(
+                f"⚠️ <b>GATE FAILURE (fail-open)</b>\n"
+                f"{gate_name} raised an exception — candidates are passing UNFILTERED. "
+                f"Check logs and iv_history.db integrity.",
+                bot_token=self.bot_token, chat_id=self.chat_id,
+            )
+        except Exception:
+            logger.exception("gate-failure alert could not be sent")
 
     # ---- intake: a scanner hands booked signals to the manager ------------- #
     def submit_signals(self, opportunities, now=None, lot_size_fn=None):
@@ -139,6 +168,7 @@ class OrderManager:
         opportunities = self._apply_pre_market_gate(opportunities, self.book)
         opportunities = self._apply_breadth_gate(opportunities)
         opportunities = self._apply_entry_gate(opportunities)
+        opportunities = self._apply_concentration_gate(opportunities, self.book)
         opened = paper_trader.process_signals(
             self.book, opportunities, now=now, lot_size_fn=lot_size_fn
         )
@@ -164,6 +194,7 @@ class OrderManager:
         sig.setdefault("strategy", "External")
         kept = self._apply_pre_market_gate([sig], self.book)
         kept = self._apply_breadth_gate(kept)
+        kept = self._apply_concentration_gate(kept, self.book)
         if not kept:
             logger.info("OrderManager: external %s %s rejected by quality gate",
                         sig.get("symbol"), sig.get("side") or sig.get("type"))
@@ -242,10 +273,85 @@ class OrderManager:
 
         except Exception:
             logger.exception("pre_market_gate failed; passing candidates through unchanged")
+            self._alert_gate_failure("pre_market_gate")
             return opportunities
 
-    @staticmethod
-    def _apply_breadth_gate(opportunities):
+    def _apply_concentration_gate(self, opportunities, book=None):
+        """Portfolio concentration cap (review §3.7).
+
+        Counts OPEN positions plus already-accepted candidates in this batch:
+          * max PORTFOLIO_MAX_SAME_DIRECTION positions per side (CE/PE)
+          * max PORTFOLIO_MAX_PER_SECTOR positions per sector (sector_mapping.db
+            via breadth.load_sector_map; symbols with no mapping are not
+            sector-capped, only direction-capped)
+
+        Modes (PORTFOLIO_GATE_MODE): off -> unchanged, soft -> log only,
+        hard -> drop. Fail-open with a loud alert.
+        """
+        try:
+            if PORTFOLIO_GATE_MODE == "off" or opportunities is None:
+                return opportunities
+            rows = (opportunities.to_dict("records")
+                    if hasattr(opportunities, "to_dict") else list(opportunities))
+            if not rows:
+                return opportunities
+
+            def norm_side(raw):
+                return "CE" if str(raw or "").upper() in ("CE", "CALL", "C") else "PE"
+
+            sector_map = {}
+            try:
+                import breadth
+                sector_map = breadth.load_sector_map() or {}
+            except Exception:
+                logger.debug("sector map unavailable — direction cap only")
+
+            # Base counts from open positions.
+            dir_count = {"CE": 0, "PE": 0}
+            sector_count: dict = {}
+            today = datetime.now().date().isoformat()
+            for t in (book.open_trades(today) if book else []):
+                s = norm_side(t.get("side"))
+                dir_count[s] += 1
+                sec = sector_map.get(str(t.get("symbol", "")).upper())
+                if sec:
+                    sector_count[sec] = sector_count.get(sec, 0) + 1
+
+            kept = []
+            for r in rows:
+                side = norm_side(r.get("side") or r.get("type"))
+                sym  = str(r.get("symbol", "")).upper()
+                sec  = sector_map.get(sym)
+                block_reason = None
+                if dir_count[side] >= PORTFOLIO_MAX_SAME_DIRECTION:
+                    block_reason = (f"direction cap {side} "
+                                    f">= {PORTFOLIO_MAX_SAME_DIRECTION}")
+                elif sec and sector_count.get(sec, 0) >= PORTFOLIO_MAX_PER_SECTOR:
+                    block_reason = f"sector cap {sec} >= {PORTFOLIO_MAX_PER_SECTOR}"
+
+                if block_reason and PORTFOLIO_GATE_MODE == "hard":
+                    logger.info("OrderManager: concentration gate blocked %s %s — %s",
+                                sym, side, block_reason)
+                    continue
+                if block_reason:  # soft
+                    logger.info("OrderManager: concentration gate (soft) would block "
+                                "%s %s — %s", sym, side, block_reason)
+                kept.append(r)
+                dir_count[side] += 1
+                if sec:
+                    sector_count[sec] = sector_count.get(sec, 0) + 1
+
+            dropped = len(rows) - len(kept)
+            if dropped:
+                logger.info("OrderManager: concentration gate dropped %d / %d candidate(s)",
+                            dropped, len(rows))
+            return kept
+        except Exception:
+            logger.exception("concentration gate failed; passing candidates through")
+            self._alert_gate_failure("concentration_gate")
+            return opportunities
+
+    def _apply_breadth_gate(self, opportunities):
         """Drop counter-trend candidates by market & sector breadth.
 
         Mode is config-driven (BREADTH_GATE_MODE):
@@ -291,10 +397,10 @@ class OrderManager:
             return kept
         except Exception:
             logger.exception("breadth gate failed; passing candidates through")
+            self._alert_gate_failure("breadth_gate")
             return opportunities
 
-    @staticmethod
-    def _apply_entry_gate(opportunities):
+    def _apply_entry_gate(self, opportunities):
         """In GATE_MODE=hard, drop candidates the composite gate rejects.
         off/soft -> unchanged (fail-open). Safe with DataFrame, list, or None."""
         try:
@@ -310,6 +416,7 @@ class OrderManager:
             return kept
         except Exception:
             logger.exception("entry gate failed; passing candidates through")
+            self._alert_gate_failure("entry_gate")
             return opportunities
 
     # ---- lifecycle: manager re-prices + exits ALL open positions ----------- #
@@ -411,6 +518,7 @@ class OrderManager:
 
         except Exception:
             logger.exception("_auto_exit_on_oi_contradiction failed (non-fatal)")
+            self._alert_gate_failure("auto_exit_oi_contradiction")
         return closed
 
     def _check_position_risks(self, open_trades: list) -> None:

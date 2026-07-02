@@ -249,6 +249,29 @@ services:
       - iv-collector
     command: python composite_runner.py
 
+  # ── Convex Engine (V2 P0 — observe-only) ─────────────────────────────────
+  # One Conviction Engine: regime -> factors -> trigger -> gates -> Decisions.
+  # Zero broker calls (reads iv_history.db written by the scanners above) and
+  # zero orders. Writes engine_decisions/engine_regime + one Telegram digest
+  # per cycle. Lean scanner image is sufficient. See V2_BLUEPRINT.md.
+  convex-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.scanner
+    container_name: convex-engine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python engine_runner.py
+
   # ── Dashboard ─────────────────────────────────────────────────────────────
   # Web dashboard — IV graph, paper trade P&L, universe overview.
   # Access via Tailscale: http://<nas-ip>:8050

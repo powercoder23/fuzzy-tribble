@@ -247,3 +247,24 @@ services:
     depends_on:
       - iv-collector
     command: python sonar_laplace_runner.py
+
+  # Convex Engine (V2 P0 — observe-only). One Conviction Engine: regime ->
+  # factors -> trigger -> gates -> ranked Decisions. Zero broker calls (reads
+  # the *_history tables in shared-data), zero orders. Writes engine_decisions/
+  # engine_regime + one Telegram digest per cycle. See V2_BLUEPRINT.md.
+  convex-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.scanner
+    container_name: convex-engine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - shared-data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python engine_runner.py

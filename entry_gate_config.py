@@ -17,3 +17,11 @@ MIN_GATE_SCORE = float(os.getenv("GATE_MIN_SCORE", "45"))   # hard mode threshol
 # If there is no composite row yet (e.g. early in history), allow the trade rather
 # than silently halting everything. Fail-open.
 ALLOW_IF_NO_COMPOSITE = os.getenv("GATE_ALLOW_IF_MISSING", "true").strip().lower() == "true"
+
+# ---- V2 strangler (P1) ------------------------------------------------------
+# composite -> gate on composite_history (current behaviour, default)
+# engine    -> gate on the Convex engine's engine_decisions table instead
+GATE_SOURCE = os.getenv("GATE_SOURCE", "composite").strip().lower()
+
+# engine mode: how stale a decision may be and still gate a trade (minutes).
+ENGINE_MAX_AGE_MIN = float(os.getenv("GATE_ENGINE_MAX_AGE_MIN", "20"))

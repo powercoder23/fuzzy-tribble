@@ -37,6 +37,23 @@ def _norm_side(raw) -> str | None:
     return None
 
 
+def _lookup_engine(security_id) -> dict:
+    """V2 strangler (P1): read the Convex engine's latest EMITTED decision and
+    map it onto the composite dict shape the rest of this module expects.
+    Engine grades A+/A/B are all non-WEAK; anything below B is never emitted."""
+    try:
+        from collectors import iv_store
+        from engine import store as engine_store
+        d = engine_store.latest_decision_for(iv_store.DB_PATH, security_id,
+                                             max_age_min=cfg.ENGINE_MAX_AGE_MIN)
+    except Exception:
+        return {}
+    if not d:
+        return {}
+    return {"direction": d.get("direction"), "score": d.get("score"),
+            "grade": d.get("grade"), "timestamp": d.get("ts")}
+
+
 def evaluate(security_id, side, mode: str | None = None) -> dict:
     """Return {allow, reason, score, direction, grade} for a candidate trade."""
     mode = (mode or cfg.GATE_MODE).lower()
@@ -46,11 +63,14 @@ def evaluate(security_id, side, mode: str | None = None) -> dict:
         return {"allow": True, "reason": "gate_off", "score": None,
                 "direction": None, "grade": None}
 
-    try:
-        from composite_scanner import get_latest_composite
-        c = get_latest_composite(security_id)
-    except Exception:
-        c = {}
+    if cfg.GATE_SOURCE == "engine":
+        c = _lookup_engine(security_id)
+    else:
+        try:
+            from composite_scanner import get_latest_composite
+            c = get_latest_composite(security_id)
+        except Exception:
+            c = {}
 
     if not c:
         return {"allow": cfg.ALLOW_IF_NO_COMPOSITE, "reason": "no_composite",

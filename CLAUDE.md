@@ -1,22 +1,41 @@
-# Project: Dhan F&O Options Trading Bot
+# Project: NSE F&O Options Trading Bot (Upstox data / Dhan reserved for future execution)
 
 A multi-service trading system for NSE F&O. Each strategy runs in its own
 Docker container, sharing IV data through a SQLite volume written by a
 single IV collector service. Order placement is gated by `AUTO_EXECUTE`;
 when false, strategies fire Telegram alerts only.
 
-## Service layout (docker-compose)
+**Broker split:** ALL market data (chains, candles, expiries, quotes) comes
+from **Upstox** via `upstox_adapter.UpstoxDhanAdapter` (a Dhan-surface shim —
+the internal data contract still uses the Dhan response shape). Dhan is NOT
+used for data; it is reserved only for possible future live order placement.
 
-| # | Service        | Container             | Entry                          | Trades? |
-|---|----------------|-----------------------|--------------------------------|---------|
-| 1 | iv-collector   | iv-collector          | `iv_collector_service.py`      | No (data only) |
-| 2 | momentum       | momentum-strategy     | `momentum_runner.py`           | Yes     |
-| 3 | discount       | discount-strategy     | `main.py --auto-loop`          | Yes (paused via `profiles: [discount]`) |
-| 4 | break-bounce   | break-bounce-strategy | `break_bounce_runner.py`       | Yes     |
+## Service layout (docker-compose.yml — current reality)
 
-Only `iv-collector` calls option-chain APIs continuously. Strategies read IV
-from the shared SQLite (`iv_history.db`) and only hit Dhan for candles +
-chain at signal/execution time.
+| #  | Service         | Container               | Entry                            | Default up? | Trades? |
+|----|-----------------|-------------------------|----------------------------------|-------------|---------|
+| 1  | iv-collector    | iv-collector            | `collectors.iv_collector_service`| yes         | No (data only) |
+| 2  | momentum        | momentum-strategy       | `momentum_runner.py`             | no (`profiles: [momentum]`, discontinued) | Yes |
+| 3  | discount        | discount-strategy       | `main.py`                        | **yes**     | Paper |
+| 4  | break-bounce    | break-bounce-strategy   | `break_bounce_runner.py`         | yes         | Yes |
+| 5  | directional-iv  | directional-iv-strategy | `directional_iv_runner.py`       | no (profile, discontinued) | Yes |
+| 6  | iv-rank         | iv-rank-scanner         | `iv_rank_runner.py`              | yes         | No (alerts) |
+| 7  | oi-buildup      | oi-buildup-scanner      | `oi_buildup_runner.py`           | yes         | No (alerts; feeds auto-exit) |
+| 8  | gap-scan        | gap-scanner             | `gap_scanner_runner.py`          | yes         | No (alerts) |
+| 9  | delivery-surge  | delivery-surge-scanner  | `delivery_surge_runner.py`       | yes         | No (alerts) |
+| 10 | smart-money     | smart-money-scanner     | `smart_money_runner.py`          | yes         | No (alerts) |
+| 11 | composite       | composite-scanner       | `composite_runner.py`            | yes         | No (feeds entry gate) |
+| 12 | sonar           | sonar-scanner           | `sonar_laplace_runner.py`        | yes         | No (feeds entry veto + risk warnings) |
+
+API callers: `iv-collector` sweeps option chains continuously; the `discount`
+service also fetches chains + candles during its 15-min scans, and `sonar`
+fetches 5-min candles. All other scanners are zero-API (read `iv_history.db`
+only).
+
+**Sole-writer contract:** only `iv-collector` writes `iv_history` rows
+(`iv_store.save_snapshot`); scanner services write their own `*_history`
+tables. All SQLite access must go through `iv_store.connect()` (WAL +
+busy_timeout) — see ARCHITECTURE_REVIEW_P0.md §0 for why.
 
 ---
 

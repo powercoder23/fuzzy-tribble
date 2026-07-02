@@ -12,6 +12,7 @@ summary at INTRADAY["eod_summary_at"] (15:25). No live orders are placed.
 
 import logging
 import os
+import threading
 import time
 import argparse
 from datetime import datetime, timedelta
@@ -89,6 +90,12 @@ class StrategySchedulerApp:
         self._cycle_gate = None
         self._lot_fn = None
         self._data_provider = None
+        # Position-management jobs (track / square-off / EOD) run on their OWN
+        # scheduler + thread. The old single-thread design meant a multi-minute
+        # full scan blocked SL/exit handling for its whole duration every 15
+        # minutes (review §3.1). API pacing across both threads is serialized
+        # by DiscountedPremiumScanner._rate_lock.
+        self._monitor_scheduler = schedule.Scheduler()
 
     # --- lazy singletons ----------------------------------------------------
     def scanner(self):
@@ -210,26 +217,39 @@ class StrategySchedulerApp:
 
     # --- scheduling ---------------------------------------------------------
     def setup_schedule(self):
-        """Register the scan cycle (15 min), the OrderManager track cycle
-        (5 min), plus square-off and EOD jobs."""
+        """Register the scan cycle (15 min) on the default scheduler, and ALL
+        position-management jobs (track / square-off / EOD) on the dedicated
+        monitor scheduler that runs in its own thread — so a long scan can
+        never delay an SL, square-off, or EOD summary."""
         schedule.clear()
+        self._monitor_scheduler.clear()
         for day in WEEKDAYS:
             for run_time in SCAN_TIMES:
                 getattr(schedule.every(), day).at(run_time).do(self.run_scan_cycle)
-            for run_time in MONITOR_TIMES:
-                getattr(schedule.every(), day).at(run_time).do(self.run_monitor_cycle)
-            getattr(schedule.every(), day).at(INTRADAY["square_off"]).do(self.run_square_off)
-            getattr(schedule.every(), day).at(INTRADAY["eod_summary_at"]).do(self.run_eod_summary)
             getattr(schedule.every(), day).at(
                 os.getenv("SECTOR_HEATMAP_AT", "09:50")
             ).do(self.run_sector_heatmap)
+            # Position lifecycle — monitor thread:
+            for run_time in MONITOR_TIMES:
+                getattr(self._monitor_scheduler.every(), day).at(run_time).do(self.run_monitor_cycle)
+            getattr(self._monitor_scheduler.every(), day).at(INTRADAY["square_off"]).do(self.run_square_off)
+            getattr(self._monitor_scheduler.every(), day).at(INTRADAY["eod_summary_at"]).do(self.run_eod_summary)
         logger.info(
-            "Scheduled discount scan %s..15:15 every %smin | OrderManager track every %smin "
-            "until %s | square-off %s | EOD %s",
+            "Scheduled discount scan %s..15:15 every %smin (main thread) | OrderManager "
+            "track every %smin until %s, square-off %s, EOD %s (monitor thread)",
             INTRADAY["session_start"], INTRADAY["scan_interval_min"],
             INTRADAY.get("monitor_interval_min", 5), INTRADAY.get("monitor_until", "15:20"),
             INTRADAY["square_off"], INTRADAY["eod_summary_at"],
         )
+
+    def _monitor_loop(self):
+        """Run position-management jobs independently of the scan thread."""
+        while True:
+            try:
+                self._monitor_scheduler.run_pending()
+            except Exception:
+                logger.exception("Monitor scheduler tick failed")
+            time.sleep(5)
 
     def run(self, run_now=False, exit_after_run=False):
         """Start the scheduler loop, with optional immediate execution."""
@@ -251,6 +271,13 @@ class StrategySchedulerApp:
             if exit_after_run:
                 logger.info("Exiting after immediate run")
                 return
+
+        # Position management runs on its own thread so a multi-minute scan
+        # can never delay an SL/exit or the square-off (review §3.1).
+        monitor_thread = threading.Thread(
+            target=self._monitor_loop, name="order-manager-monitor", daemon=True
+        )
+        monitor_thread.start()
 
         while True:
             schedule.run_pending()
