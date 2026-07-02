@@ -163,7 +163,7 @@ def _pipeline(tmp_db, trigger_map, factor_map, regime_state=None):
         regime_fn=lambda: regime_state or regime.classify(13, 65, 0.2),
         universe_fn=lambda: [("101", "TATAMOTORS"), ("102", "RELIANCE")],
         factors_fn=lambda sid, sym: factor_map.get(sid, _factors()),
-        trigger_fn=lambda sid: trigger_map.get(sid),
+        trigger_fn=lambda sid, sym=None: trigger_map.get(sid),
         # Fixed clock inside the entry window — gates must not depend on wall time.
         now_fn=lambda: __import__("datetime").datetime(2026, 7, 2, 10, 15),
     )

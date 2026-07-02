@@ -145,6 +145,14 @@ class SonarScanner:
             )
             if df is None or df.empty or "close" not in df.columns:
                 continue
+            # V2 (P2): persist the 5-min candles we already fetched so the
+            # Convex engine's triggers (ORB/VWAP/break-retest) run zero-API.
+            # Fail-open — candle persistence must never break the sonar scan.
+            try:
+                from engine import candles as engine_candles
+                engine_candles.save_candles(self.db_path, str(sec_id), symbol, df)
+            except Exception:  # noqa: BLE001
+                logger.debug("sonar: candle persist skipped", exc_info=True)
             closes = df["close"].dropna().astype(float).tolist()
             if len(closes) >= cfg.MIN_POINTS:
                 out[str(sec_id)] = (symbol, closes)

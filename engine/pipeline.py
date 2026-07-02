@@ -50,7 +50,12 @@ class EnginePipeline:
         self._regime_fn = regime_fn or (lambda: regime_mod.load(self.db_path))
         self._universe_fn = universe_fn or (lambda: default_universe(self.db_path))
         self._factors_fn = factors_fn      # (sid, symbol, breadth_snap) -> dict
-        self._trigger_fn = trigger_fn or factors_mod.load_trigger
+        if trigger_fn is None:
+            # P2 default: candle-based triggers (ORB/VWAP/break-retest) with
+            # sonar-band fallback inside detect().
+            from engine import triggers as triggers_mod
+            trigger_fn = lambda sid, sym: triggers_mod.detect(self.db_path, sid, sym)  # noqa: E731
+        self._trigger_fn = trigger_fn      # (sid, symbol) -> TriggerEvent | None
         self._risk_state_fn = risk_state_fn or (lambda: {})
         self._now_fn = now_fn or datetime.now
 
@@ -68,7 +73,7 @@ class EnginePipeline:
         emitted, watch, rejected = [], [], []
         for sid, symbol in self._universe_fn():
             f = load_factors(sid, symbol)
-            trig = self._trigger_fn(sid)
+            trig = self._trigger_fn(sid, symbol)
 
             if trig is None:
                 cs = conviction.context_score(f)
