@@ -936,6 +936,43 @@ function selectSymbol(sym) {
   loadIVChart(sym);
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// UNIVERSE TAB — all F&O names, cheapest IV first (option-buyer ordering)
+// ══════════════════════════════════════════════════════════════════════════
+function _renderUniverse(list) {
+  const grid = $('universe-grid');
+  $('uni-count').textContent = list.length;
+  if (!list.length) {
+    grid.innerHTML = '<div class="loading">No symbols yet — universe fills as iv-collector snapshots names.</div>';
+    return;
+  }
+  grid.innerHTML = list.map(s => `
+    <div class="sym-chip" onclick="showTab('iv'); selectSymbol('${s.symbol}')" title="Spot ₹${s.spot ?? '—'} · IV ${s.last_iv ?? '—'}%">
+      <span class="sym-name">${s.symbol}</span>
+      <span class="sym-ivr ${ivrClass(s.iv_rank)}">${s.iv_rank !== null ? 'IVR ' + s.iv_rank : 'N/A'}</span>
+    </div>`).join('');
+}
+
+async function loadUniverse() {
+  const grid = $('universe-grid');
+  try {
+    if (allSymbols.length === 0) allSymbols = await api('/api/symbols');
+    // Cheapest IV first — where an option buyer should shop. N/A ranks sink.
+    const sorted = [...allSymbols].sort((a, b) =>
+      (a.iv_rank ?? 999) - (b.iv_rank ?? 999) || a.symbol.localeCompare(b.symbol));
+    _renderUniverse(sorted);
+  } catch (e) {
+    grid.innerHTML = `<div class="error-msg">Universe failed to load: ${e.message}</div>`;
+  }
+}
+
+function filterUniverse(val) {
+  val = (val || '').trim().toUpperCase();
+  const base = [...allSymbols].sort((a, b) =>
+    (a.iv_rank ?? 999) - (b.iv_rank ?? 999) || a.symbol.localeCompare(b.symbol));
+  _renderUniverse(val ? base.filter(s => s.symbol.includes(val)) : base);
+}
+
 function setIvRange(days) {
   currentIvRange = days;
   document.querySelectorAll('#iv-range-group .range-btn').forEach(b => {
