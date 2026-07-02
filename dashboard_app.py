@@ -564,6 +564,55 @@ def health():
     }
 
 
+# ── Convex cockpit (V2) — everything an option buyer needs in one call ────── #
+def _iv_safe(sql: str, params=()) -> list[dict]:
+    """_iv() that tolerates missing tables (engine tables appear on first run)."""
+    try:
+        return _iv(sql, params)
+    except sqlite3.OperationalError:
+        return []
+
+
+@app.get("/api/cockpit")
+def cockpit():
+    """Regime + today's engine decisions + cheap-IV names. Read-only, fail-open."""
+    regime = _iv_safe(
+        "SELECT ts, posture, lean, vix, breadth_pct, size_mult, reasons "
+        "FROM engine_regime ORDER BY ts DESC LIMIT 1")
+    emitted = _iv_safe(
+        "SELECT ts, symbol, direction, grade, score, trigger_kind, why "
+        "FROM engine_decisions WHERE status='EMITTED' "
+        "AND date(ts)=date('now','localtime') ORDER BY score DESC LIMIT 10")
+    watch = _iv_safe(
+        "SELECT symbol, MAX(score) AS score FROM engine_decisions "
+        "WHERE status='WATCH' AND date(ts)=date('now','localtime') "
+        "GROUP BY symbol ORDER BY score DESC LIMIT 8")
+    rejects = _iv_safe(
+        "SELECT reject_reason AS reason, COUNT(*) AS n FROM engine_decisions "
+        "WHERE status='REJECTED' AND date(ts)=date('now','localtime') "
+        "GROUP BY reject_reason ORDER BY n DESC LIMIT 5")
+    n_rejected = _iv_safe(
+        "SELECT COUNT(*) AS n FROM engine_decisions "
+        "WHERE status='REJECTED' AND date(ts)=date('now','localtime')")
+    cheap_iv = _iv_safe(
+        "SELECT symbol, iv_rank, current_iv FROM iv_rank_history r "
+        "WHERE zone='CHEAP' AND timestamp=(SELECT MAX(timestamp) "
+        "  FROM iv_rank_history r2 WHERE r2.security_id=r.security_id) "
+        "ORDER BY iv_rank ASC LIMIT 10")
+    candles_today = _iv_safe(
+        "SELECT COUNT(*) AS n FROM candles_5m WHERE date(ts)=date('now','localtime')")
+    return {
+        "regime": regime[0] if regime else None,
+        "emitted": emitted,
+        "watch": watch,
+        "rejects": rejects,
+        "n_rejected": (n_rejected[0]["n"] if n_rejected else 0),
+        "cheap_iv": cheap_iv,
+        "candles_today": (candles_today[0]["n"] if candles_today else 0),
+        "server_time": datetime.now().isoformat(),
+    }
+
+
 # ── Serve frontend ────────────────────────────────────────────────────────── #
 @app.get("/", response_class=HTMLResponse)
 def index():

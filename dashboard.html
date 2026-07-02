@@ -295,6 +295,16 @@
       <!-- ═══════════════════════════════════════════════ -->
       <div id="tab-overview">
 
+        <!-- Convex cockpit (V2) — option-buyer decision strip -->
+        <div class="section">
+          <div class="section-label">Convex Cockpit — can I trade, what, and how big?</div>
+          <div class="card" id="cockpit-regime" style="margin-bottom:10px"><div class="loading">Loading regime…</div></div>
+          <div class="grid-2">
+            <div class="card table-scroll" id="cockpit-emitted"><div class="loading">Loading decisions…</div></div>
+            <div class="card" id="cockpit-context"><div class="loading">Loading…</div></div>
+          </div>
+        </div>
+
         <div class="kpi-strip" id="kpi-strip">
           <div class="loading">Loading overview…</div>
         </div>
@@ -567,6 +577,7 @@ async function checkHealth() {
 // OVERVIEW TAB
 // ══════════════════════════════════════════════════════════════════════════
 async function loadOverview() {
+  loadCockpit();
   loadKpis();
   loadOpportunities('opportunities-card');
   loadMarketSnapshot('snapshot-card');
@@ -575,6 +586,63 @@ async function loadOverview() {
   loadStrategyPerformance('strategy-card');
   loadIvRegime();
   loadActivity('activity-card');
+}
+
+async function loadCockpit() {
+  const reg = $('cockpit-regime'), emi = $('cockpit-emitted'), ctx = $('cockpit-context');
+  try {
+    const c = await api('/api/cockpit');
+
+    // Regime strip — posture, lean, VIX, breadth, size multiplier, session clock
+    const r = c.regime;
+    if (!r) {
+      reg.innerHTML = `<div class="loading">Engine has not run yet today — regime appears after the first 09:25 cycle.</div>`;
+    } else {
+      const pcol = r.posture === 'GREEN' ? 'var(--green)' : r.posture === 'RED' ? 'var(--red)' : 'var(--amber)';
+      const now = new Date(); const hm = now.toTimeString().slice(0,5);
+      const session = hm < '09:15' ? 'pre-market' : hm <= '11:30' ? 'ORB window open' :
+                      hm <= '14:30' ? 'entries open (till 14:30)' : hm <= '15:30' ? 'entries closed — manage exits' : 'market closed';
+      reg.innerHTML = `
+        <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:4px 2px">
+          <span style="font-weight:700;color:${pcol};font-size:15px">● ${r.posture}</span>
+          <span>Lean: <b>${r.lean || '—'}</b></span>
+          <span>VIX: <b>${r.vix != null ? r.vix.toFixed(1) : '—'}</b></span>
+          <span>Breadth: <b>${r.breadth_pct != null ? r.breadth_pct.toFixed(0) + '% adv' : '—'}</b></span>
+          <span>Size: <b>×${r.size_mult != null ? r.size_mult : '—'}</b></span>
+          <span class="status-label">${session}</span>
+          <span class="status-label" title="${(r.reasons||'')}">as of ${(r.ts||'').slice(11,16)}</span>
+        </div>`;
+    }
+
+    // Emitted decisions — the trade stack
+    if (!c.emitted.length) {
+      emi.innerHTML = `<div class="loading">No emitted trades yet today. ${c.n_rejected} candidates rejected (discipline working).</div>`;
+    } else {
+      emi.innerHTML = `<table><thead><tr><th>Grade</th><th>Symbol</th><th>Dir</th><th>Score</th><th>Trigger</th><th>Why</th></tr></thead><tbody>` +
+        c.emitted.map(d => `<tr>
+          <td><span class="tag ${d.grade === 'B' ? 'open' : 'win'}">${d.grade}</span></td>
+          <td><b>${d.symbol}</b></td>
+          <td><span class="tag ${(d.direction||'').toLowerCase()}">${d.direction}</span></td>
+          <td>${(d.score||0).toFixed(0)}</td>
+          <td>${d.trigger_kind || '—'}</td>
+          <td class="status-label" style="max-width:260px" title="${d.why||''}">${(d.why||'').slice(0,80)}</td>
+        </tr>`).join('') + `</tbody></table>`;
+    }
+
+    // Context column — watchlist, cheap IV, reject reasons, candle feed health
+    const watchRows = c.watch.map(w => `<span class="tag composite" style="margin:2px">${w.symbol} ${Number(w.score).toFixed(0)}</span>`).join(' ') || '<span class="status-label">none yet</span>';
+    const cheapRows = c.cheap_iv.map(x => `<span class="tag win" style="margin:2px">${x.symbol} IVR ${Number(x.iv_rank).toFixed(0)}</span>`).join(' ') || '<span class="status-label">no CHEAP-zone names</span>';
+    const rejRows = c.rejects.map(x => `<div class="status-label" style="margin:2px 0">${x.n}× ${String(x.reason||'').slice(0,70)}</div>`).join('') || '<span class="status-label">none</span>';
+    const candleOk = c.candles_today > 0;
+    ctx.innerHTML = `
+      <div style="margin-bottom:8px"><b>Watch</b> <span class="status-label">(context ready, no trigger)</span><br>${watchRows}</div>
+      <div style="margin-bottom:8px"><b>Cheap IV</b> <span class="status-label">(buyer's bargain zone, IVR &lt; 30)</span><br>${cheapRows}</div>
+      <div style="margin-bottom:8px"><b>Top reject reasons today</b> (${c.n_rejected} total)${rejRows ? '<br>' + rejRows : ''}</div>
+      <div><b>Candle feed</b>: <span class="tag ${candleOk ? 'win' : 'loss'}">${candleOk ? c.candles_today + ' rows today' : 'EMPTY — check sonar service'}</span></div>`;
+  } catch (e) {
+    reg.innerHTML = `<div class="loading">Cockpit unavailable — engine tables appear after the first run.</div>`;
+    emi.innerHTML = ''; ctx.innerHTML = '';
+  }
 }
 
 async function loadKpis() {
