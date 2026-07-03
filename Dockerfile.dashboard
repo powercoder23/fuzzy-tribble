@@ -6,6 +6,9 @@ RUN pip install --no-cache-dir fastapi uvicorn[standard]==0.24.0
 
 COPY dashboard_app.py .
 COPY dashboard.html .
+# iv_analytics.py powers the IV Analytics Engine endpoints (IV percentile,
+# vol expansion, intraday IV decay, skew tilt). Imported by dashboard_app.
+COPY iv_analytics.py .
 # breadth.py/_config are used for the F&O-universe market/sector breadth block
 # in /api/market-snapshot — dashboard has no other project dependency.
 COPY breadth.py .

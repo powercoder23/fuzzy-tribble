@@ -185,6 +185,23 @@
 
   .pnl-pos { color: var(--green); } .pnl-neg { color: var(--red); }
 
+  /* ── Day-trades drilldown modal ────────────────────────────── */
+  .day-modal { position: fixed; inset: 0; z-index: 1000; background: rgba(0,0,0,.6);
+               display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .day-modal-box { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+                   width: min(880px, 100%); max-height: 82vh; display: flex; flex-direction: column;
+                   box-shadow: 0 18px 50px rgba(0,0,0,.55); }
+  .day-modal-head { display: flex; align-items: center; justify-content: space-between;
+                    padding: 14px 18px; border-bottom: 1px solid var(--border); }
+  .day-modal-title { font-family: var(--mono); font-size: 13px; color: var(--text); font-weight: 600; }
+  .day-modal-close { background: none; border: none; color: var(--muted); font-size: 22px;
+                     line-height: 1; cursor: pointer; padding: 0 4px; }
+  .day-modal-close:hover { color: var(--text); }
+  .day-modal-body { padding: 14px 18px; overflow: auto; }
+  .day-modal-summary { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 12px;
+                       font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .day-modal-summary b { color: var(--text); font-weight: 600; }
+
   /* ── Sub-tabs (Open/Closed etc.) ───────────────────────────── */
   .subtabs { display: flex; gap: 6px; margin-bottom: 12px; }
   .subtab { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; color: var(--muted); font-family: var(--mono); font-size: 11px; padding: 6px 12px; cursor: pointer; }
@@ -531,6 +548,17 @@
   <button class="bnav-item" data-tab="alerts" onclick="showTab('alerts')"><span class="ic">&#9873;</span>Alerts</button>
   <button class="bnav-item" data-tab="market" onclick="showTab('market')"><span class="ic">&#9650;</span>Market</button>
   <button class="bnav-item" data-tab="universe" onclick="showTab('universe')"><span class="ic">&#8942;</span>More</button>
+</div>
+
+<!-- Day-trades drilldown modal (opened by clicking a P&L bar) -->
+<div id="day-modal" class="day-modal" style="display:none" onclick="if(event.target===this)closeDayModal()">
+  <div class="day-modal-box">
+    <div class="day-modal-head">
+      <div class="day-modal-title" id="day-modal-title">Trades</div>
+      <button class="day-modal-close" onclick="closeDayModal()">&times;</button>
+    </div>
+    <div class="day-modal-body" id="day-modal-body"><div class="loading">Loading…</div></div>
+  </div>
 </div>
 
 <script>
@@ -892,8 +920,15 @@ function renderPnlChartInto(canvasId, daily, setter, existing) {
     },
     options: {
       responsive: true, maintainAspectRatio: false,
+      onHover: (e, els) => { e.native.target.style.cursor = els.length ? 'pointer' : 'default'; },
+      onClick: (e, els) => {
+        if (!els.length) return;
+        const row = daily[els[0].index];
+        if (row && row.date) showDayTrades(row.date);
+      },
       plugins: { legend: { labels: { color:'#4a5568', font:{family:'JetBrains Mono',size:10}, boxWidth:16 } },
-        tooltip: { backgroundColor:'#0f0f1a', borderColor:'#1e1e35', borderWidth:1, titleColor:'#94a3b8', bodyColor:'#e2e8f0', bodyFont:{family:'JetBrains Mono',size:11}, padding:8 } },
+        tooltip: { backgroundColor:'#0f0f1a', borderColor:'#1e1e35', borderWidth:1, titleColor:'#94a3b8', bodyColor:'#e2e8f0', bodyFont:{family:'JetBrains Mono',size:11}, padding:8,
+          callbacks: { footer: () => 'Click bar for trades' } } },
       scales: {
         x: { ticks:{color:'#4a5568',font:{family:'JetBrains Mono',size:9},maxTicksLimit:10}, grid:{color:'#1e1e35'} },
         y: { ticks:{color:'#64748b',font:{family:'JetBrains Mono',size:9}, callback:v=>'₹'+v.toLocaleString('en-IN')}, grid:{color:'#1a1a2e'} },
@@ -901,6 +936,56 @@ function renderPnlChartInto(canvasId, daily, setter, existing) {
     }
   });
   setter(chart);
+}
+
+// ── Day-trades drilldown modal ───────────────────────────────────────────────
+async function showDayTrades(date) {
+  $('day-modal-title').textContent = `Trades — ${date}`;
+  $('day-modal-body').innerHTML = '<div class="loading">Loading…</div>';
+  $('day-modal').style.display = 'flex';
+  try {
+    const data = await api(`/api/paper-trades?date=${encodeURIComponent(date)}`);
+    const trades = data.trades || [];
+    let net = 0, wins = 0, closed = 0;
+    trades.forEach(t => {
+      if (t.status !== 'open' && t.realized_rupees !== null && t.realized_rupees !== undefined) {
+        net += t.realized_rupees; closed++; if (t.realized_rupees > 0) wins++;
+      }
+    });
+    const summary = `<div class="day-modal-summary">
+      <span>Trades: <b>${data.count || trades.length}</b></span>
+      <span>Closed: <b>${closed}</b></span>
+      <span>Wins: <b>${wins}</b></span>
+      <span>Net P&amp;L: <b class="${net>=0?'pnl-pos':'pnl-neg'}">${fmtPnl(net)}</b></span>
+    </div>`;
+    $('day-modal-body').innerHTML = summary + tradesTable(trades);
+  } catch(e) {
+    $('day-modal-body').innerHTML = `<div class="error-msg">Could not load trades: ${e.message}</div>`;
+  }
+}
+
+function closeDayModal() { $('day-modal').style.display = 'none'; }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDayModal(); });
+
+// ── Trades tab loader ────────────────────────────────────────────────────────
+async function loadTrades() {
+  try {
+    const today = await api('/api/paper-trades');
+    $('trades-today-card').innerHTML = tradesTable(today.trades || []);
+  } catch(e) {
+    $('trades-today-card').innerHTML = `<div class="error-msg">Could not load trades: ${e.message}</div>`;
+  }
+  try {
+    const hist = await api(`/api/paper-trades/history?days=30`);
+    const s = hist.summary || {};
+    $('s-total').textContent = s.total_trades ?? '—';
+    $('s-wr').textContent    = (s.win_rate ?? '—') + (s.win_rate != null ? '%' : '');
+    $('s-pnl').textContent   = fmtPnl(s.net_rupees);
+    $('s-exp').textContent   = fmtPnl(s.expectancy);
+    renderPnlChartInto('pnl-chart', hist.daily, c => pnlChart = c, pnlChart);
+  } catch(e) {
+    $('pnl-stats').innerHTML = `<div class="error-msg">${e.message}</div>`;
+  }
 }
 
 async function loadStrategyPerformance(targetId) {
