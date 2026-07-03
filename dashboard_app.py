@@ -24,6 +24,10 @@ GET  /api/market-snapshot       → India VIX, F&O-universe breadth, NIFTY/BANKN
                                    spot+PCR if tracked. FII/DII and Max Pain are
                                    NOT collected anywhere in this system — always null.
 GET  /api/activity              → merged recent events across the *_history tables
+GET  /api/analytics/ivp/{symbol}      → IV Percentile + buyer verdict (iv-rank scanner data)
+GET  /api/analytics/expansion         → 3-4 day IV slope leaderboard (pre-event proxy)
+GET  /api/analytics/decay             → intraday IV decay curve, 15-min buckets (?symbol=)
+GET  /api/analytics/skew-tilt/{symbol}→ today's put−call IV tilt series + panic flag
 
 Every field that isn't backed by a real collector (FII/DII cash flow, true Max
 Pain) is returned as null rather than estimated or faked — the frontend must
@@ -41,6 +45,8 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
+
+import iv_analytics
 
 # ── Config ────────────────────────────────────────────────────────────────── #
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -266,6 +272,35 @@ def iv_skew(symbol: str):
     return out
 
 
+# ── IV History Analytics Engine (module: iv_analytics.py) ────────────────── #
+@app.get("/api/analytics/ivp/{symbol}")
+def analytics_ivp(symbol: str):
+    """IV Percentile + buyer-rule verdict. Source: iv-rank scanner output."""
+    return iv_analytics.iv_percentile(symbol)
+
+
+@app.get("/api/analytics/expansion")
+def analytics_expansion(days: int = Query(4, ge=3, le=10),
+                        limit: int = Query(15, ge=1, le=50)):
+    """3-4 day daily-IV slope leaderboard — the pre-event expansion proxy.
+    (No economic-calendar collector exists; this is slope-detected only.)"""
+    return iv_analytics.vol_expansion(lookback_days=days, top_n=limit)
+
+
+@app.get("/api/analytics/decay")
+def analytics_decay(symbol: Optional[str] = None,
+                    days: int = Query(10, ge=1, le=60)):
+    """Average intraday IV per 15-min bucket over the last N sessions.
+    Omit symbol for the universe-wide curve. Surfaces the midday lull."""
+    return iv_analytics.intraday_decay_curve(symbol=symbol, days=days)
+
+
+@app.get("/api/analytics/skew-tilt/{symbol}")
+def analytics_skew_tilt(symbol: str, wing: int = Query(3, ge=1, le=7)):
+    """Today's put−call IV tilt series at equidistant strikes + panic flag."""
+    return iv_analytics.skew_tilt(symbol, wing=wing)
+
+
 # ── Paper trades ─────────────────────────────────────────────────────────── #
 @app.get("/api/paper-trades")
 def paper_trades(date: Optional[str] = None):
@@ -448,7 +483,7 @@ def opportunities(limit: int = Query(12, ge=1, le=50)):
         LIMIT ?
     """, (limit,))
 
-    ivr_map = _latest_per_symbol("iv_rank_history", "iv_rank, zone")
+    ivr_map = _latest_per_symbol("iv_rank_history", "iv_rank, iv_percentile, zone")
     oib_map = _latest_per_symbol("oi_buildup_history", "pcr, classification")
     sm_map  = _latest_per_symbol("smart_money_history", "bias")
     ds_map  = _latest_per_symbol("delivery_surge_history", "bias, surge_x")
@@ -477,6 +512,7 @@ def opportunities(limit: int = Query(12, ge=1, le=50)):
             "iv_zone": r["iv_zone"],
             "vix_regime": r["vix_regime"],
             "iv_rank": round(ivr["iv_rank"], 1) if ivr and ivr["iv_rank"] is not None else None,
+            "iv_percentile": round(ivr["iv_percentile"], 1) if ivr and ivr.get("iv_percentile") is not None else None,
             "pcr": round(oib["pcr"], 2) if oib and oib["pcr"] is not None else None,
             "oi_classification": oib["classification"] if oib else None,
             "smart_money_bias": sm["bias"] if sm else None,

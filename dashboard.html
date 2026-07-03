@@ -264,6 +264,7 @@
     <div class="sidebar-nav" id="sidebar-nav">
       <button class="nav-item active" data-tab="overview" onclick="showTab('overview')"><span class="ic">&#9679;</span>Overview</button>
       <button class="nav-item" data-tab="iv" onclick="showTab('iv')"><span class="ic">&#9633;</span>IV Graph</button>
+      <button class="nav-item" data-tab="analytics" onclick="showTab('analytics')"><span class="ic">&#931;</span>IV Analytics</button>
       <button class="nav-item" data-tab="trades" onclick="showTab('trades')"><span class="ic">&#9642;</span>Paper Trades</button>
       <button class="nav-item" data-tab="market" onclick="showTab('market')"><span class="ic">&#9650;</span>Market</button>
       <button class="nav-item" data-tab="alerts" onclick="showTab('alerts')"><span class="ic">&#9873;</span>Alerts</button>
@@ -394,6 +395,7 @@
               <div class="stat-card"><div class="stat-label">IV Rank</div><div class="stat-value" id="stat-ivr">—</div><div class="ivr-bar-wrap"><div class="ivr-bar-fill" id="ivr-bar" style="width:0%"></div></div></div>
               <div class="stat-card"><div class="stat-label">52W Range</div><div class="stat-value" id="stat-range" style="font-size:14px;padding-top:4px">—</div><div class="stat-sub" id="stat-samples">— samples</div></div>
               <div class="stat-card"><div class="stat-label">PCR</div><div class="stat-value" id="stat-pcr">—</div><div class="stat-sub">Put / Call OI</div></div>
+              <div class="stat-card"><div class="stat-label">IV %ile</div><div class="stat-value" id="stat-ivp">—</div><div class="stat-sub" id="stat-ivp-verdict">iv-rank scanner</div></div>
             </div>
             <div class="chart-wrap">
               <div class="chart-empty" id="chart-empty">Select a symbol to view IV history</div>
@@ -403,6 +405,53 @@
           </div>
         </div>
       </div><!-- /tab-iv -->
+
+
+      <!-- ═══════════════════════════════════════════════ -->
+      <!-- TAB: IV ANALYTICS                               -->
+      <!-- ═══════════════════════════════════════════════ -->
+      <div id="tab-analytics" style="display:none">
+        <div class="section">
+          <div class="section-label">IV History Analytics Engine</div>
+          <div class="card" style="margin-bottom:16px">
+            <div class="iv-controls" style="margin-bottom:0">
+              <input type="text" id="an-symbol" class="stock-search" placeholder="Symbol for IVP / Decay / Tilt — e.g. NIFTY" autocomplete="off">
+              <button class="range-btn active" onclick="loadAnalytics()">Analyze</button>
+              <span class="status-label">Expansion leaderboard is universe-wide</span>
+            </div>
+          </div>
+          <div class="grid-2">
+            <div class="card">
+              <div class="section-label" style="margin-bottom:12px">I · IV Percentile — buyer rule</div>
+              <div class="iv-stats" id="an-ivp-stats" style="margin-bottom:8px"><div class="empty-state">Enter a symbol and hit Analyze</div></div>
+              <div class="status-label" id="an-ivp-note"></div>
+            </div>
+            <div class="card table-scroll">
+              <div class="section-label" style="margin-bottom:12px">II · Volatility Expansion — 4-day IV slope</div>
+              <div id="an-expansion"><div class="loading">Loading…</div></div>
+            </div>
+          </div>
+          <div class="section"></div>
+          <div class="grid-2">
+            <div class="card">
+              <div class="section-label" style="margin-bottom:12px">III · Intraday IV Decay Curve — 15-min avg</div>
+              <div class="chart-wrap" style="height:220px">
+                <div class="chart-empty" id="an-decay-empty" style="display:none"></div>
+                <canvas id="an-decay-chart"></canvas>
+              </div>
+              <div class="status-label" id="an-decay-note"></div>
+            </div>
+            <div class="card">
+              <div class="section-label" style="margin-bottom:12px">IV · Put−Call IV Skew Tilt — today</div>
+              <div class="chart-wrap" style="height:220px">
+                <div class="chart-empty" id="an-tilt-empty" style="display:none"></div>
+                <canvas id="an-tilt-chart"></canvas>
+              </div>
+              <div class="status-label" id="an-tilt-note"></div>
+            </div>
+          </div>
+        </div>
+      </div><!-- /tab-analytics -->
 
 
       <!-- ═══════════════════════════════════════════════ -->
@@ -486,7 +535,7 @@
 
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
-const TABS = ['overview','iv','trades','market','alerts','universe'];
+const TABS = ['overview','iv','analytics','trades','market','alerts','universe'];
 let currentSymbol = null;
 let currentIvRange = 30;
 let currentView    = 'daily';
@@ -533,7 +582,7 @@ function blank(label) {
 }
 
 // ── Tab switching ──────────────────────────────────────────────────────────
-const TAB_TITLES = { overview:'Overview', iv:'IV Graph', trades:'Paper Trades', market:'Market', alerts:'Alerts', universe:'Universe' };
+const TAB_TITLES = { overview:'Overview', iv:'IV Graph', analytics:'IV Analytics', trades:'Paper Trades', market:'Market', alerts:'Alerts', universe:'Universe' };
 
 function showTab(name) {
   TABS.forEach(t => { $(`tab-${t}`).style.display = t === name ? '' : 'none'; });
@@ -547,6 +596,10 @@ function showTab(name) {
   if (name === 'universe') loadUniverse();
   if (name === 'market')   loadMarketSnapshot('snapshot-card-2');
   if (name === 'alerts')   { loadOpportunities('opportunities-card-2'); loadActivity('activity-card-2'); }
+  if (name === 'analytics') {
+    if (currentSymbol && !$('an-symbol').value) $('an-symbol').value = currentSymbol;
+    loadAnalytics();
+  }
 }
 
 // ── Header date-range selector ──────────────────────────────────────────────
@@ -710,14 +763,14 @@ async function loadOpportunities(targetId) {
         <td style="color:var(--text);font-weight:600">${o.symbol}</td>
         <td><span class="stat-value" style="font-size:15px">${o.score ?? '—'}</span></td>
         <td><span class="tag ${dirCls}">${dirTag}</span></td>
-        <td>${o.iv_rank ?? '—'}</td>
+        <td>${o.iv_rank ?? '—'}<span style="color:var(--muted)"> / ${o.iv_percentile ?? '—'}</span></td>
         <td>${o.pcr ?? '—'}</td>
         <td>${badges.join(' ') || '<span class="tag na">—</span>'}</td>
         <td style="color:var(--muted);font-size:10px">${timeOf(o.composite_as_of)}</td>
       </tr>`;
     }).join('');
     el.innerHTML = `<table class="data-table">
-      <thead><tr><th>Symbol</th><th>Score</th><th>Setup</th><th>IV Rank</th><th>PCR</th><th>Signals</th><th>As of</th></tr></thead>
+      <thead><tr><th>Symbol</th><th>Score</th><th>Setup</th><th>IVR / IVP</th><th>PCR</th><th>Signals</th><th>As of</th></tr></thead>
       <tbody>${rows}</tbody></table>`;
   } catch(e) {
     el.innerHTML = `<div class="error-msg">Could not load opportunities: ${e.message}</div>`;
@@ -1042,6 +1095,7 @@ async function loadIVChart(symbol) {
     $('stat-pcr').className = 'stat-value ' + (lastPcr > 1.2 ? 'cheap' : lastPcr < 0.6 ? 'rich' : '');
     $('chart-meta').textContent = `${symbol} · ${data.timestamps?.length ?? 0} data points`;
 
+    fillIvpStat(symbol);   // async, non-blocking — iv-rank scanner IVP
     renderIVChart(data);
   } catch(e) {
     $('chart-empty').textContent = e.message.includes('404') ? `No IV data for ${symbol}` : `Error: ${e.message}`;
@@ -1152,6 +1206,150 @@ function renderSkewChart(d) {
       }
     }
   });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// IV ANALYTICS TAB (IV History Analytics Engine — iv_analytics.py)
+// ══════════════════════════════════════════════════════════════════════════
+let decayChart = null, tiltChart = null;
+
+async function fillIvpStat(symbol) {
+  try {
+    const d = await api(`/api/analytics/ivp/${symbol}`);
+    const ivp = d.iv_percentile;
+    $('stat-ivp').textContent = ivp !== null && ivp !== undefined ? ivp.toFixed(1) : '—';
+    $('stat-ivp').className = 'stat-value ' + (d.verdict === 'BUY' ? 'cheap' : d.verdict === 'AVOID' ? 'rich' : 'normal');
+    $('stat-ivp-verdict').textContent = d.verdict ? `${d.verdict} · ${d.rule}` : (d.note || 'no data');
+  } catch(e) {
+    $('stat-ivp').textContent = '—';
+    $('stat-ivp-verdict').textContent = 'no scanner data yet';
+  }
+}
+
+async function loadAnalytics() {
+  const sym = ($('an-symbol').value || '').trim().toUpperCase();
+  loadAnExpansion();
+  loadAnDecay(sym || null);
+  if (sym) { loadAnIvp(sym); loadAnTilt(sym); }
+  else {
+    $('an-ivp-stats').innerHTML = '<div class="empty-state">Enter a symbol for IVP</div>';
+    $('an-tilt-empty').textContent = 'Enter a symbol for skew tilt';
+    $('an-tilt-empty').style.display = 'flex';
+    $('an-tilt-chart').style.display = 'none';
+  }
+}
+
+async function loadAnIvp(sym) {
+  const el = $('an-ivp-stats');
+  try {
+    const d = await api(`/api/analytics/ivp/${sym}`);
+    if (d.iv_percentile === null || d.iv_percentile === undefined) {
+      el.innerHTML = `<div class="empty-state">${d.note || 'No IVP data for ' + sym}</div>`;
+      $('an-ivp-note').textContent = '';
+      return;
+    }
+    const vCls = d.verdict === 'BUY' ? 'cheap' : d.verdict === 'AVOID' ? 'rich' : 'normal';
+    el.innerHTML = `
+      <div class="stat-card"><div class="stat-label">${sym} IV %ile</div><div class="stat-value ${vCls}">${d.iv_percentile.toFixed(1)}</div><div class="stat-sub">${d.hist_days || '?'} daily samples</div></div>
+      <div class="stat-card"><div class="stat-label">Verdict</div><div class="stat-value ${vCls}" style="font-size:16px;padding-top:3px">${d.verdict}</div><div class="stat-sub">${d.rule}</div></div>
+      <div class="stat-card"><div class="stat-label">IV Rank</div><div class="stat-value">${d.iv_rank !== null && d.iv_rank !== undefined ? d.iv_rank.toFixed(1) : '—'}</div><div class="stat-sub">zone: ${d.zone || '—'}</div></div>`;
+    $('an-ivp-note').textContent = `source: ${d.source}` + (d.as_of ? ` · as of ${timeOf(d.as_of)}` : '');
+  } catch(e) {
+    el.innerHTML = `<div class="error-msg">${e.message}</div>`;
+  }
+}
+
+async function loadAnExpansion() {
+  const el = $('an-expansion');
+  try {
+    const d = await api('/api/analytics/expansion?days=4&limit=15');
+    if (!d.symbols.length) { el.innerHTML = '<div class="empty-state">Not enough daily IV history yet (needs ≥3 days per symbol)</div>'; return; }
+    const rows = d.symbols.map(s => `<tr>
+      <td style="color:var(--text);font-weight:500">${s.symbol}</td>
+      <td class="${s.slope_iv_pts_per_day > 0 ? 'pnl-pos' : 'pnl-neg'}">${s.slope_iv_pts_per_day > 0 ? '+' : ''}${s.slope_iv_pts_per_day}/d</td>
+      <td>${s.iv_start}% → ${s.iv_now}%</td>
+      <td class="${s.change_pct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${s.change_pct >= 0 ? '+' : ''}${s.change_pct}%</td>
+      <td>${s.expanding ? '<span class="tag open">EXPANDING</span>' : '<span class="tag na">—</span>'}</td>
+    </tr>`).join('');
+    el.innerHTML = `<table class="data-table">
+      <thead><tr><th>Symbol</th><th>Slope</th><th>IV ${d.lookback_days}d</th><th>Δ%</th><th>Status</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+      <div class="status-label" style="margin-top:8px">${d.expanding_count} expanding · ${d.note}</div>`;
+  } catch(e) {
+    el.innerHTML = `<div class="error-msg">${e.message}</div>`;
+  }
+}
+
+async function loadAnDecay(sym) {
+  const empty = $('an-decay-empty'), cv = $('an-decay-chart');
+  try {
+    const d = await api(`/api/analytics/decay?days=10${sym ? '&symbol=' + sym : ''}`);
+    if (!d.buckets.length) throw new Error('No intraday IV history yet');
+    empty.style.display = 'none'; cv.style.display = '';
+    if (decayChart) decayChart.destroy();
+    const lullIdx = d.lull ? d.buckets.findIndex(b => b.time === d.lull.time) : -1;
+    decayChart = new Chart(cv.getContext('2d'), {
+      type: 'line',
+      data: { labels: d.buckets.map(b => b.time), datasets: [{
+        label: `${d.symbol || 'Universe'} avg IV % (${d.days}d)`,
+        data: d.buckets.map(b => b.avg_iv),
+        borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,0.08)',
+        borderWidth: 1.8, fill: true, tension: 0.3,
+        pointRadius: d.buckets.map((b, i) => i === lullIdx ? 5 : 0),
+        pointBackgroundColor: '#ef4444',
+      }]},
+      options: { responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { labels: { color:'#4a5568', font:{family:'JetBrains Mono',size:10} } },
+          tooltip: { backgroundColor:'#0f0f1a', borderColor:'#1e1e35', borderWidth:1, bodyFont:{family:'JetBrains Mono',size:11} } },
+        scales: {
+          x: { ticks:{color:'#4a5568',font:{family:'JetBrains Mono',size:9},maxTicksLimit:9,maxRotation:0}, grid:{color:'#1e1e35'} },
+          y: { ticks:{color:'#94a3b8',font:{family:'JetBrains Mono',size:9},callback:v=>v.toFixed(1)+'%'}, grid:{color:'#1a1a2e'} },
+        }}
+    });
+    $('an-decay-note').textContent = d.lull
+      ? `Midday lull: ${d.lull.time} (avg ${d.lull.avg_iv}%) — avoid fresh long-premium entries here (theta + IV low together)`
+      : '';
+  } catch(e) {
+    if (decayChart) { decayChart.destroy(); decayChart = null; }
+    cv.style.display = 'none';
+    empty.textContent = e.message; empty.style.display = 'flex';
+    $('an-decay-note').textContent = '';
+  }
+}
+
+async function loadAnTilt(sym) {
+  const empty = $('an-tilt-empty'), cv = $('an-tilt-chart');
+  try {
+    const d = await api(`/api/analytics/skew-tilt/${sym}?wing=3`);
+    if (!d.series.length) throw new Error(d.note || 'No skew snapshots today');
+    empty.style.display = 'none'; cv.style.display = '';
+    if (tiltChart) tiltChart.destroy();
+    tiltChart = new Chart(cv.getContext('2d'), {
+      type: 'line',
+      data: { labels: d.series.map(p => p.time), datasets: [{
+        label: `${sym} put−call tilt (IV pts, ±${d.wing_strikes} strikes)`,
+        data: d.series.map(p => p.tilt),
+        borderColor: d.panic ? '#ef4444' : '#a855f7',
+        backgroundColor: d.panic ? 'rgba(239,68,68,0.10)' : 'rgba(168,85,247,0.08)',
+        borderWidth: 1.8, fill: true, tension: 0.3, pointRadius: 2,
+      }]},
+      options: { responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { labels: { color:'#4a5568', font:{family:'JetBrains Mono',size:10} } },
+          tooltip: { backgroundColor:'#0f0f1a', borderColor:'#1e1e35', borderWidth:1, bodyFont:{family:'JetBrains Mono',size:11} } },
+        scales: {
+          x: { ticks:{color:'#4a5568',font:{family:'JetBrains Mono',size:9},maxTicksLimit:9,maxRotation:0}, grid:{color:'#1e1e35'} },
+          y: { ticks:{color:'#94a3b8',font:{family:'JetBrains Mono',size:9},callback:v=>v.toFixed(1)}, grid:{color:'#1a1a2e'} },
+        }}
+    });
+    $('an-tilt-note').innerHTML = (d.panic
+      ? `<span class="tag loss">PANIC FLAG</span> latest tilt ${d.latest_tilt} vs day mean ${d.day_mean_tilt} — `
+      : `latest tilt ${d.latest_tilt} vs day mean ${d.day_mean_tilt} · calm — `) + d.panic_rule;
+  } catch(e) {
+    if (tiltChart) { tiltChart.destroy(); tiltChart = null; }
+    cv.style.display = 'none';
+    empty.textContent = e.message; empty.style.display = 'flex';
+    $('an-tilt-note').textContent = '';
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
