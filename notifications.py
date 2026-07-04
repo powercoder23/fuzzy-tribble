@@ -114,7 +114,43 @@ def send_discord(text, webhook_url=None, convert_html=True):
         return False
 
 
+def notify_gated(container_name, alert_type, text, *, bot_token=None, chat_id=None,
+                  webhook_url=None, parse_mode="HTML"):
+    """Same delivery as notify(), but first checks the Settings page's
+    alert-flag matrix (settings_store.should_alert) to decide whether to
+    send at all, and to which channel(s).
+
+    Unlike notify()'s Telegram-first-Discord-fallback behaviour, channel
+    'both' here sends to both explicitly — the Settings page lets you pick
+    that on purpose.
+
+    Fails open: if settings_store/settings.db isn't reachable for any
+    reason, behaves exactly like notify() always has, so a Settings-page
+    problem can never silently kill an alert.
+    """
+    try:
+        import settings_store
+        channel = settings_store.should_alert(container_name, alert_type)
+    except Exception:
+        logger.warning("settings_store unavailable, defaulting to notify()", exc_info=True)
+        return notify(text, bot_token=bot_token, chat_id=chat_id,
+                       webhook_url=webhook_url, parse_mode=parse_mode)
+
+    if channel is None:
+        return False
+    if channel == "both":
+        ok_telegram = send_telegram(text, bot_token=bot_token, chat_id=chat_id, parse_mode=parse_mode)
+        ok_discord = send_discord(text, webhook_url=webhook_url, convert_html=bool(parse_mode))
+        return ok_telegram or ok_discord
+    if channel == "telegram":
+        return send_telegram(text, bot_token=bot_token, chat_id=chat_id, parse_mode=parse_mode)
+    if channel == "discord":
+        return send_discord(text, webhook_url=webhook_url, convert_html=bool(parse_mode))
+    return False
+
+
 def notify(text, *, bot_token=None, chat_id=None, webhook_url=None, parse_mode="HTML"):
+
     """Deliver `text`, Telegram first and Discord as fallback.
 
     Discord fires only when Telegram fails or is not configured. Returns True if

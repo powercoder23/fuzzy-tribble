@@ -37,6 +37,7 @@ render those as an explicit blank/"—" state, never a placeholder number.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta
@@ -47,6 +48,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 import iv_analytics
+import settings_store
+import docker_control
+from settings_routes import router as settings_router
 
 # ── Config ────────────────────────────────────────────────────────────────── #
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -54,6 +58,21 @@ IV_DB    = DATA_DIR / "iv_history.db"
 PT_DB    = DATA_DIR / "paper_trades.db"
 
 app = FastAPI(title="Fuzzy Tribble Dashboard", version="1.0")
+app.include_router(settings_router)
+
+
+@app.on_event("startup")
+def _init_settings():
+    settings_store.init_db()
+    try:
+        settings_store.ensure_container_rows(docker_control.list_services())
+    except Exception:
+        # Compose file not mounted yet, or docker CLI not installed — the
+        # rest of the dashboard should still come up fine.
+        logging.getLogger(__name__).warning(
+            "Could not seed settings rows from compose file", exc_info=True
+        )
+
 
 
 # ── DB helpers ───────────────────────────────────────────────────────────────#
@@ -708,3 +727,12 @@ def index():
     if html_path.exists():
         return html_path.read_text()
     return HTMLResponse("<h1>Dashboard HTML not found</h1>", status_code=500)
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page():
+    html_path = Path(__file__).parent / "settings.html"
+    if html_path.exists():
+        return html_path.read_text()
+    return HTMLResponse("<h1>Settings HTML not found</h1>", status_code=500)
+

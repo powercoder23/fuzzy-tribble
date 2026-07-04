@@ -2,7 +2,20 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir fastapi uvicorn[standard]==0.24.0
+# Docker CLI + compose plugin — needed only by the Settings page's container
+# start/stop/restart/rebuild controls. These proxy to the *host* daemon via
+# the socket mounted in docker-compose.prod.yml; no separate daemon runs here.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir fastapi uvicorn[standard]==0.24.0 pyyaml
 
 COPY dashboard_app.py .
 COPY dashboard.html .
@@ -13,5 +26,10 @@ COPY iv_analytics.py .
 # in /api/market-snapshot — dashboard has no other project dependency.
 COPY breadth.py .
 COPY breadth_config.py .
+# Settings page: alert-flag matrix, kill switch, and container control.
+COPY settings_store.py .
+COPY settings_routes.py .
+COPY docker_control.py .
+COPY settings.html .
 
 CMD ["uvicorn", "dashboard_app:app", "--host", "0.0.0.0", "--port", "8050", "--workers", "1"]
