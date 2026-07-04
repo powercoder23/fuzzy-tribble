@@ -285,6 +285,11 @@ services:
       - "8050:8050"
     volumes:
       - ./data:/app/data
+      # Settings page container controls (start/stop/restart/rebuild) proxy
+      # to the host daemon over this socket — see docker_control.py.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Read-only access to this compose file + build contexts.
+      - .:/compose:ro
     env_file:
       - .env
 

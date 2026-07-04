@@ -1,0 +1,271 @@
+<!--
+  settings.html
+  -------------
+  Mount this at GET /settings in your existing FastAPI app, e.g.:
+
+    from fastapi.responses import FileResponse
+
+    @app.get("/settings")
+    def settings_page():
+        return FileResponse("settings.html")
+
+  Talks to the settings_routes.py endpoints. No build step, no framework —
+  matches a plain Chart.js-dashboard setup. Add a nav link to /settings
+  from your existing index page.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>fuzzy-tribble — settings</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --dim: #8b949e;
+    --green: #3fb950;
+    --red: #f85149;
+    --amber: #d29922;
+    --accent: #58a6ff;
+    --mono: "SF Mono", "JetBrains Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: var(--mono); font-size: 13px;
+    margin: 0; padding: 24px;
+  }
+  h1 { font-size: 16px; margin: 0 0 4px; letter-spacing: 0.02em; }
+  .sub { color: var(--dim); font-size: 12px; margin-bottom: 20px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 16px; margin-bottom: 18px;
+  }
+  .panel h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--dim); margin: 0 0 12px;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { border: 1px solid var(--border); padding: 5px 8px; text-align: center; }
+  th { color: var(--dim); font-weight: 500; white-space: nowrap; }
+  td.name { text-align: left; color: var(--text); white-space: nowrap; }
+  select {
+    background: #0d1117; color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; font-family: var(--mono); font-size: 11px; padding: 2px 4px;
+  }
+  input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .running { background: var(--green); }
+  .stopped { background: var(--red); }
+  .unknown { background: var(--amber); }
+  .row-flex { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+  .container-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .container-row:last-child { border-bottom: none; }
+  .btns button { margin-left: 6px; }
+  button {
+    background: #21262d; color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 4px 10px; font-family: var(--mono);
+    font-size: 11px; cursor: pointer;
+  }
+  button:hover { background: #30363d; }
+  button.danger:hover { background: #4c1d1d; border-color: var(--red); }
+  button.primary { border-color: var(--accent); color: var(--accent); }
+  .kill-switch { display: flex; align-items: center; gap: 10px; }
+  .kill-switch.armed { color: var(--red); }
+  .toast {
+    position: fixed; bottom: 20px; right: 20px; background: var(--panel);
+    border: 1px solid var(--border); padding: 10px 14px; border-radius: 6px;
+    font-size: 12px; display: none;
+  }
+</style>
+</head>
+<body>
+
+<h1>SETTINGS</h1>
+<div class="sub">alert routing · container control · startup profile</div>
+
+<div class="panel">
+  <h2>Kill Switch</h2>
+  <div class="kill-switch" id="killSwitchRow">
+    <input type="checkbox" id="killSwitchToggle">
+    <span id="killSwitchLabel">All alerts flowing normally</span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Containers</h2>
+  <div id="containerList"></div>
+</div>
+
+<div class="panel">
+  <h2>Startup Profile — used by "Apply Startup Profile" (docker compose up -d for selected only)</h2>
+  <div id="startupList"></div>
+  <div style="margin-top:10px;">
+    <button class="primary" onclick="applyStartupProfile()">Apply Startup Profile</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Alert Flag Matrix</h2>
+  <table id="alertTable">
+    <thead><tr id="alertHeadRow"><th>container</th></tr></thead>
+    <tbody id="alertBody"></tbody>
+  </table>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let STATE = null;
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 2500);
+}
+
+async function loadOverview() {
+  STATE = await api('/api/settings/overview');
+  renderKillSwitch();
+  renderContainers();
+  renderStartupProfile();
+  renderAlertMatrix();
+}
+
+function renderKillSwitch() {
+  const cb = document.getElementById('killSwitchToggle');
+  const label = document.getElementById('killSwitchLabel');
+  const row = document.getElementById('killSwitchRow');
+  cb.checked = STATE.kill_switch;
+  label.textContent = STATE.kill_switch
+    ? 'All alerts SUPPRESSED (kill switch armed)'
+    : 'All alerts flowing normally';
+  row.classList.toggle('armed', STATE.kill_switch);
+  cb.onchange = async () => {
+    await api('/api/settings/kill-switch', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({on: cb.checked})
+    });
+    toast(cb.checked ? 'Kill switch ARMED — alerts suppressed' : 'Kill switch OFF — alerts resumed');
+    loadOverview();
+  };
+}
+
+function renderContainers() {
+  const el = document.getElementById('containerList');
+  el.innerHTML = '';
+  STATE.services.forEach(name => {
+    const state = STATE.status[name] || 'unknown';
+    const dotClass = state.includes('running') ? 'running' : state.includes('exited') ? 'stopped' : 'unknown';
+    const row = document.createElement('div');
+    row.className = 'container-row';
+    row.innerHTML = `
+      <div><span class="status-dot ${dotClass}"></span>${name} <span style="color:var(--dim)">[${state}]</span></div>
+      <div class="btns">
+        <button onclick="doAction('${name}','start')">start</button>
+        <button onclick="doAction('${name}','stop')">stop</button>
+        <button onclick="doAction('${name}','restart')">restart</button>
+        <button class="danger" onclick="doAction('${name}','rebuild')">rebuild</button>
+      </div>`;
+    el.appendChild(row);
+  });
+}
+
+async function doAction(service, action) {
+  toast(`${action}ing ${service}...`);
+  const result = await api('/api/settings/container-action', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({services: [service], action})
+  });
+  const r = result.results[0];
+  toast(r.ok ? `${service}: ${action} OK` : `${service}: ${action} FAILED — ${r.stderr.slice(0,120)}`);
+  loadOverview();
+}
+
+function renderStartupProfile() {
+  const el = document.getElementById('startupList');
+  el.innerHTML = '';
+  STATE.services.forEach(name => {
+    const on = STATE.startup_profile[name] ?? true;
+    const row = document.createElement('div');
+    row.className = 'container-row';
+    row.innerHTML = `
+      <div>${name}</div>
+      <div><input type="checkbox" ${on ? 'checked' : ''} onchange="toggleAutostart('${name}', this.checked)"></div>`;
+    el.appendChild(row);
+  });
+}
+
+async function toggleAutostart(name, on) {
+  await api('/api/settings/startup-profile', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({container_name: name, autostart: on})
+  });
+}
+
+async function applyStartupProfile() {
+  toast('Applying startup profile...');
+  const result = await api('/api/settings/startup-profile/apply', {method: 'POST'});
+  toast(result.ok ? 'Startup profile applied' : `Failed: ${result.stderr.slice(0,150)}`);
+  loadOverview();
+}
+
+function renderAlertMatrix() {
+  const head = document.getElementById('alertHeadRow');
+  head.innerHTML = '<th>container</th>' + STATE.alert_types.map(t => `<th>${t}</th>`).join('');
+
+  const body = document.getElementById('alertBody');
+  body.innerHTML = '';
+
+  STATE.services.forEach(container => {
+    const tr = document.createElement('tr');
+    let cells = `<td class="name">${container}</td>`;
+    STATE.alert_types.forEach(alertType => {
+      const flag = STATE.alert_matrix.find(
+        f => f.container_name === container && f.alert_type === alertType
+      ) || {enabled: 1, channel: 'both'};
+      const cbId = `cb_${container}_${alertType}`;
+      const selId = `sel_${container}_${alertType}`;
+      const channelOpts = STATE.channels.map(c =>
+        `<option value="${c}" ${c === flag.channel ? 'selected' : ''}>${c}</option>`
+      ).join('');
+      cells += `<td>
+        <input type="checkbox" id="${cbId}" ${flag.enabled ? 'checked' : ''}
+               onchange="updateFlag('${container}','${alertType}')">
+        <br>
+        <select id="${selId}" onchange="updateFlag('${container}','${alertType}')">
+          ${channelOpts}
+        </select>
+      </td>`;
+    });
+    tr.innerHTML = cells;
+    body.appendChild(tr);
+  });
+}
+
+async function updateFlag(container, alertType) {
+  const enabled = document.getElementById(`cb_${container}_${alertType}`).checked;
+  const channel = document.getElementById(`sel_${container}_${alertType}`).value;
+  await api('/api/settings/alert-flag', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({container_name: container, alert_type: alertType, enabled, channel})
+  });
+  toast(`${container} / ${alertType} updated`);
+}
+
+loadOverview();
+setInterval(() => { api('/api/settings/containers/status').then(s => {
+  if (STATE) { STATE.status = s; renderContainers(); }
+}); }, 8000);
+</script>
+</body>
+</html>
