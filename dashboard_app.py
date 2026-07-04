@@ -24,6 +24,8 @@ GET  /api/market-snapshot       → India VIX, F&O-universe breadth, NIFTY/BANKN
                                    spot+PCR if tracked. FII/DII and Max Pain are
                                    NOT collected anywhere in this system — always null.
 GET  /api/activity              → merged recent events across the *_history tables
+GET  /api/convex/journal        → V2 journal: readiness, daily timeline, grade/trigger
+                                   mix, reject-reason breakdown (?days=30)
 GET  /api/analytics/ivp/{symbol}      → IV Percentile + buyer verdict (iv-rank scanner data)
 GET  /api/analytics/expansion         → 3-4 day IV slope leaderboard (pre-event proxy)
 GET  /api/analytics/decay             → intraday IV decay curve, 15-min buckets (?symbol=)
@@ -697,6 +699,124 @@ def cockpit():
         "n_rejected": (n_rejected[0]["n"] if n_rejected else 0),
         "cheap_iv": cheap_iv,
         "candles_today": (candles_today[0]["n"] if candles_today else 0),
+        "server_time": datetime.now().isoformat(),
+    }
+
+
+# ── Convex journal (V2 P0) — progress + attribution over engine_decisions ── #
+@app.get("/api/convex/journal")
+def convex_journal(days: int = Query(30, ge=1, le=120)):
+    """Everything the Journal tab needs in one call. Read-only, fail-open.
+
+    Answers four questions:
+      1. How much evidence has P0 gathered? (days journaled, decision counts)
+      2. What is the engine deciding, and why?  (grades, triggers, reject reasons)
+      3. Is quality drifting?                    (daily timeline: counts + avg score)
+      4. Are we ready for P1?                    (readiness vs evidence targets)
+    """
+    since = f"-{days} days"
+
+    span = _iv_safe(
+        "SELECT COUNT(DISTINCT date(ts)) AS days_journaled, "
+        "       MIN(date(ts)) AS first_day, MAX(date(ts)) AS last_day, "
+        "       COUNT(*) AS total_rows "
+        "FROM engine_decisions")
+    span = span[0] if span else {}
+
+    by_status = _iv_safe(
+        "SELECT status, COUNT(*) AS n FROM engine_decisions "
+        "WHERE date(ts) >= date('now','localtime', ?) GROUP BY status", (since,))
+    status_map = {r["status"]: r["n"] for r in by_status}
+
+    grades = _iv_safe(
+        "SELECT grade, COUNT(*) AS n, ROUND(AVG(score),1) AS avg_score "
+        "FROM engine_decisions WHERE status='EMITTED' "
+        "AND date(ts) >= date('now','localtime', ?) "
+        "GROUP BY grade ORDER BY avg_score DESC", (since,))
+
+    triggers = _iv_safe(
+        "SELECT trigger_kind, COUNT(*) AS n, ROUND(AVG(trigger_quality),2) AS avg_q, "
+        "       ROUND(AVG(score),1) AS avg_score "
+        "FROM engine_decisions WHERE status='EMITTED' AND trigger_kind IS NOT NULL "
+        "AND date(ts) >= date('now','localtime', ?) "
+        "GROUP BY trigger_kind ORDER BY n DESC", (since,))
+
+    directions = _iv_safe(
+        "SELECT direction, COUNT(*) AS n FROM engine_decisions "
+        "WHERE status='EMITTED' AND date(ts) >= date('now','localtime', ?) "
+        "GROUP BY direction", (since,))
+
+    rejects = _iv_safe(
+        "SELECT COALESCE(NULLIF(reject_reason,''),'(unspecified)') AS reason, "
+        "       COUNT(*) AS n FROM engine_decisions "
+        "WHERE status='REJECTED' AND date(ts) >= date('now','localtime', ?) "
+        "GROUP BY reason ORDER BY n DESC LIMIT 12", (since,))
+
+    daily = _iv_safe(
+        "SELECT date(ts) AS day, "
+        "       SUM(status='EMITTED')  AS emitted, "
+        "       SUM(status='WATCH')    AS watch, "
+        "       SUM(status='REJECTED') AS rejected, "
+        "       ROUND(AVG(CASE WHEN status='EMITTED' THEN score END),1) AS avg_emitted_score, "
+        "       MAX(CASE WHEN status='EMITTED' THEN score END) AS best_score "
+        "FROM engine_decisions WHERE date(ts) >= date('now','localtime', ?) "
+        "GROUP BY day ORDER BY day", (since,))
+
+    # symbol concentration — guards the V1 'same 5-10 instruments' failure mode
+    top_symbols = _iv_safe(
+        "SELECT symbol, COUNT(*) AS n FROM engine_decisions "
+        "WHERE status='EMITTED' AND date(ts) >= date('now','localtime', ?) "
+        "GROUP BY symbol ORDER BY n DESC LIMIT 8", (since,))
+
+    regime_daily = _iv_safe(
+        "SELECT date(ts) AS day, posture, COUNT(*) AS n FROM engine_regime "
+        "WHERE date(ts) >= date('now','localtime', ?) "
+        "GROUP BY day, posture", (since,))
+    # dominant posture per day
+    posture_by_day: dict = {}
+    for r in regime_daily:
+        d = r["day"]
+        if d not in posture_by_day or r["n"] > posture_by_day[d]["n"]:
+            posture_by_day[d] = {"posture": r["posture"], "n": r["n"]}
+    for row in daily:
+        p = posture_by_day.get(row["day"])
+        row["regime"] = p["posture"] if p else None
+
+    formula_vers = _iv_safe(
+        "SELECT formula_ver, COUNT(*) AS n, MIN(date(ts)) AS since_day "
+        "FROM engine_decisions GROUP BY formula_ver ORDER BY since_day")
+
+    # P1 readiness — evidence-gated, not calendar-gated
+    emitted_total = _scalar(IV_DB,
+        "SELECT COUNT(*) FROM engine_decisions WHERE status='EMITTED'", default=0) or 0
+    TARGET_EMITTED, TARGET_DAYS = 30, 15
+    days_j = span.get("days_journaled") or 0
+    readiness = {
+        "emitted_total": emitted_total,
+        "target_emitted": TARGET_EMITTED,
+        "days_journaled": days_j,
+        "target_days": TARGET_DAYS,
+        "pct": round(min(100.0,
+                         50.0 * min(1.0, emitted_total / TARGET_EMITTED)
+                         + 50.0 * min(1.0, days_j / TARGET_DAYS)), 1),
+    }
+
+    return {
+        "span": span,
+        "status_counts": {
+            "emitted": status_map.get("EMITTED", 0),
+            "watch": status_map.get("WATCH", 0),
+            "rejected": status_map.get("REJECTED", 0),
+        },
+        "grades": grades,
+        "triggers": triggers,
+        "directions": directions,
+        "rejects": rejects,
+        "daily": daily,
+        "top_symbols": top_symbols,
+        "formula_versions": formula_vers,
+        "readiness": readiness,
+        "window_days": days,
         "server_time": datetime.now().isoformat(),
     }
 
