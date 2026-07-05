@@ -17,6 +17,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>fuzzy-tribble — settings</title>
 <style>
   :root {
@@ -79,10 +80,35 @@
     border: 1px solid var(--border); padding: 10px 14px; border-radius: 6px;
     font-size: 12px; display: none;
   }
+  .back-link {
+    display: inline-block; color: var(--accent); text-decoration: none;
+    font-size: 12px; margin-bottom: 14px;
+  }
+  .back-link:hover { text-decoration: underline; }
+  /* horizontal-scroll wrapper for wide tables on narrow screens */
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+  /* ── Mobile ────────────────────────────────────────────────── */
+  @media (max-width: 700px) {
+    body { padding: 14px 12px; font-size: 13px; }
+    .panel { padding: 12px; margin-bottom: 14px; }
+    .panel h2 { font-size: 11px; line-height: 1.5; }
+    /* container / startup rows: let name + controls wrap instead of overflow */
+    .container-row { flex-wrap: wrap; gap: 8px; }
+    .btns { display: flex; flex-wrap: wrap; gap: 6px; }
+    .btns button { margin-left: 0; }
+    /* bigger tap targets */
+    button { padding: 8px 12px; font-size: 12px; }
+    input[type=checkbox] { width: 20px; height: 20px; }
+    select { font-size: 13px; padding: 5px 6px; }
+    th, td { padding: 8px 6px; }
+    .toast { left: 12px; right: 12px; bottom: 12px; text-align: center; }
+  }
 </style>
 </head>
 <body>
 
+<a class="back-link" href="/">&#8592; Back to dashboard</a>
 <h1>SETTINGS</h1>
 <div class="sub">alert routing · container control · startup profile</div>
 
@@ -109,10 +135,12 @@
 
 <div class="panel">
   <h2>Alert Flag Matrix</h2>
-  <table id="alertTable">
-    <thead><tr id="alertHeadRow"><th>container</th></tr></thead>
-    <tbody id="alertBody"></tbody>
-  </table>
+  <div class="table-wrap">
+    <table id="alertTable">
+      <thead><tr id="alertHeadRow"><th>container</th></tr></thead>
+      <tbody id="alertBody"></tbody>
+    </table>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>

@@ -63,6 +63,7 @@
     border-right: 2px solid transparent;
     color: var(--muted); font-family: var(--sans); font-size: 13px; font-weight: 500;
     padding: 10px 20px; cursor: pointer; text-align: left; transition: all .15s;
+    text-decoration: none;
   }
   .nav-item .ic { font-size: 14px; width: 16px; text-align: center; }
   .nav-item:hover { color: var(--text); }
@@ -242,29 +243,55 @@
   ::-webkit-scrollbar-track { background: var(--surface); }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
-  /* ── Mobile bottom nav ─────────────────────────────────────── */
+  /* ── Mobile bottom nav + drawer ────────────────────────────── */
   .bottom-nav { display: none; }
+  .menu-btn {
+    display: none; background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 17px; line-height: 1;
+    cursor: pointer; width: 38px; height: 34px; align-items: center; justify-content: center;
+  }
+  .nav-backdrop { display: none; }
 
   @media (max-width: 900px) {
-    .sidebar { display: none; }
-    .content { padding-bottom: 70px; }
+    /* sidebar becomes an off-canvas drawer, toggled by the hamburger */
+    .sidebar {
+      display: block; position: fixed; top: 0; left: 0; height: 100vh; width: 240px;
+      z-index: 300; transform: translateX(-100%); transition: transform .22s ease;
+      box-shadow: 2px 0 24px rgba(0,0,0,.55);
+    }
+    .sidebar.open { transform: translateX(0); }
+    .nav-backdrop.show {
+      display: block; position: fixed; inset: 0; z-index: 250; background: rgba(0,0,0,.55);
+    }
+    .menu-btn { display: inline-flex; }
+
+    .content { padding-bottom: 74px; }
     .main { padding: 14px 12px 30px; }
     .kpi-strip { grid-template-columns: repeat(2, 1fr); }
     .topbar { padding: 12px 14px; }
     .topbar h1 { font-size: 16px; }
+    .range-btn { padding: 6px 8px; }
 
     .bottom-nav {
       display: flex; position: fixed; bottom: 0; left: 0; right: 0; z-index: 200;
       background: var(--surface); border-top: 1px solid var(--border);
-      padding: 6px 0 8px;
+      padding: 6px 0 max(8px, env(safe-area-inset-bottom));
     }
     .bnav-item {
       flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
       background: none; border: none; color: var(--muted); font-family: var(--sans);
-      font-size: 10px; padding: 4px 2px; cursor: pointer;
+      font-size: 10px; padding: 6px 2px; cursor: pointer; min-height: 46px;
     }
     .bnav-item .ic { font-size: 17px; }
     .bnav-item.active { color: var(--amber); }
+  }
+
+  @media (max-width: 460px) {
+    .snap-grid { grid-template-columns: 1fr; }
+    .range-group { flex-wrap: wrap; }
+    .day-modal { padding: 10px; }
+    .day-modal-box { max-height: 90vh; }
+    .iv-controls .stock-search { max-width: 100%; }
   }
 </style>
 </head>
@@ -272,8 +299,8 @@
 
 <div class="app-shell">
 
-  <!-- Sidebar (desktop) -->
-  <div class="sidebar">
+  <!-- Sidebar (desktop) / drawer (mobile) -->
+  <div class="sidebar" id="sidebar">
     <div class="sidebar-logo">
       <div class="name">ODT</div>
       <div class="sub">Option Discount Trader</div>
@@ -286,14 +313,19 @@
       <button class="nav-item" data-tab="market" onclick="showTab('market')"><span class="ic">&#9650;</span>Market</button>
       <button class="nav-item" data-tab="alerts" onclick="showTab('alerts')"><span class="ic">&#9873;</span>Alerts</button>
       <button class="nav-item" data-tab="universe" onclick="showTab('universe')"><span class="ic">&#9673;</span>Universe</button>
+      <a class="nav-item" href="/settings"><span class="ic">&#9881;</span>Settings</a>
     </div>
   </div>
+  <div class="nav-backdrop" id="nav-backdrop" onclick="toggleMenu()"></div>
 
   <div class="content">
 
     <!-- Topbar -->
     <div class="topbar">
-      <h1 id="topbar-title">Overview</h1>
+      <div style="display:flex;align-items:center;gap:12px">
+        <button class="menu-btn" onclick="toggleMenu()" aria-label="Open menu">&#9776;</button>
+        <h1 id="topbar-title">Overview</h1>
+      </div>
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <div class="range-group" id="range-group">
           <button class="range-btn" onclick="setRangeDays(1)">Today</button>
@@ -547,7 +579,7 @@
   <button class="bnav-item" data-tab="trades" onclick="showTab('trades')"><span class="ic">&#9642;</span>Trades</button>
   <button class="bnav-item" data-tab="alerts" onclick="showTab('alerts')"><span class="ic">&#9873;</span>Alerts</button>
   <button class="bnav-item" data-tab="market" onclick="showTab('market')"><span class="ic">&#9650;</span>Market</button>
-  <button class="bnav-item" data-tab="universe" onclick="showTab('universe')"><span class="ic">&#8942;</span>More</button>
+  <button class="bnav-item" onclick="toggleMenu()"><span class="ic">&#9776;</span>Menu</button>
 </div>
 
 <!-- Day-trades drilldown modal (opened by clicking a P&L bar) -->
@@ -612,11 +644,24 @@ function blank(label) {
 // ── Tab switching ──────────────────────────────────────────────────────────
 const TAB_TITLES = { overview:'Overview', iv:'IV Graph', analytics:'IV Analytics', trades:'Paper Trades', market:'Market', alerts:'Alerts', universe:'Universe' };
 
+function toggleMenu() {
+  const sb = $('sidebar'), bd = $('nav-backdrop');
+  const open = !sb.classList.contains('open');
+  sb.classList.toggle('open', open);
+  bd.classList.toggle('show', open);
+}
+
+function closeMenu() {
+  $('sidebar').classList.remove('open');
+  $('nav-backdrop').classList.remove('show');
+}
+
 function showTab(name) {
   TABS.forEach(t => { $(`tab-${t}`).style.display = t === name ? '' : 'none'; });
   document.querySelectorAll('.nav-item, .bnav-item').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.tab === name);
   });
+  closeMenu();
   $('topbar-title').textContent = TAB_TITLES[name] || name;
 
   if (name === 'overview') loadOverview();
