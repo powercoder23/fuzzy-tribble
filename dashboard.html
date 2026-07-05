@@ -98,6 +98,7 @@
 
   /* ── Section / card ────────────────────────────────────────── */
   .section { margin-bottom: 20px; }
+  .mono-hl { font-family: var(--mono); color: var(--amber); font-size: 11px; background: var(--surface2); padding: 1px 5px; border-radius: 4px; }
   .section-label {
     font-size: 10px; font-weight: 600; letter-spacing: .15em; text-transform: uppercase;
     color: var(--muted); margin-bottom: 10px; display: flex; align-items: center; gap: 8px;
@@ -243,7 +244,7 @@
   ::-webkit-scrollbar-track { background: var(--surface); }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
-  /* ── Mobile bottom nav + drawer ────────────────────────────── */
+  /* ── Mobile bottom nav ─────────────────────────────────────── */
   .bottom-nav { display: none; }
   .menu-btn {
     display: none; background: var(--surface2); border: 1px solid var(--border);
@@ -313,6 +314,7 @@
       <button class="nav-item" data-tab="market" onclick="showTab('market')"><span class="ic">&#9650;</span>Market</button>
       <button class="nav-item" data-tab="alerts" onclick="showTab('alerts')"><span class="ic">&#9873;</span>Alerts</button>
       <button class="nav-item" data-tab="universe" onclick="showTab('universe')"><span class="ic">&#9673;</span>Universe</button>
+      <button class="nav-item" data-tab="convex" onclick="showTab('convex')"><span class="ic">&#129504;</span>Convex Journal</button>
       <a class="nav-item" href="/settings"><span class="ic">&#9881;</span>Settings</a>
     </div>
   </div>
@@ -569,6 +571,81 @@
         </div>
       </div><!-- /tab-universe -->
 
+      <!-- ═══════════════════════════════════════════════ -->
+      <!-- TAB: CONVEX JOURNAL (V2)                        -->
+      <!-- ═══════════════════════════════════════════════ -->
+      <div id="tab-convex" style="display:none">
+
+        <!-- What & why -->
+        <div class="section">
+          <div class="section-label">Convex Engine — what this journal is doing</div>
+          <div class="card" style="font-size:12px; line-height:1.7; color:var(--muted)">
+            <b style="color:var(--text)">One engine, one score, everything explained.</b>
+            The Convex Engine runs every 5 min (09:25–15:05) beside V1 in <b>observe-only</b> mode:
+            it computes 7 factors, detects triggers, classifies regime, scores conviction — and
+            writes <i>every</i> outcome to <span class="mono-hl">engine_decisions</span>:
+            EMITTED (would trade), WATCH (context, no trigger), REJECTED (gate failed, reason journaled).
+            <b style="color:var(--text)">No orders are placed.</b>
+            The journal is the evidence base: it proves (or disproves) that the engine's picks beat
+            V1's before any real order flow is gated by it, and later re-tunes factor weights from
+            winner/loser attribution instead of opinion.
+          </div>
+        </div>
+
+        <!-- Phase roadmap -->
+        <div class="section">
+          <div class="section-label">Migration roadmap — where we are</div>
+          <div class="card" id="cvx-roadmap"><div class="loading">Loading…</div></div>
+        </div>
+
+        <!-- Readiness -->
+        <div class="section">
+          <div class="section-label">P0 → P1 readiness (evidence-gated, not calendar-gated)</div>
+          <div class="card" id="cvx-readiness"><div class="loading">Loading…</div></div>
+        </div>
+
+        <!-- Daily timeline -->
+        <div class="section">
+          <div class="section-label">Journal timeline — decisions per day <span id="cvx-span" style="color:var(--muted);text-transform:none;letter-spacing:normal"></span></div>
+          <div class="card">
+            <div class="chart-wrap" style="height:220px"><canvas id="cvx-daily-chart"></canvas></div>
+            <div class="table-scroll" id="cvx-daily-table" style="margin-top:12px"></div>
+          </div>
+        </div>
+
+        <!-- Attribution grids -->
+        <div class="grid-2">
+          <div class="section" style="margin-bottom:0">
+            <div class="section-label">Why trades were rejected</div>
+            <div class="card table-scroll" id="cvx-rejects"><div class="loading">Loading…</div></div>
+          </div>
+          <div class="section" style="margin-bottom:0">
+            <div class="section-label">Grade &amp; trigger mix (emitted)</div>
+            <div class="card" id="cvx-mix"><div class="loading">Loading…</div></div>
+          </div>
+        </div>
+
+        <div class="section"></div>
+
+        <div class="grid-2">
+          <div class="section" style="margin-bottom:0">
+            <div class="section-label">Symbol concentration guard</div>
+            <div class="card table-scroll" id="cvx-symbols"><div class="loading">Loading…</div></div>
+          </div>
+          <div class="section" style="margin-bottom:0">
+            <div class="section-label">Formula versions in journal</div>
+            <div class="card table-scroll" id="cvx-formulas"><div class="loading">Loading…</div></div>
+          </div>
+        </div>
+
+        <!-- Playbook -->
+        <div class="section" style="margin-top:20px">
+          <div class="section-label">Playbook — what we change if X happens</div>
+          <div class="card" id="cvx-playbook"></div>
+        </div>
+
+      </div><!-- /tab-convex -->
+
     </div><!-- /main -->
   </div><!-- /content -->
 </div><!-- /app-shell -->
@@ -595,7 +672,7 @@
 
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
-const TABS = ['overview','iv','analytics','trades','market','alerts','universe'];
+const TABS = ['overview','iv','analytics','trades','market','alerts','universe','convex'];
 let currentSymbol = null;
 let currentIvRange = 30;
 let currentView    = 'daily';
@@ -642,7 +719,7 @@ function blank(label) {
 }
 
 // ── Tab switching ──────────────────────────────────────────────────────────
-const TAB_TITLES = { overview:'Overview', iv:'IV Graph', analytics:'IV Analytics', trades:'Paper Trades', market:'Market', alerts:'Alerts', universe:'Universe' };
+const TAB_TITLES = { overview:'Overview', iv:'IV Graph', analytics:'IV Analytics', trades:'Paper Trades', market:'Market', alerts:'Alerts', universe:'Universe', convex:'Convex Journal' };
 
 function toggleMenu() {
   const sb = $('sidebar'), bd = $('nav-backdrop');
@@ -669,6 +746,7 @@ function showTab(name) {
   if (name === 'universe') loadUniverse();
   if (name === 'market')   loadMarketSnapshot('snapshot-card-2');
   if (name === 'alerts')   { loadOpportunities('opportunities-card-2'); loadActivity('activity-card-2'); }
+  if (name === 'convex')   loadConvexJournal();
   if (name === 'analytics') {
     if (currentSymbol && !$('an-symbol').value) $('an-symbol').value = currentSymbol;
     loadAnalytics();
@@ -1539,6 +1617,184 @@ function renderUniverse(syms) {
 function filterUniverse(val) {
   val = val.trim().toUpperCase();
   renderUniverse(val ? allUniverse.filter(s => s.symbol.includes(val)) : allUniverse);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// CONVEX JOURNAL TAB (V2)
+// ══════════════════════════════════════════════════════════════════════════
+let cvxDailyChart = null;
+
+const CVX_PHASES = [
+  { id:'P0', name:'Observe-only engine', status:'active',
+    what:'Engine runs beside V1 every 5 min. Emits WATCH / DECISION / REJECT rows + one Telegram digest. Zero orders.',
+    kills:'—' },
+  { id:'P1', name:'entry_gate re-point', status:'next',
+    what:'V1 order flow gated by engine_decisions (one-line shim). Cockpit v1 over engine tables.',
+    kills:'composite · trade_suggester · morning_confluence' },
+  { id:'P2', name:'Native triggers + factors', status:'partial',
+    what:'ORB / VWAP / break-retest / sonar-band in-engine over the candle cache. NOTE: triggers.py already ported early — journal is validating them now.',
+    kills:'momentum · break-bounce · sonar · iv-rank · oi-buildup · gap · delivery · smart-money services' },
+  { id:'P3', name:'Executor unification', status:'pending',
+    what:'paper_trader + order_manager + auto-exit → convex-executor consuming Decisions.',
+    kills:'discount service · per-strategy notifiers · all V1 gates' },
+  { id:'P4', name:'Consolidation', status:'pending',
+    what:'DB rename → market.db, compose shrinks to 4 services, absorbed modules deleted.',
+    kills:'everything not in the 4-service architecture' },
+];
+
+const CVX_PLAYBOOK = [
+  ['Rejects dominated by one gate (>50%)', 'That gate is doing all the work or is miscalibrated — inspect its threshold in engine/config.py before P1 (e.g. IVR>55, spread>5%, expected-move floor).'],
+  ['A+ grades rare (<10% of emitted)', 'Weights may be too harsh or confluence bonus too small — compare A+ vs B outcomes once paper attribution lands; only then touch weights and bump FORMULA_VER.'],
+  ['Same 5–8 symbols dominate emissions', 'Liquidity/sector factors are concentrating again (V1 failure mode). Add per-symbol cooldown or cap emissions per symbol per day.'],
+  ['One trigger kind produces most emissions', 'Other triggers may be too strict or candle data is thin — check candles_5m coverage before judging trigger logic.'],
+  ['Avg emitted score drifting down over days', 'Regime shifted or factor tables are stale — verify V1 collectors feeding *_history tables are healthy before touching the formula.'],
+  ['Engine picks consistently beat V1 paper trades', 'GREEN light for P1: re-point entry_gate at engine_decisions, keep AUTO_EXECUTE off, observe 1 more week.'],
+  ['Engine picks consistently worse than V1', 'Do NOT advance to P1. Use journal breakdown_json to find which factor mis-votes; fix factor adapter, bump FORMULA_VER, restart the evidence clock.'],
+  ['Formula version changes mid-journal', 'Never compare scores across versions — attribution must group by formula_ver (the table stores it per row for exactly this).'],
+];
+
+function cvxBadge(s) {
+  const map = { active:['ACTIVE','var(--green)'], next:['NEXT','var(--amber)'],
+                partial:['PARTIAL','var(--amber)'], pending:['PENDING','var(--muted)'] };
+  const [t,c] = map[s] || ['—','var(--muted)'];
+  return `<span style="font-size:10px;font-weight:700;color:${c};border:1px solid ${c};border-radius:4px;padding:1px 6px">${t}</span>`;
+}
+
+function cvxBar(val, target, color) {
+  const pct = Math.min(100, target ? (val/target*100) : 0);
+  return `<div style="background:var(--surface2);border-radius:5px;height:8px;overflow:hidden;margin-top:4px">
+    <div style="width:${pct.toFixed(0)}%;height:100%;background:${color}"></div></div>`;
+}
+
+async function loadConvexJournal() {
+  // Roadmap + playbook are static — render immediately
+  $('cvx-roadmap').innerHTML = CVX_PHASES.map(p => `
+    <div style="display:flex;gap:12px;padding:9px 0;border-bottom:1px solid var(--border);align-items:flex-start">
+      <div style="min-width:34px;font-family:var(--mono);font-weight:700;color:var(--amber)">${p.id}</div>
+      <div style="flex:1">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:2px">
+          <b style="font-size:12px">${p.name}</b> ${cvxBadge(p.status)}
+        </div>
+        <div style="font-size:11px;color:var(--muted);line-height:1.5">${p.what}</div>
+        <div style="font-size:10px;color:var(--muted);margin-top:2px">Kills after phase: <span style="color:var(--red)">${p.kills}</span></div>
+      </div>
+    </div>`).join('');
+
+  $('cvx-playbook').innerHTML = `<table class="data-table"><thead><tr><th>If this shows in the journal…</th><th>…then we do this</th></tr></thead><tbody>` +
+    CVX_PLAYBOOK.map(([x,y]) => `<tr><td style="white-space:normal;color:var(--amber)">${x}</td><td style="white-space:normal;color:var(--muted)">${y}</td></tr>`).join('') +
+    `</tbody></table>`;
+
+  let j;
+  try { j = await api('/api/convex/journal?days=30'); }
+  catch (e) {
+    ['cvx-readiness','cvx-rejects','cvx-mix','cvx-symbols','cvx-formulas','cvx-daily-table']
+      .forEach(id => $(id).innerHTML = `<div class="loading">Journal unavailable: ${e.message}</div>`);
+    return;
+  }
+
+  const rd = j.readiness, sp = j.span || {};
+  $('cvx-span').textContent = sp.first_day ? `· ${sp.first_day} → ${sp.last_day}` : '';
+
+  // Readiness card
+  $('cvx-readiness').innerHTML = `
+    <div class="grid-2" style="gap:16px">
+      <div>
+        <div style="font-size:11px;color:var(--muted)">Emitted decisions (all time)</div>
+        <div style="font-family:var(--mono);font-size:18px">${rd.emitted_total} <span style="font-size:11px;color:var(--muted)">/ ${rd.target_emitted} target</span></div>
+        ${cvxBar(rd.emitted_total, rd.target_emitted, 'var(--green)')}
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted)">Trading days journaled</div>
+        <div style="font-family:var(--mono);font-size:18px">${rd.days_journaled} <span style="font-size:11px;color:var(--muted)">/ ${rd.target_days} target</span></div>
+        ${cvxBar(rd.days_journaled, rd.target_days, 'var(--amber)')}
+      </div>
+    </div>
+    <div style="margin-top:12px;font-size:11px;color:var(--muted);line-height:1.6">
+      Overall readiness <b style="color:var(--text)">${rd.pct}%</b> ·
+      last 30d: <b style="color:var(--green)">${j.status_counts.emitted} emitted</b> ·
+      ${j.status_counts.watch} watch · <b style="color:var(--red)">${j.status_counts.rejected} rejected</b>.
+      P1 gate: enough graded Decisions across CE+PE to compare against V1 paper results — plus at least one week where engine picks ≥ V1 picks. Evidence advances the phase, not the calendar.
+    </div>`;
+
+  // Daily chart + table
+  const days = j.daily || [];
+  const ctx = $('cvx-daily-chart').getContext('2d');
+  if (cvxDailyChart) cvxDailyChart.destroy();
+  cvxDailyChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: days.map(d => d.day.slice(5)),
+      datasets: [
+        { label:'Emitted',  data:days.map(d=>d.emitted),  backgroundColor:'#10b981', stack:'s' },
+        { label:'Watch',    data:days.map(d=>d.watch),    backgroundColor:'#f59e0b', stack:'s' },
+        { label:'Rejected', data:days.map(d=>d.rejected), backgroundColor:'#ef4444', stack:'s' },
+        { label:'Avg emitted score', data:days.map(d=>d.avg_emitted_score), type:'line',
+          borderColor:'#93c5fd', backgroundColor:'transparent', yAxisID:'y1', tension:0.3, pointRadius:2 },
+      ]
+    },
+    options: {
+      responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{ labels:{ color:'#8b93a7', font:{size:10} } } },
+      scales:{
+        x:{ stacked:true, ticks:{ color:'#4a5568', font:{size:10} }, grid:{ display:false } },
+        y:{ stacked:true, ticks:{ color:'#4a5568', font:{size:10} }, grid:{ color:'rgba(255,255,255,0.04)' } },
+        y1:{ position:'right', min:0, max:100, ticks:{ color:'#93c5fd', font:{size:10} }, grid:{ display:false } },
+      }
+    }
+  });
+
+  $('cvx-daily-table').innerHTML = days.length ? `<table class="data-table">
+    <thead><tr><th>Day</th><th>Regime</th><th>Emit</th><th>Watch</th><th>Reject</th><th>Avg score</th><th>Best</th></tr></thead><tbody>` +
+    [...days].reverse().map(d => `<tr>
+      <td>${d.day}</td>
+      <td style="color:${d.regime==='GREEN'?'var(--green)':d.regime==='RED'?'var(--red)':'var(--amber)'}">${d.regime||'—'}</td>
+      <td style="color:var(--green)">${d.emitted}</td><td>${d.watch}</td>
+      <td style="color:var(--red)">${d.rejected}</td>
+      <td>${fmtNum(d.avg_emitted_score,1)}</td><td>${fmtNum(d.best_score,1)}</td>
+    </tr>`).join('') + `</tbody></table>`
+    : `<div class="loading">No journal rows yet — engine writes on the next market cycle.</div>`;
+
+  // Rejects
+  const totalRej = (j.rejects||[]).reduce((a,r)=>a+r.n,0) || 1;
+  $('cvx-rejects').innerHTML = (j.rejects||[]).length ? `<table class="data-table">
+    <thead><tr><th>Gate / reason</th><th>Count</th><th>Share</th></tr></thead><tbody>` +
+    j.rejects.map(r => `<tr><td style="white-space:normal">${r.reason}</td><td>${r.n}</td>
+      <td>${(r.n/totalRej*100).toFixed(0)}%</td></tr>`).join('') + `</tbody></table>`
+    : `<div class="loading">No rejects in window.</div>`;
+
+  // Grade + trigger + direction mix
+  const dirs = Object.fromEntries((j.directions||[]).map(d=>[d.direction,d.n]));
+  $('cvx-mix').innerHTML = `
+    <div style="font-size:11px;color:var(--muted);margin-bottom:6px">GRADES</div>
+    <table class="data-table"><tbody>` +
+    (j.grades||[]).map(g=>`<tr><td>${g.grade||'—'}</td><td>${g.n}</td><td>avg ${fmtNum(g.avg_score,1)}</td></tr>`).join('') +
+    `</tbody></table>
+    <div style="font-size:11px;color:var(--muted);margin:10px 0 6px">TRIGGERS</div>
+    <table class="data-table"><tbody>` +
+    (j.triggers||[]).map(t=>`<tr><td>${t.trigger_kind}</td><td>${t.n}</td><td>q ${fmtNum(t.avg_q,2)}</td><td>avg ${fmtNum(t.avg_score,1)}</td></tr>`).join('') +
+    `</tbody></table>
+    <div style="font-size:11px;color:var(--muted);margin-top:10px">
+      Direction: <b style="color:var(--green)">CE ${dirs.CE||0}</b> · <b style="color:var(--red)">PE ${dirs.PE||0}</b></div>`;
+
+  // Symbol concentration
+  const emitted30 = j.status_counts.emitted || 1;
+  $('cvx-symbols').innerHTML = (j.top_symbols||[]).length ? `<table class="data-table">
+    <thead><tr><th>Symbol</th><th>Emitted</th><th>Share</th></tr></thead><tbody>` +
+    j.top_symbols.map(s => {
+      const share = s.n/emitted30*100;
+      return `<tr><td>${s.symbol}</td><td>${s.n}</td>
+        <td style="color:${share>25?'var(--red)':'var(--text)'}">${share.toFixed(0)}%${share>25?' ⚠':''}</td></tr>`;
+    }).join('') + `</tbody></table>
+    <div style="font-size:10px;color:var(--muted);margin-top:6px">⚠ = one symbol &gt;25% of emissions — the V1 concentration failure mode. Playbook below.</div>`
+    : `<div class="loading">No emissions in window.</div>`;
+
+  // Formula versions
+  $('cvx-formulas').innerHTML = (j.formula_versions||[]).length ? `<table class="data-table">
+    <thead><tr><th>Version</th><th>Rows</th><th>Since</th></tr></thead><tbody>` +
+    j.formula_versions.map(f=>`<tr><td>${f.formula_ver||'—'}</td><td>${f.n}</td><td>${f.since_day||'—'}</td></tr>`).join('') +
+    `</tbody></table>
+    <div style="font-size:10px;color:var(--muted);margin-top:6px">Attribution must never mix versions — weights only change with a version bump.</div>`
+    : `<div class="loading">—</div>`;
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────
