@@ -135,6 +135,16 @@
 
 <div class="panel">
   <h2>Alert Flag Matrix</h2>
+  <div class="row-flex" style="margin-bottom:12px; flex-wrap:wrap;">
+    <span>Master override — apply one channel to <b>every</b> container &amp; alert type</span>
+    <select id="masterAlertSelect" onchange="applyMasterAlert(this.value)">
+      <option value="" selected>Set all…</option>
+      <option value="none">none</option>
+      <option value="telegram">telegram</option>
+      <option value="discord">discord</option>
+      <option value="both">both</option>
+    </select>
+  </div>
   <div class="table-wrap">
     <table id="alertTable">
       <thead><tr id="alertHeadRow"><th>container</th></tr></thead>
@@ -278,6 +288,28 @@ function renderAlertMatrix() {
     tr.innerHTML = cells;
     body.appendChild(tr);
   });
+}
+
+async function applyMasterAlert(channel) {
+  const sel = document.getElementById('masterAlertSelect');
+  if (!channel) return;
+  const label = channel === 'none' ? 'NONE (all alerts off)' : channel;
+  if (!confirm(`Override ALL alert flags to "${label}"?\nThis replaces the setting for every container and alert type.`)) {
+    sel.value = '';
+    return;
+  }
+  toast(`Setting all alerts to ${channel}…`);
+  try {
+    await api('/api/settings/alert-flag/bulk', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({channel})
+    });
+    toast(`All alerts set to ${channel}`);
+  } catch (e) {
+    toast(`Failed: ${String(e).slice(0,120)}`);
+  }
+  sel.value = '';
+  loadOverview();
 }
 
 async function updateFlag(container, alertType) {

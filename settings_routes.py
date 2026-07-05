@@ -19,6 +19,10 @@ class AlertFlagUpdate(BaseModel):
     channel: str
 
 
+class AlertFlagBulkUpdate(BaseModel):
+    channel: str
+
+
 class KillSwitchUpdate(BaseModel):
     on: bool
 
@@ -55,6 +59,17 @@ def update_alert_flag(payload: AlertFlagUpdate):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
+
+
+@router.post("/alert-flag/bulk")
+def update_alert_flag_bulk(payload: AlertFlagBulkUpdate):
+    """Master override: apply one channel to every container × alert-type.
+    'none' disables all alerts; any other channel enables all with that route."""
+    if payload.channel not in store.CHANNELS:
+        raise HTTPException(400, f"channel must be one of {store.CHANNELS}")
+    enabled = payload.channel != "none"
+    store.set_all_alert_flags(enabled, payload.channel)
+    return {"ok": True, "channel": payload.channel, "enabled": enabled}
 
 
 @router.post("/kill-switch")

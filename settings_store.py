@@ -119,6 +119,18 @@ def set_alert_flag(container_name: str, alert_type: str, enabled: bool, channel:
         """, (container_name, alert_type, int(enabled), channel))
 
 
+def set_all_alert_flags(enabled: bool, channel: str):
+    """Master override — set the routing for EVERY container × alert-type in a
+    single statement. Used by the 'Set all' dropdown in the Alert Flag Matrix."""
+    if channel not in CHANNELS:
+        raise ValueError(f"channel must be one of {CHANNELS}")
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE alert_flags SET enabled=?, channel=?",
+            (int(enabled), channel),
+        )
+
+
 def should_alert(container_name: str, alert_type: str) -> Optional[str]:
     """Call from notifications.notify_gated() before sending. Returns the
     channel to use ('telegram' | 'discord' | 'both'), or None to suppress.
