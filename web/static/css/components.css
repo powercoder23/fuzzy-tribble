@@ -1,0 +1,214 @@
+/* ============================================================================
+   components.css — reusable UI: cards, stat cards, tabs, tables, tags,
+   buttons, star rating, toast, quick actions, metric/sparkline cards.
+   Mobile-first; wide tables restack to cards on phones.
+   ========================================================================== */
+
+/* ── Card ────────────────────────────────────────────────────────────────── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: var(--s5);
+}
+.card + .card { margin-top: var(--s5); }
+.card-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: var(--s3); margin-bottom: var(--s4);
+}
+.card-title { font-size: 15px; font-weight: 600; }
+.card-sub { font-size: 12px; color: var(--dim); }
+
+/* ── Stat card row ───────────────────────────────────────────────────────── */
+.stat-row {
+  display: grid; gap: var(--s3); margin-bottom: var(--s5);
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+.stat-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); padding: var(--s4);
+}
+.stat-card .sc-head { display: flex; align-items: center; gap: var(--s2); color: var(--muted); font-size: 12px; margin-bottom: var(--s2); }
+.stat-card .sc-ic { font-size: 15px; }
+.stat-card .sc-val { font-size: 20px; font-weight: 700; font-family: var(--mono); }
+.stat-card .sc-sub { font-size: 11px; color: var(--dim); margin-top: 2px; }
+.sc-val.pos { color: var(--green); } .sc-val.neg { color: var(--red); }
+.sc-val.warn { color: var(--amber); }
+
+/* ── Tabs ────────────────────────────────────────────────────────────────── */
+.tabs {
+  display: flex; gap: var(--s1); border-bottom: 1px solid var(--border);
+  margin-bottom: var(--s5); overflow-x: auto; -webkit-overflow-scrolling: touch;
+}
+.tab {
+  padding: 10px var(--s4); font-size: 13px; color: var(--muted);
+  cursor: pointer; white-space: nowrap; border-bottom: 2px solid transparent;
+  display: flex; align-items: center; gap: var(--s2);
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+/* ── Grid layout: main + right rail ──────────────────────────────────────── */
+.grid-main { display: grid; grid-template-columns: 1fr 340px; gap: var(--s5); align-items: start; }
+.rail { display: flex; flex-direction: column; gap: var(--s5); }
+@media (max-width: 1100px) { .grid-main { grid-template-columns: 1fr; } }
+
+/* ── Table ───────────────────────────────────────────────────────────────── */
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.data th {
+  text-align: left; font-weight: 600; color: var(--dim); font-size: 11px;
+  text-transform: uppercase; letter-spacing: .05em; padding: 10px var(--s3);
+  border-bottom: 1px solid var(--border); white-space: nowrap;
+}
+table.data td { padding: 11px var(--s3); border-bottom: 1px solid var(--border-soft); vertical-align: middle; }
+table.data tr:last-child td { border-bottom: none; }
+table.data tr:hover td { background: rgba(255,255,255,.015); }
+td.name, .cell-strong { color: var(--text); font-weight: 500; }
+
+/* ── Tags / badges ───────────────────────────────────────────────────────── */
+.tag {
+  display: inline-block; padding: 2px 8px; border-radius: var(--r-sm);
+  font-size: 10px; font-weight: 700; letter-spacing: .04em; white-space: nowrap;
+}
+.tag.ce, .tag.call    { background: var(--indigo-fill); color: #a5b4fc; }
+.tag.pe, .tag.put     { background: var(--red-fill);    color: #fca5a5; }
+.tag.win, .tag.running{ background: var(--green-fill);  color: #6ee7b7; }
+.tag.loss, .tag.stopped{ background: var(--red-fill);   color: #fca5a5; }
+.tag.open, .tag.paused{ background: var(--amber-fill);  color: #fcd34d; }
+.tag.unknown          { background: var(--surface-2);   color: var(--muted); }
+
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+.status-dot.running { background: var(--green); }
+.status-dot.stopped { background: var(--red); }
+.status-dot.unknown { background: var(--amber); }
+
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--surface-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: 6px 12px; font-family: var(--sans); font-size: 12px; font-weight: 500;
+  cursor: pointer; white-space: nowrap;
+}
+.btn:hover { background: var(--surface-3); }
+.btn.primary { border-color: var(--accent); color: #c7c9ff; background: var(--indigo-fill); }
+.btn.danger  { color: #fca5a5; }
+.btn.danger:hover { background: var(--red-fill); border-color: var(--red); }
+.btn.sm { padding: 4px 9px; font-size: 11px; }
+.btn-group { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+
+.pill-btn {
+  border: 1px solid var(--border); background: var(--surface); border-radius: var(--r-sm);
+  color: var(--text); cursor: pointer; display: grid; place-items: center; width: 30px; height: 28px;
+}
+.pill-btn:hover { background: var(--surface-3); }
+
+/* ── Star rating (scanner priority) ──────────────────────────────────────── */
+.stars { color: var(--amber); letter-spacing: 1px; font-size: 13px; }
+.stars .off { color: var(--border); }
+
+/* ── Add / header action ─────────────────────────────────────────────────── */
+.btn.add { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.add:hover { filter: brightness(1.08); }
+
+/* ── Right-rail: startup profiles ────────────────────────────────────────── */
+.profile {
+  display: flex; align-items: center; gap: var(--s3);
+  padding: var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm);
+  cursor: pointer; margin-bottom: var(--s2);
+}
+.profile:hover { background: var(--surface-2); }
+.profile.active { border-color: var(--accent); background: var(--indigo-fill); }
+.profile .p-ic { font-size: 16px; width: 20px; text-align: center; color: var(--amber); }
+.profile .p-body { flex: 1; min-width: 0; }
+.profile .p-name { font-size: 13px; font-weight: 600; }
+.profile .p-desc { font-size: 11px; color: var(--dim); }
+.profile .p-count { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.profile .p-go { color: var(--muted); }
+.profile.active .p-go { color: var(--accent); }
+
+/* ── Quick actions grid ──────────────────────────────────────────────────── */
+.qa-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s3); }
+.qa {
+  display: flex; align-items: center; gap: var(--s3);
+  padding: var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface-2); cursor: pointer; text-align: left;
+}
+.qa:hover { background: var(--surface-3); }
+.qa .qa-ic { font-size: 16px; }
+.qa .qa-t { font-size: 12px; font-weight: 600; color: var(--text); }
+.qa .qa-s { font-size: 10px; color: var(--dim); }
+.qa.danger .qa-t, .qa.danger .qa-ic { color: #fca5a5; }
+.qa.danger:hover { border-color: var(--red); }
+
+/* ── Metric cards with sparkline ─────────────────────────────────────────── */
+.metric-row {
+  display: grid; gap: var(--s3); margin-top: var(--s5);
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+.metric {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); padding: var(--s4); position: relative; overflow: hidden;
+}
+.metric .m-lbl { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+.metric .m-val { font-size: 22px; font-weight: 700; font-family: var(--mono); margin-top: 6px; }
+.metric .m-sub { font-size: 11px; color: var(--dim); }
+.metric canvas { margin-top: var(--s2); width: 100% !important; height: 34px !important; }
+.metric .m-bar { height: 3px; border-radius: 2px; background: var(--border); margin-top: var(--s2); overflow: hidden; }
+.metric .m-bar > i { display: block; height: 100%; background: var(--green); border-radius: 2px; }
+
+/* Placeholder (not-yet-real) tiles render muted so no fake data reads as live */
+.placeholder .sc-val, .placeholder .m-val { color: var(--dim); }
+.placeholder .m-badge, .sc-ph {
+  font-size: 9px; color: var(--dim); border: 1px solid var(--border);
+  border-radius: var(--r-pill); padding: 1px 6px; letter-spacing: .04em;
+}
+
+/* ── Toggle switch ───────────────────────────────────────────────────────── */
+.switch { position: relative; width: 38px; height: 22px; display: inline-block; flex: none; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch .track { position: absolute; inset: 0; background: var(--surface-3); border: 1px solid var(--border); border-radius: var(--r-pill); transition: .18s; cursor: pointer; }
+.switch .track::before { content: ""; position: absolute; width: 16px; height: 16px; left: 2px; top: 2px; background: var(--muted); border-radius: 50%; transition: .18s; }
+.switch input:checked + .track { background: var(--green-fill); border-color: var(--green); }
+.switch input:checked + .track::before { transform: translateX(16px); background: var(--green); }
+
+select.inp {
+  background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--r-sm); font-family: var(--sans); font-size: 12px; padding: 5px 8px;
+}
+
+/* ── Toast ───────────────────────────────────────────────────────────────── */
+.toast {
+  position: fixed; bottom: var(--s5); right: var(--s5); z-index: 60;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r-sm); padding: 11px 16px; font-size: 13px;
+  box-shadow: var(--shadow-lg); opacity: 0; transform: translateY(8px);
+  transition: .2s; pointer-events: none; max-width: 360px;
+}
+.toast.show { opacity: 1; transform: translateY(0); }
+.toast.ok { border-left: 3px solid var(--green); }
+.toast.err { border-left: 3px solid var(--red); }
+
+.loading, .empty { color: var(--dim); font-size: 13px; padding: var(--s5); text-align: center; }
+
+/* ── Phone: restack wide tables as key/value cards ───────────────────────── */
+@media (max-width: 600px) {
+  .stat-card .sc-val { font-size: 18px; }
+  .qa-grid { grid-template-columns: 1fr; }
+
+  table.data.stack thead { display: none; }
+  table.data.stack tr {
+    display: block; background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: var(--r-sm); padding: var(--s3); margin-bottom: var(--s3);
+  }
+  table.data.stack td {
+    display: flex; justify-content: space-between; gap: var(--s4);
+    padding: 5px 0; border: none; text-align: right;
+  }
+  table.data.stack td::before {
+    content: attr(data-label); color: var(--dim); font-size: 11px;
+    text-transform: uppercase; letter-spacing: .04em; text-align: left; font-weight: 600;
+  }
+  table.data.stack tr:hover td { background: none; }
+}

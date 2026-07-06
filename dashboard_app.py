@@ -48,6 +48,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 import iv_analytics
 import settings_store
@@ -61,6 +62,11 @@ PT_DB    = DATA_DIR / "paper_trades.db"
 
 app = FastAPI(title="Fuzzy Tribble Dashboard", version="1.0")
 app.include_router(settings_router)
+
+# Shared frontend assets (new design system: css/ + js/ under web/static).
+WEB_DIR = Path(__file__).parent / "web"
+if (WEB_DIR / "static").exists():
+    app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
 
 
 @app.on_event("startup")
@@ -851,8 +857,122 @@ def index():
 
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page():
-    html_path = Path(__file__).parent / "settings.html"
-    if html_path.exists():
-        return html_path.read_text()
+    # New redesigned page (Fuzzy Tribble design system). Falls back to the
+    # legacy flat page if the new one isn't present.
+    for p in (WEB_DIR / "pages" / "settings.html", Path(__file__).parent / "settings.html"):
+        if p.exists():
+            return p.read_text()
     return HTMLResponse("<h1>Settings HTML not found</h1>", status_code=500)
+
+
+@app.get("/settings-legacy", response_class=HTMLResponse)
+def settings_page_legacy():
+    p = Path(__file__).parent / "settings.html"
+    return p.read_text() if p.exists() else HTMLResponse("<h1>not found</h1>", status_code=500)
+
+
+# ── Settings page data: system metrics + scanner list (real where cheap) ──── #
+_SCANNER_META = {
+    "discount":       ("Discount Scanner", "Primary Entry Scanner", 5),
+    "break-bounce":   ("Break Bounce", "Price Action Scanner", 4),
+    "oi-buildup":     ("OI BuildUp", "Open Interest Scanner", 5),
+    "smart-money":    ("Smart Money", "Smart Money Flow", 4),
+    "gap-scan":       ("Gap Scan", "Gap Up/Down Scanner", 3),
+    "delivery-surge": ("Delivery Surge", "Delivery Volume Scanner", 3),
+    "sonar":          ("Sonar", "Sonar Laplace Scanner", 3),
+    "composite":      ("Composite", "Composite Conviction", 5),
+    "iv-rank":        ("IV Rank", "IV Rank Scanner", 4),
+    "momentum":       ("Momentum", "ORB / VWAP (discontinued)", 2),
+    "directional-iv": ("Directional IV", "Directional IV (discontinued)", 2),
+}
+_INFRA_SERVICES = {"iv-collector", "dashboard"}
+
+
+@app.get("/api/scanners")
+def scanners():
+    """Per-scanner rows for the Settings page. status is REAL (docker);
+    priority/signals_today/last_signal are static placeholders for now."""
+    try:
+        services = docker_control.list_services()
+    except Exception:
+        services = []
+    try:
+        status = docker_control.get_running_status()
+    except Exception:
+        status = {}
+
+    names = [s for s in services if s not in _INFRA_SERVICES]
+    if not names:  # dev / compose not mounted — show the known scanner set
+        names = list(_SCANNER_META.keys())
+
+    out = []
+    for s in names:
+        key = s.replace("_", "-")
+        label, sub, prio = _SCANNER_META.get(key, (s.replace("-", " ").replace("_", " ").title(), "Scanner", 3))
+        out.append({
+            "name": s,
+            "label": label,
+            "sub": sub,
+            "priority": prio,
+            "status": status.get(s, "unknown"),
+            "signals_today": None,   # placeholder — no per-scanner counter yet
+            "last_signal": None,     # placeholder
+        })
+    return {"scanners": out, "count": len(out)}
+
+
+@app.get("/api/system/metrics")
+def system_metrics():
+    """One call for the Settings stat-cards + bottom-metric row.
+    REAL: container counts, DB health, signals today. PLACEHOLDER (null):
+    alerts today, Telegram, last backup. CPU/Mem/Disk/Net are real IF psutil
+    is installed, else null."""
+    # Containers (real)
+    try:
+        services = docker_control.list_services()
+        status = docker_control.get_running_status()
+        total = len(services)
+        running = sum(1 for s in services if "running" in str(status.get(s, "")).lower())
+    except Exception:
+        total = running = 0
+
+    # DB health (real, cheap)
+    t0 = datetime.now()
+    iv_ok = IV_DB.exists() and _scalar(IV_DB, "SELECT 1", default=None) == 1
+    pt_ok = PT_DB.exists()
+    resp_ms = int((datetime.now() - t0).total_seconds() * 1000)
+
+    # Signals today (real)
+    signals_today = _scalar(
+        PT_DB, "SELECT COUNT(*) FROM paper_trades WHERE date=date('now','localtime')",
+        default=0) or 0
+
+    # Host metrics — real only if psutil is available, else placeholders
+    cpu = mem = disk = None
+    net = None
+    try:
+        import psutil
+        cpu = round(psutil.cpu_percent(interval=0.1))
+        vm = psutil.virtual_memory()
+        mem = {"pct": round(vm.percent), "detail": f"{vm.used >> 30} / {vm.total >> 30} GB"}
+        du = psutil.disk_usage("/")
+        disk = {"pct": round(du.percent), "detail": f"{du.used >> 30} / {du.total >> 30} GB"}
+    except Exception:
+        pass
+
+    return {
+        "containers": {"running": running, "total": total},
+        "database": {"ok": bool(iv_ok or pt_ok), "resp_ms": resp_ms},
+        "signals_today": int(signals_today),
+        "alerts_today": None,            # placeholder — no alert counter yet
+        "telegram": None,                # placeholder
+        "last_backup": None,             # placeholder
+        "cpu_pct": cpu,
+        "mem_pct": (mem or {}).get("pct"),
+        "mem": mem,
+        "disk_pct": (disk or {}).get("pct"),
+        "disk": disk,
+        "net": net,
+        "server_time": datetime.now().isoformat(),
+    }
 

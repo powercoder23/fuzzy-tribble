@@ -186,6 +186,13 @@
   .tag.na { background: var(--surface2); color: var(--muted); }
 
   .pnl-pos { color: var(--green); } .pnl-neg { color: var(--red); }
+  .pnl-live { color: var(--amber); font-size: 9px; vertical-align: middle; animation: pnlPulse 1.6s ease-in-out infinite; }
+  @keyframes pnlPulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .trades-total-bar { display: flex; align-items: baseline; justify-content: space-between;
+    padding: 10px 14px; margin-bottom: 10px; border-radius: 8px;
+    background: var(--surface2); border: 1px solid var(--border); }
+  .trades-total-bar .ttb-label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  .trades-total-bar .ttb-value { font-size: 20px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
 
   /* ── Day-trades drilldown modal ────────────────────────────── */
   .day-modal { position: fixed; inset: 0; z-index: 1000; background: rgba(0,0,0,.6);
@@ -708,6 +715,48 @@ function fmtNum(v, nd=2) {
   return (v === null || v === undefined) ? '—' : Number(v).toFixed(nd);
 }
 
+// ── Trade formatting helpers ────────────────────────────────────────────────
+const _MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+function fmtExpiry(e) {
+  if (!e) return '';
+  const m = String(e).match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[3]} ${_MONTHS[+m[2]-1]}`;
+  const d = new Date(e);
+  if (!isNaN(d)) return `${String(d.getDate()).padStart(2,'0')} ${_MONTHS[d.getMonth()]}`;
+  return String(e);
+}
+function ceOrPe(side) {
+  const s = (side || '').toUpperCase();
+  if (s.startsWith('C')) return 'CE';
+  if (s.startsWith('P')) return 'PE';
+  return s;
+}
+function fmtStrike(v) {
+  if (v === null || v === undefined || v === '') return '';
+  const n = Number(v);
+  return Number.isInteger(n) ? String(n) : String(n);
+}
+function contractName(t) {
+  return `${fmtExpiry(t.expiry)} ${t.symbol} ${ceOrPe(t.side)} ${fmtStrike(t.strike)}`
+    .replace(/\s+/g, ' ').trim();
+}
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const m = String(ts).match(/(\d{2}):(\d{2})/);
+  return m ? `${m[1]}:${m[2]}` : String(ts);
+}
+// Live (unrealized) P&L for open trades; realized for closed. Mirrors the
+// paper_trader net = (last - entry) * lot formula (without the fee model).
+function tradePnl(t) {
+  if (t.status === 'open') {
+    const lot = t.lot_size || 1;
+    const rupees = ((t.last_price || 0) - (t.entry || 0)) * lot;
+    const pct = t.entry ? ((t.last_price || 0) - t.entry) / t.entry * 100 : 0;
+    return { rupees, pct, live: true };
+  }
+  return { rupees: t.realized_rupees, pct: t.realized_pct, live: false };
+}
+
 function timeOf(ts) {
   if (!ts) return '—';
   const t = String(ts);
@@ -985,25 +1034,38 @@ async function loadOvTrades() {
   }
 }
 
-function tradesTable(trades) {
+function tradesTable(trades, showTotal = true) {
   if (!trades || !trades.length) return '<div class="empty-state">No trades in this view</div>';
+  let totalPnl = 0, havePnl = false;
   const rows = trades.map(t => {
-    const side = (t.side || '').toUpperCase();
-    const pnl = t.realized_rupees, pct = t.realized_pct;
-    const status = t.status === 'open' ? 'open' : (pnl >= 0 ? 'win' : 'loss');
-    const pnlCell = pnl !== null && pnl !== undefined
-      ? `<span class="${pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtPnl(pnl)} (${pct > 0 ? '+' : ''}${(pct||0).toFixed(1)}%)</span>` : '—';
+    const { rupees, pct, live } = tradePnl(t);
+    if (rupees !== null && rupees !== undefined) { totalPnl += rupees; havePnl = true; }
+    const status = t.status === 'open' ? 'open' : ((t.realized_rupees || 0) >= 0 ? 'win' : 'loss');
+    const pe = ceOrPe(t.side);
+    const pnlCell = (rupees !== null && rupees !== undefined)
+      ? `<span class="${rupees >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtPnl(rupees)} (${pct > 0 ? '+' : ''}${(pct||0).toFixed(1)}%)${live ? '<span class="pnl-live" title="Live / unrealized"> ●</span>' : ''}</span>`
+      : '—';
+    const exitPx = (t.status !== 'open' && t.last_price != null) ? `₹${t.last_price.toFixed(2)}` : '—';
     return `<tr>
-      <td style="color:var(--text);font-weight:500">${t.symbol}</td>
+      <td style="color:var(--text);font-weight:500;white-space:nowrap">${contractName(t)}</td>
       <td>${t.strategy || '—'}</td>
-      <td><span class="tag ${side.toLowerCase()}">${side}</span></td>
+      <td><span class="tag ${pe.toLowerCase()}">${pe}</span></td>
       <td>₹${(t.entry||0).toFixed(2)}</td>
       <td>₹${(t.last_price||0).toFixed(2)}</td>
+      <td>${exitPx}</td>
+      <td>${fmtTime(t.opened_at)}</td>
+      <td>${fmtTime(t.closed_at)}</td>
       <td>${pnlCell}</td>
       <td><span class="tag ${status}">${status.toUpperCase()}</span></td>
     </tr>`;
   }).join('');
-  return `<table class="data-table"><thead><tr><th>Symbol</th><th>Strategy</th><th>Side</th><th>Entry</th><th>LTP</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>`;
+  const table = `<table class="data-table"><thead><tr><th>Contract</th><th>Strategy</th><th>Side</th><th>Entry</th><th>LTP</th><th>Exit</th><th>In</th><th>Out</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>`;
+  if (!showTotal) return table;
+  const totalBar = `<div class="trades-total-bar">
+    <span class="ttb-label">Current Total P&amp;L</span>
+    <span class="ttb-value ${totalPnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${havePnl ? fmtPnl(totalPnl) : '—'}</span>
+  </div>`;
+  return totalBar + table;
 }
 
 async function loadOvPnlChart() {
@@ -1081,7 +1143,7 @@ async function showDayTrades(date) {
       <span>Wins: <b>${wins}</b></span>
       <span>Net P&amp;L: <b class="${net>=0?'pnl-pos':'pnl-neg'}">${fmtPnl(net)}</b></span>
     </div>`;
-    $('day-modal-body').innerHTML = summary + tradesTable(trades);
+    $('day-modal-body').innerHTML = summary + tradesTable(trades, false);
   } catch(e) {
     $('day-modal-body').innerHTML = `<div class="error-msg">Could not load trades: ${e.message}</div>`;
   }
