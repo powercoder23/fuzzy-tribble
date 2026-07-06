@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir fastapi uvicorn[standard]==0.24.0 pyyaml
+RUN pip install --no-cache-dir fastapi uvicorn[standard]==0.24.0 pyyaml psutil
 
 COPY dashboard_app.py .
 COPY dashboard.html .
@@ -31,5 +31,8 @@ COPY settings_store.py .
 COPY settings_routes.py .
 COPY docker_control.py .
 COPY settings.html .
+# New frontend design system (shared css/js + per-page HTML). Served at /static
+# and /settings by dashboard_app. Without this the redesigned pages 404.
+COPY web/ ./web/
 
 CMD ["uvicorn", "dashboard_app:app", "--host", "0.0.0.0", "--port", "8050", "--workers", "1"]
