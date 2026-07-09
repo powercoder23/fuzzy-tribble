@@ -26,6 +26,7 @@ import numpy as np
 import pytz
 
 import notifications
+import strike_selector
 from discount import DiscountedPremiumScanner, unwrap_dhan_payload, get_trading_days_to_expiry
 from config import Config
 from collectors import iv_store
@@ -1086,6 +1087,39 @@ class BreakBounceStrategyRunner:
                     time.sleep(0.2)
                     continue
 
+                # ── Optional: trade discount's best-value strike, not ATM ──────
+                # Feature-flagged (STRATEGY_STRIKE_VIA_DISCOUNT, default OFF).
+                # When ON, the B&B pattern only CONFIRMS the direction; the
+                # discount scanner then picks the cheapest / best-value option on
+                # this underlying in that direction and we trade THAT strike.
+                # B&B keeps its own SL/target/lot model on the new premium below.
+                if strike_selector.use_discount_strike():
+                    pick = strike_selector.best_value_strike(
+                        self._scanner_obj, symbol, sec_id, side, expiry, segment=seg)
+                    if pick and pick.get("entry"):
+                        new_strike = pick["strike"]
+                        try:
+                            opt_sid = self.lot_sizer.get_option_security_id(
+                                symbol, expiry, new_strike, side) or ""
+                        except Exception:
+                            logger.exception("B&B: option_security_id lookup failed "
+                                             "for discount strike %s %s", symbol, new_strike)
+                            opt_sid = strike_data.get("option_security_id", "")
+                        strike_data = {
+                            **strike_data,
+                            "strike": new_strike,
+                            "ltp": pick["entry"],
+                            "iv": pick.get("iv", strike_data.get("iv")),
+                            "option_security_id": opt_sid,
+                            "strike_source": "discount",
+                        }
+                        logger.info("B&B strike via discount: %s %s K%s @ %.2f (score %s)",
+                                    symbol, side, new_strike, float(pick["entry"]),
+                                    pick.get("score"))
+                    else:
+                        logger.info("B&B: discount strike empty for %s %s — keeping ATM",
+                                    symbol, side)
+
                 lot_size = self.lot_sizer.get(symbol)
                 premium  = strike_data.get("ltp", 0)
                 if premium <= 0:
@@ -1160,7 +1194,9 @@ class BreakBounceStrategyRunner:
                         "t1_book_fraction":  1.0,
                         "lot_size":          lot_size,
                         "iv":                strike_data.get("iv"),
-                        "strategy":          "Break & Bounce",
+                        "strategy":          ("Break & Bounce (discount strike)"
+                                              if strike_data.get("strike_source") == "discount"
+                                              else "Break & Bounce"),
                     }
                     _om = getattr(self, "_order_manager", None)
                     if _om is None:

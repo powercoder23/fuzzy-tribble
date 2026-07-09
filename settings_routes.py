@@ -27,6 +27,11 @@ class KillSwitchUpdate(BaseModel):
     on: bool
 
 
+class FeatureFlagUpdate(BaseModel):
+    key: str
+    value: str
+
+
 class ContainerActionRequest(BaseModel):
     services: list[str]
     action: str
@@ -76,6 +81,21 @@ def update_alert_flag_bulk(payload: AlertFlagBulkUpdate):
 def update_kill_switch(payload: KillSwitchUpdate):
     store.set_kill_switch(payload.on)
     return {"ok": True, "kill_switch": payload.on}
+
+
+@router.get("/flags")
+def get_flags():
+    """Feature flags with their effective value + source (db/env/default)."""
+    return {"flags": store.list_feature_flags()}
+
+
+@router.post("/flag")
+def update_flag(payload: FeatureFlagUpdate):
+    try:
+        store.set_flag(payload.key, payload.value)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "flags": store.list_feature_flags()}
 
 
 @router.post("/startup-profile")

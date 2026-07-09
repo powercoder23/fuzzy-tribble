@@ -272,6 +272,17 @@ class PaperTradeBook:
             ).fetchone()
         return int(row["n"]) if row else 0
 
+    def count_symbol_today(self, date, symbol):
+        """How many paper trades already booked for this underlying today
+        (across all strikes/sides/strategies). Used for the per-symbol/day cap
+        so one symbol can't eat every slot via different strikes."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_trades WHERE date=? AND symbol=?",
+                (date, symbol),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
     def open_trade(self, signal, now=None):
         """Insert a new paper trade from a signal dict. Returns the row id."""
         now = now or datetime.now()
@@ -501,6 +512,50 @@ def _hhmm(now):
     return now.strftime("%H:%M")
 
 
+def _risk_rupees(signal) -> float:
+    """1-lot rupee risk of a signal: (entry - sl) * lot_size. Accepts either
+    the paper-signal shape ('sl') or a raw scan row ('stop_loss')."""
+    try:
+        entry = float(signal.get("entry") or 0)
+        sl = float(signal.get("sl") if signal.get("sl") is not None
+                   else signal.get("stop_loss") or 0)
+        lot = int(signal.get("lot_size") or 1)
+        return max(entry - sl, 0.0) * lot
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _flag_override(key):
+    """Raw settings-DB override for a UI flag, or None (fail-open)."""
+    try:
+        import settings_store
+        return settings_store.get_flag_raw(key)
+    except Exception:
+        return None
+
+
+def _max_risk_rupees() -> float:
+    """Per-trade rupee-risk budget (0/None disables the cap). Settings-DB
+    override (MAX_RISK_RUPEES) wins over the discount_config default."""
+    try:
+        ov = _flag_override("MAX_RISK_RUPEES")
+        v = ov if ov is not None else INTRADAY.get("max_risk_rupees")
+        return float(v) if v else 0.0
+    except Exception:
+        return 0.0
+
+
+def _max_per_symbol_per_day() -> int:
+    """Max paper trades per underlying per day (0 disables the cap). Settings-DB
+    override (MAX_PER_SYMBOL_PER_DAY) wins over the discount_config default."""
+    try:
+        ov = _flag_override("MAX_PER_SYMBOL_PER_DAY")
+        v = ov if ov is not None else INTRADAY.get("max_per_symbol_per_day")
+        return int(float(v)) if v is not None else 0
+    except Exception:
+        return 0
+
+
 def _half_spread_from_row(row) -> float:
     """Half the bid/ask spread from the scan row; the honest entry/exit
     slippage estimate. Falls back to a conservative % of entry when quotes
@@ -620,7 +675,10 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
     else:
         rows = list(opportunities or [])
 
-    rows = [r for r in rows if r.get("strategy") == VOLATILITY_STRATEGY]
+    # Book EVERY strategy the scanner emits, not only "Volatility Expansion
+    # Play". Rows with no explicit tag default to VOLATILITY_STRATEGY at
+    # signal_from_row(), so every opportunity can paper-trade.
+    rows = [r for r in rows if r]
     rows.sort(key=lambda r: (r.get("score") or 0), reverse=True)
 
     # Sonar-Laplace direction gate (VETO, never a flip):
@@ -666,6 +724,13 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
 
         if book.has_trade_today(date, symbol, strike, side):
             continue
+        # Per-symbol/day cap — one underlying can't eat every slot via different
+        # strikes (e.g. 7 ABCAPITAL strikes in a single day).
+        sym_cap = _max_per_symbol_per_day()
+        if sym_cap and book.count_symbol_today(date, symbol) >= sym_cap:
+            logger.info("Per-symbol cap — %s already has %d trade(s) today (max %d)",
+                        symbol, book.count_symbol_today(date, symbol), sym_cap)
+            continue
         if not row.get("entry") or not row.get("t1"):
             continue
         # Min premium gate — skip cheap/illiquid far-OTM options
@@ -675,6 +740,18 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
                         symbol, side, float(row.get("entry") or 0), min_prem)
             continue
         sig = signal_from_row(row, lot_size_fn)
+        # Rupee-risk cap — a big-lot cheap option must not risk many multiples of
+        # a small-lot one. (entry-sl)*lot_size is the 1-lot risk.
+        max_risk = _max_risk_rupees()
+        if max_risk:
+            risk = _risk_rupees(sig)
+            if risk > max_risk:
+                logger.info("Risk cap — skipping %s %s: 1-lot risk ₹%.0f > ₹%.0f "
+                            "(entry ₹%.2f, sl ₹%.2f, lot %s)",
+                            symbol, side, risk, max_risk,
+                            float(sig.get("entry") or 0), float(sig.get("sl") or 0),
+                            sig.get("lot_size"))
+                continue
         book.open_trade(sig, now)
         send_telegram(format_signal_alert(sig), bot_token, chat_id)
         opened.append(sig)
@@ -713,11 +790,21 @@ def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
         logger.info("book_signal: %s %s %s already booked today", symbol, strike, side)
         return None
 
+    sym_cap = _max_per_symbol_per_day()
+    if sym_cap and book.count_symbol_today(date, symbol) >= sym_cap:
+        logger.info("book_signal: per-symbol cap — %s already has %d trade(s) today (max %d)",
+                    symbol, book.count_symbol_today(date, symbol), sym_cap)
+        return None
+
     min_prem = INTRADAY.get("min_premium", 5.0)
     if float(signal.get("entry") or 0) < min_prem:
         logger.info("book_signal: %s %s premium ₹%.2f < min ₹%.2f — skip",
                     symbol, side, float(signal.get("entry") or 0), min_prem)
         return None
+
+    # NOTE: the rupee-risk cap is deliberately NOT applied here. External
+    # strategies (e.g. Break & Bounce) own their own SL/sizing model; the
+    # max_risk_rupees budget only governs the discount path (process_signals).
 
     # External strategies (e.g. B&B) may not pre-fill the honest-economics
     # fields — capture them here so every booked trade carries them.

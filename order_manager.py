@@ -21,8 +21,17 @@ import os
 from datetime import datetime
 
 import paper_trader
+import settings_store
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_mode(key: str, fallback: str) -> str:
+    """Settings-DB override for a gate-mode flag (UI toggle), else `fallback`."""
+    try:
+        return settings_store.flag_str(key)
+    except Exception:
+        return fallback
 
 # ---- portfolio concentration limits (review §3.7) -------------------------- #
 # Dedup alone allows 5 same-sector same-direction CEs — one correlated bet at
@@ -192,7 +201,11 @@ class OrderManager:
         """
         sig = dict(signal)
         sig.setdefault("strategy", "External")
-        kept = self._apply_pre_market_gate([sig], self.book)
+        # External strategies own their own daily cap, so skip the shared Gate-5
+        # simultaneous-position cap here (the discount scanner would otherwise
+        # fill those 2 slots first and block every B&B trade). Quality gates and
+        # the concentration/breadth caps still apply.
+        kept = self._apply_pre_market_gate([sig], self.book, enforce_position_cap=False)
         kept = self._apply_breadth_gate(kept)
         kept = self._apply_concentration_gate(kept, self.book)
         if not kept:
@@ -208,9 +221,12 @@ class OrderManager:
                         sig.get("symbol"), sig.get("side"), sig.get("strategy"))
         return booked
 
-    def _apply_pre_market_gate(self, opportunities, book=None):
+    def _apply_pre_market_gate(self, opportunities, book=None, enforce_position_cap=True):
         """
         Apply the 5-gate pre-market quality filter before booking.
+
+        `enforce_position_cap=False` skips Gate 5 (the shared simultaneous cap)
+        for external strategies that own their own daily cap (e.g. B&B).
 
         Gates: IVR cap | IV/HV ratio | OTM% cap | PCR direction | position cap.
         Mode is config-driven (PMG_GATE_MODE env var):
@@ -252,6 +268,7 @@ class OrderManager:
                     hv            = r.get("hv"),
                     iv_rank       = r.get("iv_rank"),
                     open_positions= open_count + accepted_this_batch,
+                    enforce_position_cap = enforce_position_cap,
                 )
                 if result["allow"]:
                     kept.append(r)
@@ -289,7 +306,8 @@ class OrderManager:
         hard -> drop. Fail-open with a loud alert.
         """
         try:
-            if PORTFOLIO_GATE_MODE == "off" or opportunities is None:
+            pmode = _resolve_mode("PORTFOLIO_GATE_MODE", PORTFOLIO_GATE_MODE)
+            if pmode == "off" or opportunities is None:
                 return opportunities
             rows = (opportunities.to_dict("records")
                     if hasattr(opportunities, "to_dict") else list(opportunities))
@@ -329,7 +347,7 @@ class OrderManager:
                 elif sec and sector_count.get(sec, 0) >= PORTFOLIO_MAX_PER_SECTOR:
                     block_reason = f"sector cap {sec} >= {PORTFOLIO_MAX_PER_SECTOR}"
 
-                if block_reason and PORTFOLIO_GATE_MODE == "hard":
+                if block_reason and pmode == "hard":
                     logger.info("OrderManager: concentration gate blocked %s %s — %s",
                                 sym, side, block_reason)
                     continue
@@ -365,7 +383,8 @@ class OrderManager:
         try:
             import breadth
             import breadth_config as bcfg
-            if bcfg.MODE == "off" or opportunities is None:
+            bmode = _resolve_mode("BREADTH_GATE_MODE", bcfg.MODE)
+            if bmode == "off" or opportunities is None:
                 return opportunities
 
             rows = (opportunities.to_dict("records")
@@ -381,7 +400,7 @@ class OrderManager:
             for r in rows:
                 side = r.get("side") or r.get("type")
                 block, reason = breadth.breadth_blocks(side, r.get("symbol", ""), snap, bcfg)
-                if block and bcfg.MODE == "hard":
+                if block and bmode == "hard":
                     logger.info("OrderManager: breadth gate blocked %s %s — %s",
                                 r.get("symbol"), side, reason)
                     continue
@@ -459,7 +478,8 @@ class OrderManager:
             import auto_exit_config as cfg
             from collectors import iv_store
 
-            if cfg.MODE == "off":
+            amode = _resolve_mode("AUTO_EXIT_OI_MODE", cfg.MODE)
+            if amode == "off":
                 return closed
 
             for trade in open_trades:
@@ -497,7 +517,7 @@ class OrderManager:
                     continue
 
                 oi_chg_f = float(oi_chg or 0)
-                if cfg.MODE == "soft":
+                if amode == "soft":
                     logger.info(
                         "AUTO-EXIT (soft) would close %s %s — %s OI %+.0f%% (pnl %+.1f%%)",
                         symbol, side, classification, oi_chg_f, pnl_pct,

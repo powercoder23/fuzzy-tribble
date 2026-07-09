@@ -405,7 +405,7 @@ def overview(days: int = Query(30, ge=1, le=365)):
 
     by_strat: dict = {}
     for r in closed:
-        s = r["strategy"] or "Unknown"
+        s = r["strategy"] or "Untagged (legacy)"
         d = by_strat.setdefault(s, {"n": 0, "net": 0.0, "wins": 0})
         d["n"] += 1
         d["net"] += (r["realized_rupees"] or 0)
@@ -446,7 +446,7 @@ def strategy_performance(days: int = Query(30, ge=1, le=365)):
     )
     by_strat: dict = {}
     for r in rows:
-        s = r["strategy"] or "Unknown"
+        s = r["strategy"] or "Untagged (legacy)"
         d = by_strat.setdefault(
             s, {"n": 0, "net": 0.0, "wins": 0, "gross_win": 0.0, "gross_loss": 0.0}
         )
@@ -469,6 +469,43 @@ def strategy_performance(days: int = Query(30, ge=1, le=365)):
             "profit_factor": round(d["gross_win"] / d["gross_loss"], 2) if d["gross_loss"] else None,
         })
     return {"days": days, "strategies": out}
+
+
+# ── Sector trend (market + per-sector breadth) ───────────────────────────── #
+@app.get("/api/sector-trend")
+def sector_trend():
+    """Market-wide and per-sector breadth from the latest intraday spot
+    snapshots. Recomputed on every call (reads iv_history.db, zero broker
+    calls), so the dashboard section refreshes whenever data is fetched."""
+    try:
+        import breadth
+        snap = breadth.compute()
+    except Exception:
+        return {"market_pct": None, "adv": 0, "dec": 0, "total": 0,
+                "day": None, "sectors": []}
+
+    sectors = []
+    for ind, s in (snap.sectors or {}).items():
+        if (s.get("n") or 0) < 1:
+            continue
+        sectors.append({
+            "sector": ind,
+            "avg": s.get("avg"),
+            "pct": s.get("pct"),
+            "adv": s.get("adv"),
+            "dec": s.get("dec"),
+            "n": s.get("n"),
+        })
+    sectors.sort(key=lambda x: (x["avg"] if x["avg"] is not None else -999),
+                 reverse=True)
+    return {
+        "market_pct": snap.market_pct,
+        "adv": snap.adv,
+        "dec": snap.dec,
+        "total": snap.total,
+        "day": snap.day,
+        "sectors": sectors,
+    }
 
 
 # ── Latest-per-symbol helper (shared by opportunities + snapshot) ────────── #

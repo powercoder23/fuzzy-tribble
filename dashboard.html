@@ -171,6 +171,10 @@
   .data-table td { padding: 10px 8px; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 12px; vertical-align: middle; }
   .data-table tr:last-child td { border-bottom: none; }
   .table-scroll { overflow-x: auto; }
+  .contract-cell { cursor: pointer; color: var(--text); font-weight: 500; white-space: nowrap; }
+  .contract-cell:hover { text-decoration: underline; }
+  .contract-cell.copied { color: #10b981; }
+  .trades-split-label { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; margin: 4px 2px 8px; }
 
   .tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 10px; font-weight: 600; letter-spacing: .05em; white-space: nowrap; }
   .tag.ce, .tag.call { background: rgba(99,102,241,.2); color: #818cf8; }
@@ -301,6 +305,31 @@
     .day-modal-box { max-height: 90vh; }
     .iv-controls .stock-search { max-width: 100%; }
   }
+
+  /* Mobile: collapse wide data tables (paper trades, sector trend) so each
+     row stacks into a multiline card with inline labels instead of scrolling. */
+  @media (max-width: 640px) {
+    .data-table.stack thead { display: none; }
+    .data-table.stack,
+    .data-table.stack tbody,
+    .data-table.stack tr,
+    .data-table.stack td { display: block; width: 100%; }
+    .data-table.stack tr {
+      border: 1px solid var(--border); border-radius: 8px;
+      margin-bottom: 10px; padding: 6px 10px; background: var(--surface, transparent);
+    }
+    .data-table.stack td {
+      border: none; padding: 4px 0; white-space: normal;
+      display: flex; justify-content: space-between; align-items: center; gap: 12px;
+      text-align: right;
+    }
+    .data-table.stack td::before {
+      content: attr(data-label); text-align: left;
+      color: var(--muted); font-size: 11px; text-transform: uppercase;
+      letter-spacing: .04em; flex: 0 0 auto;
+    }
+    .data-table.stack td:first-child { font-weight: 600; border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 2px; }
+  }
 </style>
 </head>
 <body>
@@ -380,6 +409,11 @@
         </div>
 
         <div class="section"></div>
+
+        <div class="section">
+          <div class="section-label">Sector Trend <span class="status-label">— market &amp; sector breadth, refreshes with data</span></div>
+          <div class="card table-scroll" id="sector-trend-card"><div class="loading">Loading…</div></div>
+        </div>
 
         <div class="grid-2">
           <div class="section" style="margin-bottom:0">
@@ -546,6 +580,10 @@
         <div class="section">
           <div class="section-label">Market Snapshot</div>
           <div class="card" id="snapshot-card-2"><div class="loading">Loading…</div></div>
+        </div>
+        <div class="section">
+          <div class="section-label">Sector Trend <span class="status-label">— market &amp; sector breadth, refreshes with data</span></div>
+          <div class="card table-scroll" id="sector-trend-card-2"><div class="loading">Loading…</div></div>
         </div>
       </div><!-- /tab-market -->
 
@@ -740,6 +778,25 @@ function contractName(t) {
   return `${fmtExpiry(t.expiry)} ${t.symbol} ${ceOrPe(t.side)} ${fmtStrike(t.strike)}`
     .replace(/\s+/g, ' ').trim();
 }
+function fallbackCopy(text, cb) {
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy');
+    document.body.removeChild(ta); if (cb) cb();
+  } catch (e) {}
+}
+function copyContract(el) {
+  const name = el && el.getAttribute ? el.getAttribute('data-copy') : '';
+  if (!name) return;
+  const done = () => {
+    el.classList.add('copied'); el.setAttribute('title', 'Copied!');
+    setTimeout(() => { el.classList.remove('copied'); el.setAttribute('title', 'Click to copy'); }, 900);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(name).then(done).catch(() => fallbackCopy(name, done));
+  } else { fallbackCopy(name, done); }
+}
 function fmtTime(ts) {
   if (!ts) return '—';
   const m = String(ts).match(/(\d{2}):(\d{2})/);
@@ -793,7 +850,7 @@ function showTab(name) {
   if (name === 'overview') loadOverview();
   if (name === 'trades')   { loadTrades(); loadStrategyPerformance('strategy-card-2'); }
   if (name === 'universe') loadUniverse();
-  if (name === 'market')   loadMarketSnapshot('snapshot-card-2');
+  if (name === 'market')   { loadMarketSnapshot('snapshot-card-2'); loadSectorTrend('sector-trend-card-2'); }
   if (name === 'alerts')   { loadOpportunities('opportunities-card-2'); loadActivity('activity-card-2'); }
   if (name === 'convex')   loadConvexJournal();
   if (name === 'analytics') {
@@ -844,6 +901,41 @@ async function loadOverview() {
   loadStrategyPerformance('strategy-card');
   loadIvRegime();
   loadActivity('activity-card');
+  loadSectorTrend('sector-trend-card');
+}
+
+async function loadSectorTrend(targetId) {
+  const el = $(targetId);
+  if (!el) return;
+  try {
+    const d = await api('/api/sector-trend');
+    const m = d.market_pct;
+    if (m === null || m === undefined) {
+      el.innerHTML = '<div class="empty-state">No intraday breadth yet — appears once the IV collector has two spot snapshots (≈09:30).</div>';
+      return;
+    }
+    const mcls = m >= 55 ? 'pnl-pos' : m <= 45 ? 'pnl-neg' : '';
+    const header = `<div class="trades-total-bar">
+      <span class="ttb-label">Market breadth${d.day ? ' · ' + d.day : ''}</span>
+      <span class="ttb-value ${mcls}">${m.toFixed(0)}% adv <span class="status-label">(${d.adv}↑ / ${d.dec}↓)</span></span>
+    </div>`;
+    if (!d.sectors || !d.sectors.length) { el.innerHTML = header + '<div class="empty-state">No sector map / not enough names per sector yet.</div>'; return; }
+    const rows = d.sectors.map(s => {
+      const avg = (s.avg == null) ? 0 : s.avg;
+      const dot = avg > 0.15 ? '🟢' : avg < -0.15 ? '🔴' : '⚪';
+      const pcls = avg >= 0 ? 'pnl-pos' : 'pnl-neg';
+      return `<tr>
+        <td data-label="Sector" style="color:var(--text);font-weight:500">${dot} ${s.sector}</td>
+        <td data-label="Avg move" class="${pcls}">${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%</td>
+        <td data-label="Breadth">${s.pct == null ? '—' : s.pct.toFixed(0) + '%'}</td>
+        <td data-label="Adv/Dec">${s.adv}↑ / ${s.dec}↓</td>
+        <td data-label="Names">${s.n}</td>
+      </tr>`;
+    }).join('');
+    el.innerHTML = header + `<table class="data-table stack"><thead><tr><th>Sector</th><th>Avg move</th><th>Breadth</th><th>Adv/Dec</th><th>Names</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } catch(e) {
+    el.innerHTML = `<div class="error-msg">Could not load sector trend: ${e.message}</div>`;
+  }
 }
 
 async function loadCockpit() {
@@ -1041,25 +1133,27 @@ function tradesTable(trades, showTotal = true) {
     const { rupees, pct, live } = tradePnl(t);
     if (rupees !== null && rupees !== undefined) { totalPnl += rupees; havePnl = true; }
     const status = t.status === 'open' ? 'open' : ((t.realized_rupees || 0) >= 0 ? 'win' : 'loss');
-    const pe = ceOrPe(t.side);
     const pnlCell = (rupees !== null && rupees !== undefined)
       ? `<span class="${rupees >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtPnl(rupees)} (${pct > 0 ? '+' : ''}${(pct||0).toFixed(1)}%)${live ? '<span class="pnl-live" title="Live / unrealized"> ●</span>' : ''}</span>`
       : '—';
     const exitPx = (t.status !== 'open' && t.last_price != null) ? `₹${t.last_price.toFixed(2)}` : '—';
+    const tgt = (t.t1 != null && +t.t1 > 0) ? `₹${(+t.t1).toFixed(2)}` : '—';
+    const tgtTitle = (t.t2 != null && +t.t2 > 0 && +t.t2 !== +t.t1) ? `T1 ₹${(+t.t1).toFixed(2)} · T2 ₹${(+t.t2).toFixed(2)}` : 'Target (T1)';
+    const cname = contractName(t);
     return `<tr>
-      <td style="color:var(--text);font-weight:500;white-space:nowrap">${contractName(t)}</td>
-      <td>${t.strategy || '—'}</td>
-      <td><span class="tag ${pe.toLowerCase()}">${pe}</span></td>
-      <td>₹${(t.entry||0).toFixed(2)}</td>
-      <td>₹${(t.last_price||0).toFixed(2)}</td>
-      <td>${exitPx}</td>
-      <td>${fmtTime(t.opened_at)}</td>
-      <td>${fmtTime(t.closed_at)}</td>
-      <td>${pnlCell}</td>
-      <td><span class="tag ${status}">${status.toUpperCase()}</span></td>
+      <td data-label="Contract" class="contract-cell" data-copy="${cname}" title="Click to copy" onclick="copyContract(this)">${cname}</td>
+      <td data-label="Strategy">${t.strategy || '—'}</td>
+      <td data-label="Entry">₹${(t.entry||0).toFixed(2)}</td>
+      <td data-label="LTP">₹${(t.last_price||0).toFixed(2)}</td>
+      <td data-label="Target" title="${tgtTitle}">${tgt}</td>
+      <td data-label="Exit">${exitPx}</td>
+      <td data-label="In">${fmtTime(t.opened_at)}</td>
+      <td data-label="Out">${fmtTime(t.closed_at)}</td>
+      <td data-label="P&amp;L">${pnlCell}</td>
+      <td data-label="Status"><span class="tag ${status}">${status.toUpperCase()}</span></td>
     </tr>`;
   }).join('');
-  const table = `<table class="data-table"><thead><tr><th>Contract</th><th>Strategy</th><th>Side</th><th>Entry</th><th>LTP</th><th>Exit</th><th>In</th><th>Out</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>`;
+  const table = `<table class="data-table stack"><thead><tr><th>Contract</th><th>Strategy</th><th>Entry</th><th>LTP</th><th>Target</th><th>Exit</th><th>In</th><th>Out</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>`;
   if (!showTotal) return table;
   const totalBar = `<div class="trades-total-bar">
     <span class="ttb-label">Current Total P&amp;L</span>
@@ -1628,13 +1722,25 @@ async function loadAnTilt(sym) {
 async function loadTrades() {
   try {
     const today = await api('/api/paper-trades');
-    $('trades-today-card').innerHTML = tradesTable(today.trades);
+    renderTradesSplit('trades-today-card', today.trades || []);
     const hist = await api('/api/paper-trades/history?days=30');
     renderPnlStats(hist.summary);
     renderPnlChart(hist.daily);
   } catch(e) {
     $('trades-today-card').innerHTML = `<div class="error-msg">Could not load trades: ${e.message}</div>`;
   }
+}
+
+function renderTradesSplit(containerId, trades) {
+  const openT = (trades || []).filter(t => t.status === 'open');
+  const closedT = (trades || []).filter(t => t.status !== 'open');
+  const block = (label, arr) =>
+    `<div class="trades-split-label">${label} <span class="status-label">(${arr.length})</span></div>` +
+    tradesTable(arr);
+  $(containerId).innerHTML =
+    block('Open positions', openT) +
+    '<div style="height:16px"></div>' +
+    block('Closed positions', closedT);
 }
 
 function renderPnlStats(s) {

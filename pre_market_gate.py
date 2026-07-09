@@ -124,6 +124,7 @@ def evaluate(
     hv: float | None = None,
     iv_rank: float | None = None,
     open_positions: int = 0,
+    enforce_position_cap: bool = True,
 ) -> dict:
     """
     Run all gates and return a result dict.
@@ -148,7 +149,12 @@ def evaluate(
         "gates"  : list,  # per-gate dicts for logging / diagnostics
     }
     """
-    mode = cfg.GATE_MODE
+    # Settings-DB override (UI toggle) wins over the env/config default.
+    try:
+        import settings_store
+        mode = settings_store.flag_str("PMG_GATE_MODE")
+    except Exception:
+        mode = cfg.GATE_MODE
     side = _norm_side(side)
 
     # Unknown side → fail-open (let existing validators catch it)
@@ -244,12 +250,20 @@ def evaluate(
         failures.append(g["reason"])
 
     # ── Gate 5: simultaneous position cap ───────────────────────────────── #
-    ok = open_positions < cfg.MAX_SIMULTANEOUS
-    g  = _gate("simultaneous", ok, open_positions, cfg.MAX_SIMULTANEOUS,
-               f"{open_positions} open {'<' if ok else '≥'} {cfg.MAX_SIMULTANEOUS} max")
-    gates.append(g)
-    if not ok:
-        failures.append(g["reason"])
+    # External strategies (e.g. Break & Bounce) own their own daily cap and are
+    # routed here only for the QUALITY gates; the shared 2-position cap would
+    # otherwise reject them whenever the discount scanner has already filled its
+    # slots, so it is skipped when enforce_position_cap is False.
+    if enforce_position_cap:
+        ok = open_positions < cfg.MAX_SIMULTANEOUS
+        g  = _gate("simultaneous", ok, open_positions, cfg.MAX_SIMULTANEOUS,
+                   f"{open_positions} open {'<' if ok else '≥'} {cfg.MAX_SIMULTANEOUS} max")
+        gates.append(g)
+        if not ok:
+            failures.append(g["reason"])
+    else:
+        gates.append(_gate("simultaneous", True, open_positions, cfg.MAX_SIMULTANEOUS,
+                           "position cap skipped (external strategy owns its own cap)"))
 
     # ── Verdict ──────────────────────────────────────────────────────────── #
     if failures:

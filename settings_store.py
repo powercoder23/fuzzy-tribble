@@ -16,6 +16,7 @@ Three concerns:
 
 import os
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -179,3 +180,153 @@ def set_startup_profile(container_name: str, autostart: bool):
             INSERT INTO startup_profile (container_name, autostart) VALUES (?, ?)
             ON CONFLICT(container_name) DO UPDATE SET autostart=excluded.autostart
         """, (container_name, int(autostart)))
+
+
+# ---------------------------------------------------------------------------
+# Feature flags — UI-controllable runtime toggles.
+#
+# Stored in global_settings under "flag:<KEY>" (same shared settings.db every
+# container mounts), so a toggle in the Settings page is picked up by the
+# scanner/strategy containers on their next decision (within FLAG_CACHE_TTL).
+#
+# Resolution order for the effective value: DB override -> env var -> registry
+# default. Fully backward compatible: with an empty DB the old env/defaults win.
+# ---------------------------------------------------------------------------
+
+FEATURE_FLAGS = [
+    {"key": "STRATEGY_STRIKE_VIA_DISCOUNT", "type": "bool", "default": False,
+     "env": "STRATEGY_STRIKE_VIA_DISCOUNT",
+     "label": "Discount strike for strategies",
+     "help": "After a strategy confirms direction, trade discount's best-value "
+             "strike instead of the strategy's own ATM+offset."},
+    {"key": "BREADTH_GATE_MODE", "type": "enum", "values": ["off", "soft", "hard"],
+     "default": "off", "env": "BREADTH_GATE_MODE",
+     "label": "Market / sector breadth gate",
+     "help": "Block CE into a broadly-red tape/sector and PE into green. "
+             "soft = log only, hard = drop."},
+    {"key": "PMG_GATE_MODE", "type": "enum", "values": ["off", "soft", "hard"],
+     "default": "hard", "env": "PMG_GATE_MODE",
+     "label": "Pre-market quality gate",
+     "help": "IVR / IV-HV / OTM% / PCR / position gates before booking."},
+    {"key": "PORTFOLIO_GATE_MODE", "type": "enum", "values": ["off", "soft", "hard"],
+     "default": "hard", "env": "PORTFOLIO_GATE_MODE",
+     "label": "Concentration gate",
+     "help": "Cap positions per direction and per sector."},
+    {"key": "AUTO_EXIT_OI_MODE", "type": "enum", "values": ["off", "soft", "hard"],
+     "default": "off", "env": "AUTO_EXIT_OI_MODE",
+     "label": "Auto-exit on OI contradiction",
+     "help": "Close a position when strong opposite-side OI buildup appears."},
+    {"key": "MAX_RISK_RUPEES", "type": "float", "default": 3000.0, "env": None,
+     "label": "Discount max risk / trade (Rs)",
+     "help": "Skip a discount signal whose 1-lot risk (entry-sl)*lot exceeds "
+             "this. 0 disables the cap. (Does not affect B&B.)"},
+    {"key": "MAX_PER_SYMBOL_PER_DAY", "type": "int", "default": 1, "env": None,
+     "label": "Max paper trades per symbol / day",
+     "help": "One underlying can't take more than this many paper trades a day. "
+             "0 disables the cap."},
+]
+_FLAG_BY_KEY = {f["key"]: f for f in FEATURE_FLAGS}
+
+_flag_cache: dict = {}   # key -> (value, expiry_epoch)
+_FLAG_TTL = float(os.getenv("FLAG_CACHE_TTL", "30"))
+
+
+def _coerce(spec, raw):
+    t = spec["type"]
+    if t == "bool":
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    if t == "float":
+        return float(raw)
+    if t == "int":
+        return int(float(raw))
+    return str(raw)   # str / enum
+
+
+def get_flag_raw(key: str) -> Optional[str]:
+    """Raw DB override for a flag ('flag:<key>' in global_settings), or None."""
+    try:
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM global_settings WHERE key=?", (f"flag:{key}",)
+            ).fetchone()
+            return row["value"] if row else None
+    except Exception:
+        return None
+
+
+def set_flag(key: str, value) -> None:
+    """Persist a flag override. Validates enums against the registry."""
+    spec = _FLAG_BY_KEY.get(key)
+    if spec and spec["type"] == "enum" and str(value) not in spec["values"]:
+        raise ValueError(f"{key} must be one of {spec['values']}")
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO global_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (f"flag:{key}", str(value)),
+        )
+    _flag_cache.pop(key, None)
+
+
+def resolve_flag(key: str):
+    """Effective flag value: DB override -> env -> registry default, coerced to
+    the declared type. Cached ~FLAG_CACHE_TTL. Fail-open to the default."""
+    spec = _FLAG_BY_KEY.get(key)
+    now = time.time()
+    hit = _flag_cache.get(key)
+    if hit and hit[1] > now:
+        return hit[0]
+    try:
+        raw = get_flag_raw(key)
+        if raw is None and spec and spec.get("env"):
+            raw = os.getenv(spec["env"])
+        if raw is None:
+            val = spec["default"] if spec else None
+        else:
+            val = _coerce(spec, raw) if spec else raw
+    except Exception:
+        val = spec["default"] if spec else None
+    _flag_cache[key] = (val, now + _FLAG_TTL)
+    return val
+
+
+def flag_bool(key: str) -> bool:
+    return bool(resolve_flag(key))
+
+
+def flag_str(key: str) -> str:
+    return str(resolve_flag(key))
+
+
+def flag_float(key: str) -> float:
+    try:
+        return float(resolve_flag(key))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def flag_int(key: str) -> int:
+    try:
+        return int(resolve_flag(key))
+    except (TypeError, ValueError):
+        return 0
+
+
+def list_feature_flags() -> list[dict]:
+    """For the Settings UI: each flag with its effective value and source."""
+    out = []
+    for spec in FEATURE_FLAGS:
+        db = get_flag_raw(spec["key"])
+        env = os.getenv(spec["env"]) if spec.get("env") else None
+        source = "db" if db is not None else ("env" if env is not None else "default")
+        out.append({
+            "key": spec["key"],
+            "type": spec["type"],
+            "label": spec["label"],
+            "help": spec["help"],
+            "default": spec["default"],
+            "values": spec.get("values"),
+            "value": resolve_flag(spec["key"]),
+            "source": source,
+        })
+    return out

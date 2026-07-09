@@ -121,6 +121,12 @@
 </div>
 
 <div class="panel">
+  <h2>Feature Flags</h2>
+  <div class="sub" style="margin-bottom:10px">Runtime toggles saved to the shared settings DB — services pick them up within ~30s, no restart.</div>
+  <div id="featureFlagList"><div class="sub">Loading…</div></div>
+</div>
+
+<div class="panel">
   <h2>Containers</h2>
   <div id="containerList"></div>
 </div>
@@ -322,7 +328,51 @@ async function updateFlag(container, alertType) {
   toast(`${container} / ${alertType} updated`);
 }
 
+async function loadFeatureFlags() {
+  try {
+    const data = await api('/api/settings/flags');
+    renderFeatureFlags(data.flags || []);
+  } catch (e) {
+    document.getElementById('featureFlagList').innerHTML = `<div class="sub">Could not load flags: ${e.message}</div>`;
+  }
+}
+function renderFeatureFlags(flags) {
+  const host = document.getElementById('featureFlagList');
+  if (!flags.length) { host.innerHTML = '<div class="sub">No flags.</div>'; return; }
+  host.innerHTML = flags.map(f => {
+    let control;
+    if (f.type === 'bool') {
+      const on = (f.value === true || String(f.value) === 'true');
+      control = `<input type="checkbox" id="ff_${f.key}" ${on ? 'checked' : ''} onchange="setFeatureFlag('${f.key}', this.checked)">`;
+    } else if (f.type === 'enum') {
+      control = `<select id="ff_${f.key}" onchange="setFeatureFlag('${f.key}', this.value)">` +
+        (f.values || []).map(v => `<option value="${v}" ${String(f.value)===String(v)?'selected':''}>${v}</option>`).join('') + `</select>`;
+    } else {
+      const step = f.type === 'int' ? '1' : 'any';
+      control = `<input type="number" step="${step}" id="ff_${f.key}" value="${f.value}" style="width:120px" onchange="setFeatureFlag('${f.key}', this.value)">`;
+    }
+    return `<div class="row-flex" style="justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--border); flex-wrap:wrap; gap:8px;">
+      <div style="max-width:68%">
+        <div><b>${f.label}</b> <span class="sub" style="opacity:.6">[${f.source}]</span></div>
+        <div class="sub" style="opacity:.7">${f.help}</div>
+      </div>
+      <div>${control}</div>
+    </div>`;
+  }).join('');
+}
+async function setFeatureFlag(key, value) {
+  try {
+    await api('/api/settings/flag', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({key, value: String(value)})
+    });
+    toast(`${key} = ${value}`);
+    loadFeatureFlags();
+  } catch (e) { toast('Failed: ' + e.message); }
+}
+
 loadOverview();
+loadFeatureFlags();
 setInterval(() => { api('/api/settings/containers/status').then(s => {
   if (STATE) { STATE.status = s; renderContainers(); }
 }); }, 8000);
