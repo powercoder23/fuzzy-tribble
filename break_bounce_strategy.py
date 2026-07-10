@@ -38,7 +38,7 @@ from momentum_strategy import (
 )
 from load_scrip_master_sqlite import get_security_id_symbol_map
 from break_bounce_config import (
-    CAPITAL, BB_RISK, BB_BREAKOUT, BB_LIQUIDITY, BB_STRIKE,
+    CAPITAL, BB_RISK, BB_BREAKOUT, BB_LIQUIDITY, BB_STRIKE, BB_PAPER,
     SCRIP_MASTER_DB, TRADE_LOG_PATH, LOT_SIZE_FALLBACK,
 )
 
@@ -53,6 +53,19 @@ from oi_validator import (
 
 IST = pytz.timezone("Asia/Kolkata")
 logger = logging.getLogger(__name__)
+
+
+def _bb_breakout_alerts_enabled() -> bool:
+    """UI-controllable toggle for the 15-min 'BREAKOUTS CONFIRMED' batch
+    alert. Default OFF — a confirmed breakout is only step 2 of 3 (no retest,
+    no entry yet), so the batch message is noise next to the actual
+    entry-signal + paper-trade alerts. Settings-DB flag wins over env."""
+    try:
+        import settings_store
+        return settings_store.flag_bool("BB_BREAKOUT_ALERTS")
+    except Exception:
+        return os.getenv("BB_BREAKOUT_ALERTS", "false").strip().lower() in (
+            "1", "true", "yes", "on")
 
 
 # ---------------------------------------------------------------------------
@@ -1194,6 +1207,15 @@ class BreakBounceStrategyRunner:
                         "t1_book_fraction":  1.0,
                         "lot_size":          lot_size,
                         "iv":                strike_data.get("iv"),
+                        # bid/ask let paper_trader compute the REAL half-spread
+                        # for honest slippage instead of the 2% fallback.
+                        "bid":               strike_data.get("bid"),
+                        "ask":               strike_data.get("ask"),
+                        "oi":                strike_data.get("oi"),
+                        "volume":            strike_data.get("volume"),
+                        # B&B's own paper-booking floor (see BB_PAPER) — the
+                        # shared ₹5 discount floor dropped cheap large-lot names.
+                        "min_premium":       BB_PAPER["min_premium"],
                         "strategy":          ("Break & Bounce (discount strike)"
                                               if strike_data.get("strike_source") == "discount"
                                               else "Break & Bounce"),
@@ -1255,7 +1277,13 @@ class BreakBounceStrategyRunner:
                             symbol, side, strike_data.get("strike"), lots)
                 time.sleep(0.3)
 
-            if new_breakouts:
+            if new_breakouts and not _bb_breakout_alerts_enabled():
+                # Breakout batch alert hidden (BB_BREAKOUT_ALERTS off, the
+                # default): a confirmed 15-min breakout is only step 2 of 3 —
+                # the retest entry (and its paper trade) still alerts normally.
+                logger.info("B&B: %d breakout(s) confirmed — batch alert hidden "
+                            "(BB_BREAKOUT_ALERTS off)", len(new_breakouts))
+            elif new_breakouts:
                 # When the OI layer annotated these breakouts, send the enriched
                 # alert via the generic notifier primitive (the existing Telegram
                 # infrastructure is left untouched); otherwise use the unchanged

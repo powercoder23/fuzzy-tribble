@@ -21,17 +21,23 @@ deployment without touching code.
 import os
 
 # ── Mode ─────────────────────────────────────────────────────────────────── #
-MODE = os.getenv("AUTO_EXIT_OI_MODE", "off").strip().lower()
+MODE = os.getenv("AUTO_EXIT_OI_MODE", "hard").strip().lower()
 
 # ── Trigger thresholds ───────────────────────────────────────────────────── #
 # Minimum aggregate-OI change (%) on the contradicting buildup before we act.
 # The OI here is aggregate call+put OI vs day-open (see oi_buildup_scanner), so
 # this is a conviction filter: small OI drift shouldn't dump a position.
-MIN_OI_CHG_PCT = float(os.getenv("AUTO_EXIT_OI_MIN_OI_CHG_PCT", "50"))
+# 1.0 (not 50): the POSITION RISK warning fires on ANY opposite-side bias,
+# and the operator decision (2026-07-09) is to ACT on those same reads — e.g.
+# APOLLOHOSP CE vs SHORT_BUILDUP OI +1.6%, JUBLFOOD PE vs SHORT_COVERING
+# OI -1.0%. The 1% floor only mutes pure zero-drift noise.
+MIN_OI_CHG_PCT = float(os.getenv("AUTO_EXIT_OI_MIN_OI_CHG_PCT", "1.0"))
 
 # Only act on a *strong* buildup (LONG_BUILDUP / SHORT_BUILDUP — fresh
 # positioning), not on weak SHORT_COVERING / LONG_UNWINDING fades.
-REQUIRE_STRONG = os.getenv("AUTO_EXIT_OI_REQUIRE_STRONG", "true").strip().lower() == "true"
+# false: weak reads (SHORT_COVERING / LONG_UNWINDING) also contradict — the
+# JUBLFOOD sample above was a covering read the trader wanted exited.
+REQUIRE_STRONG = os.getenv("AUTO_EXIT_OI_REQUIRE_STRONG", "false").strip().lower() == "true"
 
 # Don't dump a clear winner on a noisy OI read: skip auto-exit when the
 # position is already up more than this (%). Set very high to disable.

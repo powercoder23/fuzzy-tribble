@@ -43,6 +43,14 @@ BB_STRIKE = {
     "otm_offset": 0,  # ATM strike (tighter to the level for break & bounce)
 }
 
+BB_PAPER = {
+    # Premium floor for booking a B&B signal into the shared paper book.
+    # B&B already enforces its own liquidity + affordability gates, so this
+    # only filters sub-50-paise junk. The discount path's ₹5 floor would
+    # wrongly drop cheap large-lot names (e.g. NHPC CE @ ₹1.8, lot 6,950).
+    "min_premium": 0.5,
+}
+
 SCRIP_MASTER_DB = str(Path("data") / "api-scrip-master.db")
 IV_HISTORY_DB   = str(Path("data") / "iv_history.db")
 TRADE_LOG_PATH  = str(Path("data") / "break_bounce_trades.csv")

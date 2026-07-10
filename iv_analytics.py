@@ -149,6 +149,19 @@ def vol_expansion(lookback_days: int = 4, top_n: int = 15) -> dict:
             "expanding": slope > 0.5,   # >0.5 IV pts/day = meaningful climb
         })
     out.sort(key=lambda x: x["slope_iv_pts_per_day"], reverse=True)
+    # Buy-zone enrichment (top rows only — one IVP lookup per displayed
+    # symbol). The tradeable pattern is the COMBINATION: IV climbing (slope)
+    # while STILL cheap on 52-week history (IVP in the buy zone) → long
+    # premium can win on Vega before the event even resolves. EXPANDING but
+    # already-rich names are chase entries — vol crush eats the edge.
+    for row in out[:top_n]:
+        try:
+            ivp = iv_percentile(row["symbol"])
+            row["iv_percentile"] = ivp.get("iv_percentile")
+            row["iv_rank"] = ivp.get("iv_rank")
+            row["buy_zone"] = ivp.get("verdict")     # BUY / NEUTRAL / AVOID
+        except Exception:
+            row["iv_percentile"] = row["iv_rank"] = row["buy_zone"] = None
     return {
         "lookback_days": lookback_days,
         "note": ("Slope-detected expansion. No economic-calendar collector "

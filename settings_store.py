@@ -213,10 +213,18 @@ FEATURE_FLAGS = [
      "label": "Concentration gate",
      "help": "Cap positions per direction and per sector."},
     {"key": "AUTO_EXIT_OI_MODE", "type": "enum", "values": ["off", "soft", "hard"],
-     "default": "off", "env": "AUTO_EXIT_OI_MODE",
+     "default": "hard", "env": "AUTO_EXIT_OI_MODE",
      "label": "Auto-exit on OI contradiction",
-     "help": "Close a position when strong opposite-side OI buildup appears."},
-    {"key": "MAX_RISK_RUPEES", "type": "float", "default": 3000.0, "env": None,
+     "help": "Close a position when the latest OI buildup contradicts its side "
+             "(thresholds in auto_exit_config: min OI change, strong-only, "
+             "winner-skip). hard = exit at market; soft = log only."},
+    {"key": "BB_BREAKOUT_ALERTS", "type": "bool", "default": False,
+     "env": "BB_BREAKOUT_ALERTS",
+     "label": "B&B 15-min breakout alerts",
+     "help": "Send the 'BREAKOUTS CONFIRMED' batch alert when 15-min breakouts "
+             "are detected (step 2 of 3, before any retest/entry). Off = only "
+             "entry-signal and paper-trade alerts."},
+    {"key": "MAX_RISK_RUPEES", "type": "float", "default": 1500.0, "env": None,
      "label": "Discount max risk / trade (Rs)",
      "help": "Skip a discount signal whose 1-lot risk (entry-sl)*lot exceeds "
              "this. 0 disables the cap. (Does not affect B&B.)"},

@@ -329,16 +329,29 @@ def analytics_skew_tilt(symbol: str, wing: int = Query(3, ge=1, le=7)):
 
 
 # ── Paper trades ─────────────────────────────────────────────────────────── #
-@app.get("/api/paper-trades")
-def paper_trades(date: Optional[str] = None):
-    """Today's (or a specific date's) paper trades."""
-    d = date or datetime.now().strftime("%Y-%m-%d")
-    rows = _pt("""
-        SELECT symbol, side, strike, expiry, entry, last_price,
+_PT_COLS = """date, symbol, side, strike, expiry, entry, last_price,
                sl, t1, t2, lot_size, score, iv, hv, iv_rank,
-               realized_pct, realized_rupees, status,
-               opened_at, closed_at, exit_reason
-        FROM   paper_trades
+               realized_pct, realized_rupees, status, strategy,
+               opened_at, closed_at, exit_reason, factors_json"""
+
+
+@app.get("/api/paper-trades")
+def paper_trades(date: Optional[str] = None,
+                 days: Optional[int] = Query(None, ge=1, le=365)):
+    """Paper trades. Default: today. `?date=` a specific day, or `?days=N`
+    every trade in the trailing window (newest first) — the Trades page uses
+    this to show the WHOLE book, not just today."""
+    if days:
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        rows = _pt(f"""
+            SELECT {_PT_COLS} FROM paper_trades
+            WHERE  date >= ?
+            ORDER  BY date DESC, opened_at DESC
+        """, (since,))
+        return {"days": days, "trades": rows, "count": len(rows)}
+    d = date or datetime.now().strftime("%Y-%m-%d")
+    rows = _pt(f"""
+        SELECT {_PT_COLS} FROM paper_trades
         WHERE  date = ?
         ORDER  BY opened_at ASC
     """, (d,))
@@ -978,38 +991,3 @@ def system_metrics():
     iv_ok = IV_DB.exists() and _scalar(IV_DB, "SELECT 1", default=None) == 1
     pt_ok = PT_DB.exists()
     resp_ms = int((datetime.now() - t0).total_seconds() * 1000)
-
-    # Signals today (real)
-    signals_today = _scalar(
-        PT_DB, "SELECT COUNT(*) FROM paper_trades WHERE date=date('now','localtime')",
-        default=0) or 0
-
-    # Host metrics — real only if psutil is available, else placeholders
-    cpu = mem = disk = None
-    net = None
-    try:
-        import psutil
-        cpu = round(psutil.cpu_percent(interval=0.1))
-        vm = psutil.virtual_memory()
-        mem = {"pct": round(vm.percent), "detail": f"{vm.used >> 30} / {vm.total >> 30} GB"}
-        du = psutil.disk_usage("/")
-        disk = {"pct": round(du.percent), "detail": f"{du.used >> 30} / {du.total >> 30} GB"}
-    except Exception:
-        pass
-
-    return {
-        "containers": {"running": running, "total": total},
-        "database": {"ok": bool(iv_ok or pt_ok), "resp_ms": resp_ms},
-        "signals_today": int(signals_today),
-        "alerts_today": None,            # placeholder — no alert counter yet
-        "telegram": None,                # placeholder
-        "last_backup": None,             # placeholder
-        "cpu_pct": cpu,
-        "mem_pct": (mem or {}).get("pct"),
-        "mem": mem,
-        "disk_pct": (disk or {}).get("pct"),
-        "disk": disk,
-        "net": net,
-        "server_time": datetime.now().isoformat(),
-    }
-

@@ -817,7 +817,11 @@ def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
                     symbol, book.count_symbol_today(date, symbol), sym_cap)
         return None
 
-    min_prem = INTRADAY.get("min_premium", 5.0)
+    # Per-signal floor override: external strategies (e.g. B&B) own their own
+    # affordability/liquidity model — a ₹1.8 NHPC option with a 6,950 lot is a
+    # valid B&B trade but sits below the discount path's ₹5 far-OTM-junk floor.
+    _ov = signal.get("min_premium")
+    min_prem = float(_ov) if _ov is not None else INTRADAY.get("min_premium", 5.0)
     if float(signal.get("entry") or 0) < min_prem:
         logger.info("book_signal: %s %s premium ₹%.2f < min ₹%.2f — skip",
                     symbol, side, float(signal.get("entry") or 0), min_prem)

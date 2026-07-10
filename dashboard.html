@@ -551,7 +551,7 @@
       <!-- ═══════════════════════════════════════════════ -->
       <div id="tab-trades" style="display:none">
         <div class="section">
-          <div class="section-label">Today's Trades</div>
+          <div class="section-label">All Paper Trades <span class="status-label" id="trades-window-note"></span></div>
           <div class="card table-scroll" id="trades-today-card"><div class="loading">Loading trades…</div></div>
         </div>
         <div class="section">
@@ -1126,9 +1126,31 @@ async function loadOvTrades() {
   }
 }
 
+function factorTip(t) {
+  // Entry factor snapshot (factors_json, captured at booking) as a tooltip —
+  // the data that says WHY this trade was taken (edge attribution).
+  if (!t.factors_json) return '';
+  try {
+    const f = JSON.parse(t.factors_json);
+    const bits = [];
+    if (f.score != null) bits.push(`score ${f.score}`);
+    if (f.iv_rank != null) bits.push(`IVR ${f.iv_rank}`);
+    if (f.iv != null && f.hv != null) bits.push(`IV/HV ${f.iv}/${f.hv}`);
+    if (f.pcr != null) bits.push(`PCR ${f.pcr}`);
+    if (f.spread_half != null) bits.push(`½spread ${f.spread_half}`);
+    if (f.sonar && f.sonar.signal) bits.push(`sonar ${f.sonar.signal}`);
+    if (f.oi_buildup && f.oi_buildup.classification) bits.push(`OI ${f.oi_buildup.classification}`);
+    if (f.composite && f.composite.score != null) bits.push(`composite ${f.composite.score} ${f.composite.grade || ''}`);
+    if (f.breadth_market_pct != null) bits.push(`breadth ${f.breadth_market_pct}%`);
+    return bits.join(' · ');
+  } catch(e) { return ''; }
+}
+
 function tradesTable(trades, showTotal = true) {
   if (!trades || !trades.length) return '<div class="empty-state">No trades in this view</div>';
   let totalPnl = 0, havePnl = false;
+  // Show a Date column only when the set spans more than one trading day.
+  const multiDay = new Set((trades || []).map(t => t.date).filter(Boolean)).size > 1;
   const rows = trades.map(t => {
     const { rupees, pct, live } = tradePnl(t);
     if (rupees !== null && rupees !== undefined) { totalPnl += rupees; havePnl = true; }
@@ -1141,6 +1163,7 @@ function tradesTable(trades, showTotal = true) {
     const tgtTitle = (t.t2 != null && +t.t2 > 0 && +t.t2 !== +t.t1) ? `T1 ₹${(+t.t1).toFixed(2)} · T2 ₹${(+t.t2).toFixed(2)}` : 'Target (T1)';
     const cname = contractName(t);
     return `<tr>
+      ${multiDay ? `<td data-label="Date">${(t.date || '').slice(5)}</td>` : ''}
       <td data-label="Contract" class="contract-cell" data-copy="${cname}" title="Click to copy" onclick="copyContract(this)">${cname}</td>
       <td data-label="Strategy">${t.strategy || '—'}</td>
       <td data-label="Entry">₹${(t.entry||0).toFixed(2)}</td>
@@ -1150,10 +1173,10 @@ function tradesTable(trades, showTotal = true) {
       <td data-label="In">${fmtTime(t.opened_at)}</td>
       <td data-label="Out">${fmtTime(t.closed_at)}</td>
       <td data-label="P&amp;L">${pnlCell}</td>
-      <td data-label="Status"><span class="tag ${status}">${status.toUpperCase()}</span></td>
+      <td data-label="Status"><span class="tag ${status}" title="${factorTip(t)}">${status.toUpperCase()}</span></td>
     </tr>`;
   }).join('');
-  const table = `<table class="data-table stack"><thead><tr><th>Contract</th><th>Strategy</th><th>Entry</th><th>LTP</th><th>Target</th><th>Exit</th><th>In</th><th>Out</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>`;
+  const table = `<table class="data-table stack"><thead><tr>${multiDay ? '<th>Date</th>' : ''}<th>Contract</th><th>Strategy</th><th>Entry</th><th>LTP</th><th>Target</th><th>Exit</th><th>In</th><th>Out</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>`;
   if (!showTotal) return table;
   const totalBar = `<div class="trades-total-bar">
     <span class="ttb-label">Current Total P&amp;L</span>
@@ -1249,8 +1272,11 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDayModa
 // ── Trades tab loader ────────────────────────────────────────────────────────
 async function loadTrades() {
   try {
-    const today = await api('/api/paper-trades');
-    $('trades-today-card').innerHTML = tradesTable(today.trades || []);
+    // Whole book (trailing year), newest first — not just today.
+    const all = await api('/api/paper-trades?days=365');
+    $('trades-today-card').innerHTML = tradesTable(all.trades || []);
+    const n = $('trades-window-note');
+    if (n) n.textContent = `${all.count} trade(s), last ${all.days} days`;
   } catch(e) {
     $('trades-today-card').innerHTML = `<div class="error-msg">Could not load trades: ${e.message}</div>`;
   }
@@ -1628,17 +1654,25 @@ async function loadAnExpansion() {
   try {
     const d = await api('/api/analytics/expansion?days=4&limit=15');
     if (!d.symbols.length) { el.innerHTML = '<div class="empty-state">Not enough daily IV history yet (needs ≥3 days per symbol)</div>'; return; }
+    const bz = s => {
+      if (s.buy_zone === 'BUY')   return `<span class="tag win" title="IVP ${s.iv_percentile ?? '—'} — still cheap on 52-wk history">BUY ZONE</span>`;
+      if (s.buy_zone === 'AVOID') return `<span class="tag loss" title="IVP ${s.iv_percentile ?? '—'} — already rich, vol-crush risk">RICH</span>`;
+      if (s.buy_zone === 'NEUTRAL') return `<span class="tag na" title="IVP ${s.iv_percentile ?? '—'}">NEUTRAL</span>`;
+      return '<span class="tag na">—</span>';
+    };
     const rows = d.symbols.map(s => `<tr>
       <td style="color:var(--text);font-weight:500">${s.symbol}</td>
       <td class="${s.slope_iv_pts_per_day > 0 ? 'pnl-pos' : 'pnl-neg'}">${s.slope_iv_pts_per_day > 0 ? '+' : ''}${s.slope_iv_pts_per_day}/d</td>
       <td>${s.iv_start}% → ${s.iv_now}%</td>
       <td class="${s.change_pct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${s.change_pct >= 0 ? '+' : ''}${s.change_pct}%</td>
+      <td>${s.iv_percentile != null ? s.iv_percentile : '—'}</td>
+      <td>${bz(s)}</td>
       <td>${s.expanding ? '<span class="tag open">EXPANDING</span>' : '<span class="tag na">—</span>'}</td>
     </tr>`).join('');
     el.innerHTML = `<table class="data-table">
-      <thead><tr><th>Symbol</th><th>Slope</th><th>IV ${d.lookback_days}d</th><th>Δ%</th><th>Status</th></tr></thead>
+      <thead><tr><th>Symbol</th><th>Slope</th><th>IV ${d.lookback_days}d</th><th>Δ%</th><th>IVP</th><th>Buy zone</th><th>Status</th></tr></thead>
       <tbody>${rows}</tbody></table>
-      <div class="status-label" style="margin-top:8px">${d.expanding_count} expanding · ${d.note}</div>`;
+      <div class="status-label" style="margin-top:8px">${d.expanding_count} expanding · trade rule: EXPANDING + BUY ZONE = long premium (Vega) candidate; EXPANDING + RICH = chase, skip · ${d.note}</div>`;
   } catch(e) {
     el.innerHTML = `<div class="error-msg">${e.message}</div>`;
   }
@@ -1758,34 +1792,9 @@ function renderPnlChart(daily) {
   renderPnlChartInto('pnl-chart', daily, c => pnlChart = c, pnlChart);
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// UNIVERSE TAB (existing behaviour, preserved)
-// ══════════════════════════════════════════════════════════════════════════
-let allUniverse = [];
-async function loadUniverse() {
-  try {
-    allUniverse = await api('/api/symbols');
-    allSymbols = allUniverse;
-    $('uni-count').textContent = allUniverse.length;
-    renderUniverse(allUniverse);
-  } catch(e) {
-    $('universe-grid').innerHTML = `<div class="error-msg">${e.message}</div>`;
-  }
-}
-
-function renderUniverse(syms) {
-  if (!syms.length) { $('universe-grid').innerHTML = '<div class="loading">No symbols yet</div>'; return; }
-  $('universe-grid').innerHTML = syms.map(s => `
-    <div class="sym-chip ${s.symbol === currentSymbol ? 'selected' : ''}" onclick="showTab('iv');selectSymbol('${s.symbol}')">
-      <span class="sym-name">${s.symbol}</span>
-      <span class="sym-ivr ${ivrClass(s.iv_rank)}">${s.iv_rank !== null && s.iv_rank !== undefined ? s.iv_rank.toFixed(0) : 'N/A'}</span>
-    </div>`).join('');
-}
-
-function filterUniverse(val) {
-  val = val.trim().toUpperCase();
-  renderUniverse(val ? allUniverse.filter(s => s.symbol.includes(val)) : allUniverse);
-}
+// (Duplicate unsorted Universe block removed 2026-07-10 — it silently
+// overrode the cheap-IV-first implementation above, so the option-buyer
+// ordering never ran.)
 
 // ══════════════════════════════════════════════════════════════════════════
 // CONVEX JOURNAL TAB (V2)
