@@ -159,6 +159,17 @@ def apply_tick(trade, last_price, square_off=False):
             return events
         if last_price >= trade["t1"]:
             _book(trade, trade["t1_book_fraction"], trade["t1"])
+            if trade["qty_frac"] <= 1e-9:
+                # Full-book plan (t1_book_fraction == 1.0, e.g. B&B's single
+                # target with t1 == t2): nothing left to run. Finalize NOW —
+                # otherwise the trade lingers as a zero-quantity "open" row
+                # until square-off, occupying position/concentration caps and
+                # burning one chain fetch per monitor tick (review 2026-07-09
+                # BUG-1), with a wrong "Time 15:20" exit reason.
+                trade["t1_done"] = 1
+                _finalize(trade, "Target full")
+                events.append("T1_FULL")
+                return events
             trade["t1_done"] = 1
             trade["runner_stop"] = entry           # move runner stop to breakeven
             events.append("T1")
@@ -383,6 +394,7 @@ def format_fill_update(trade, event):
     """Short HTML note when a paper trade books T1 or closes."""
     label = {
         "T1": "✅ T1 hit — booked partial",
+        "T1_FULL": "🎯 Target hit — full exit",
         "T2": "🎯 T2 hit — runner closed",
         "SL": "🛑 SL hit — closed",
         "BE": "➖ Runner stopped at breakeven",
@@ -417,6 +429,8 @@ def _why(trade):
         return "hit stop-loss (−15%); premium fell after entry"
     if reason == "T2":
         return "ran to T2 target (+45%); strong directional move"
+    if reason == "Target full":
+        return "hit target; booked 100% (single-target plan, no runner)"
     if reason == "Runner BE":
         return "booked T1, runner came back to breakeven (move stalled)"
     if reason and reason.startswith("Time"):
@@ -710,6 +724,13 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
         if _sonar_available:
             sec_id = str(row.get("security_id") or "")
             sonar  = get_latest_sonar(sec_id) if sec_id else {}
+            # Stale-guard: only SAME-DAY sonar rows may veto (mirrors
+            # OrderManager._check_position_risks). get_latest_sonar returns the
+            # latest row EVER, so without this a FLAT/BREAKDOWN persisted at
+            # yesterday's close vetoes this morning's entries until sonar
+            # writes fresh rows (review 2026-07-09 BUG-2). No data = no veto.
+            if str(sonar.get("timestamp", ""))[:10] != date:
+                sonar = {}
             signal = sonar.get("signal", "")
             if signal == "FLAT":
                 logger.info("Sonar FLAT — skipping %s", symbol)
@@ -846,7 +867,7 @@ def monitor(book, scanner, now=None, bot_token=None, chat_id=None, square_off=Fa
         book.save_runtime(trade, now)
         # Mid-session fill alerts — fire on every actionable event so the
         # trader knows in real time when a SL/T1/T2 is hit.
-        for event in ("SL", "T1", "T2", "BE", "TIME"):
+        for event in ("SL", "T1", "T1_FULL", "T2", "BE", "TIME"):
             if event in events:
                 send_telegram(
                     format_fill_update(trade, event),
