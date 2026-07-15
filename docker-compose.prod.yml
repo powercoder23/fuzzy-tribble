@@ -83,6 +83,27 @@ services:
       - iv-collector
     command: python break_bounce_runner.py
 
+  # ── Service: Volatility-Expansion paper strategy (4-day IV slope) ────────
+  # Trades the dashboard's buy-zone expansion signal. MODE via VOL_EXP_MODE
+  # (off|alert|paper, default paper). Paper only — never places real orders.
+  vol-expansion:
+    build:
+      context: .
+      dockerfile: Dockerfile.break-bounce
+    container_name: vol-expansion-strategy
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python vol_expansion_runner.py
+
   # ── Service 5: Directional IV Strategy (DISCONTINUED) ───────────────────
   # Excluded from default `docker-compose up` via profile.
   # To run manually: docker-compose --profile directional-iv up directional-iv
