@@ -26,6 +26,7 @@ used for data; it is reserved only for possible future live order placement.
 | 10 | smart-money     | smart-money-scanner     | `smart_money_runner.py`          | yes         | No (alerts) |
 | 11 | composite       | composite-scanner       | `composite_runner.py`            | yes         | No (feeds entry gate) |
 | 12 | sonar           | sonar-scanner           | `sonar_laplace_runner.py`        | yes         | No (feeds entry veto + risk warnings) |
+| 13 | vol-expansion   | vol-expansion-strategy  | `vol_expansion_runner.py`        | yes         | Paper |
 
 API callers: `iv-collector` sweeps option chains continuously; the `discount`
 service also fetches chains + candles during its 15-min scans, and `sonar`
@@ -41,11 +42,10 @@ busy_timeout) — see ARCHITECTURE_REVIEW_P0.md §0 for why.
 
 ## Strategies
 
-This section covers the four `*_strategy.py` modules besides `discount.py`.
-Note: only **three distinct trading strategies** exist in the code. Splitting
-momentum into ORB and VWAP (both live in `momentum_strategy.py:MomentumScanner`)
-yields ORB + VWAP + Break-and-Bounce. **A fourth strategy is not present** —
-see the "Missing 4th strategy?" section at the end.
+This section covers the `*_strategy.py` modules besides `discount.py`.
+Splitting momentum into ORB and VWAP (both live in
+`momentum_strategy.py:MomentumScanner`) yields four distinct trading
+strategies: ORB + VWAP + Break-and-Bounce + Volatility-Expansion.
 
 ### Strategy: Momentum — Opening Range Breakout (ORB)
 
@@ -85,20 +85,16 @@ see the "Missing 4th strategy?" section at the end.
 - **Strike:** ATM + `BB_STRIKE["otm_offset"]` strike-gaps (separate config from momentum).
 - **Lifecycle:** one trade per stock per day (`state["trade_placed"]`). Setup is voided once breakout window expires without a breakout. EOD reset at 15:15.
 
-### Missing 4th strategy?
+### Strategy: Volatility-Expansion (IV buy-zone)
 
-You asked for four strategies. The repo has **three trading strategies** plus
-the IV collector. After full inspection:
-
-- `iv_collector_service.py` is explicitly self-described as *"Service 1. Sole responsibility: fetch option chain data and persist IV snapshots. Neither strategy service should write IV data."* — it has no entry rules and never places orders.
-- `main.py` is a scheduler wrapper that runs `discount.py`'s scanner — not a separate strategy.
-- The `*_runner.py` files (`momentum_runner.py`, `break_bounce_runner.py`) are just `schedule`-based service wrappers around their `*_strategy.py` siblings — no extra rules.
-- No other `*_strategy.py` or trading-logic file exists at the project root or in `old/` outside of the discount/momentum/break-bounce families.
-
-**If you intended a 4th strategy, it isn't in the tree yet.** Likely
-candidates if you want me to look further: a planned strategy described
-elsewhere (a doc, screenshot, or branch), or one that lives inside
-`discount.py` as a sub-mode I should pull out.
+- **Files:** [vol_expansion_strategy.py](vol_expansion_strategy.py), runner [vol_expansion_runner.py](vol_expansion_runner.py), config [vol_expansion_config.py](vol_expansion_config.py).
+- **Signal source:** the dashboard's "II · Volatility Expansion — 4-day IV slope" leaderboard (`iv_analytics.buy_zone_leaderboard`) — names whose daily ATM IV is **climbing** (slope ≥ `MIN_SLOPE`) while **still cheap** on 52-wk history (IVP in the buy zone), ranked by `slope × (1 - IVP/100)`. Vega signal, not directional by nature.
+- **Direction:** since the signal itself is direction-agnostic, the strategy picks CE/PE from the underlying's recent daily spot trend (`underlying_bias`, `TREND_LOOKBACK` days, `MIN_MOVE_PCT` threshold). `REQUIRE_TREND=true` skips names with no clear lean rather than forcing a directional bet on a pure-vega setup.
+- **Universe / gates:** `BUY_ZONE_ONLY` restricts to buy-zone names (else trades top-expanding by slope regardless of price, i.e. includes rich chases); `MAX_SCAN` candidates considered; liquidity floor (`LIQ_MIN_OI`, `LIQ_MIN_VOLUME`, `LIQ_MAX_SPREAD`); `MIN_PREMIUM`, `MIN_DTE`.
+- **Sizing & risk:** single long-premium leg, ATM ± `STRIKE_OTM_OFFSET`. SL at `entry × (1 - SL_PCT)` (30% default). T1/T2 at `T1_MULT`/`T2_MULT` on premium, `T1_BOOK_FRACTION` booked at T1.
+- **Booking:** goes through `OrderManager.submit_external_signal` into the **shared paper book** — same monitor/fill-alerts/auto-exit/EOD/analytics pipeline as discount and Break-and-Bounce. `MODE` (`off`/`alert`/`paper`, env `VOL_EXP_MODE`, default `paper`) gates whether candidates are scanned-only-and-alerted or actually booked; paper only, no real orders regardless of mode.
+- **Schedule:** scans at `SCAN_TIMES` (default 09:45, 11:00, 13:00 — the daily-IV signal changes slowly, so a few scans are enough to catch freshly-qualifying names), entry cutoff `ENTRY_CUTOFF` (13:30), monitor every `MONITOR_INTERVAL_MIN` min until `MONITOR_UNTIL`, square-off at `SQUARE_OFF`, EOD summary at `EOD_SUMMARY_AT` (15:20/15:25).
+- **Cap:** `MAX_TRADES_PER_DAY` (default 3).
 
 ---
 
