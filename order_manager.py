@@ -33,6 +33,14 @@ def _resolve_mode(key: str, fallback: str) -> str:
     except Exception:
         return fallback
 
+
+def _resolve_limit(key: str, fallback: float) -> float:
+    """Settings-DB override for a numeric flag (UI toggle), else `fallback`."""
+    try:
+        return settings_store.flag_float(key)
+    except Exception:
+        return fallback
+
 # ---- portfolio concentration limits (review §3.7) -------------------------- #
 # Dedup alone allows 5 same-sector same-direction CEs — one correlated bet at
 # 5x intended risk. These caps count OPEN positions + candidates in-batch.
@@ -136,6 +144,36 @@ def place_bracket_order(dhan, strike_data: dict, lots: int, lot_size: int,
         return {"status": "exception"}
 
 
+def book_day_pnl_rupees(trades, include_open: bool = True) -> float:
+    """Today's book P&L in rupees across ALL strategies (review 2026-07-09 §3.1).
+
+    Pure — pass `book.all_trades(date)`. Closed trades contribute their NET
+    `realized_rupees`; open trades contribute a MARKED estimate: points already
+    booked plus the open remainder marked at the last monitored price, times the
+    lot size. Costs are only realized on close, so the marked leg is gross.
+    Robust to missing/None fields (fail-soft to 0 for that trade).
+    """
+    total = 0.0
+    for t in trades or []:
+        status = str(t.get("status") or "").lower()
+        if status == "closed":
+            total += float(t.get("realized_rupees") or 0.0)
+        elif include_open and status == "open":
+            try:
+                entry = float(t.get("entry") or 0.0)
+                _lp = t.get("last_price")
+                last = float(_lp) if _lp is not None else entry
+                lot = int(t.get("lot_size") or 1)
+                booked = float(t.get("booked_points") or 0.0)
+                _qf = t.get("qty_frac")
+                qty_frac = float(_qf) if _qf is not None else 1.0
+                marked_points = booked + (last - entry) * qty_frac
+                total += marked_points * lot
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
 class OrderManager:
     """Owns the trade book and the open-position lifecycle (paper backend)."""
 
@@ -147,6 +185,7 @@ class OrderManager:
         self._warned: set = set()          # (trade_id, risk_type) — dedup intraday alerts
         self._warned_date: str | None = None
         self._gate_alerted: set = set()    # (gate_name, date) — dedup gate-failure alerts
+        self._loss_alerted_date: str | None = None  # dedup daily-loss lockout alert
 
     def _alert_gate_failure(self, gate_name: str) -> None:
         """A gate that crashes fails OPEN — candidates pass unfiltered. That is
@@ -168,12 +207,64 @@ class OrderManager:
         except Exception:
             logger.exception("gate-failure alert could not be sent")
 
+    # ---- book-level daily-loss lockout (review 2026-07-09 §3.1) ------------ #
+    def _daily_loss_locked(self, book, now=None) -> tuple[bool, float]:
+        """Return (locked, day_pnl_rupees). Config-gated (daily_loss_config):
+        off -> never locks; soft -> logs the would-be lockout; hard -> locks new
+        entries once the day is down past the floor. Fail-open (never locks on
+        an internal error, but fires a loud gate-failure alert)."""
+        try:
+            import daily_loss_config as cfg
+            mode = _resolve_mode("DAILY_LOSS_GATE_MODE", cfg.MODE)
+            limit = _resolve_limit("DAILY_LOSS_LIMIT_RUPEES", cfg.LIMIT_RUPEES)
+            if mode == "off" or not limit or limit <= 0:
+                return False, 0.0
+            today = (now or datetime.now()).date().isoformat()
+            pnl = book_day_pnl_rupees(book.all_trades(today), include_open=cfg.INCLUDE_OPEN)
+            if pnl <= -abs(limit):
+                if mode == "soft":
+                    logger.info("DAILY-LOSS (soft) would lock new entries — day P&L "
+                                "Rs %.0f <= -Rs %.0f", pnl, abs(limit))
+                    return False, pnl
+                logger.info("DAILY-LOSS lockout — day P&L Rs %.0f <= -Rs %.0f; "
+                            "blocking new entries", pnl, abs(limit))
+                self._alert_daily_loss(pnl, abs(limit), now)
+                return True, pnl
+            return False, pnl
+        except Exception:
+            logger.exception("daily-loss guard failed; not locking (fail-open)")
+            self._alert_gate_failure("daily_loss_guard")
+            return False, 0.0
+
+    def _alert_daily_loss(self, pnl: float, limit: float, now=None) -> None:
+        """One Telegram alert the first time the lockout engages each day."""
+        today = (now or datetime.now()).date().isoformat()
+        if self._loss_alerted_date == today:
+            return
+        self._loss_alerted_date = today
+        try:
+            import notifications
+            notifications.notify(
+                f"\U0001F6D1 <b>DAILY-LOSS LOCKOUT</b>\n"
+                f"Day P&L Rs {pnl:,.0f} <= -Rs {limit:,.0f}. No new paper entries for "
+                f"the rest of the session; open positions are still managed.",
+                bot_token=self.bot_token, chat_id=self.chat_id,
+            )
+        except Exception:
+            logger.exception("daily-loss alert could not be sent")
+
     # ---- intake: a scanner hands booked signals to the manager ------------- #
     def submit_signals(self, opportunities, now=None, lot_size_fn=None):
         """Book the top qualifying signals (caps / dedup / cutoff enforced by
         paper_trader.process_signals). Applies the pre-market quality gate
         (IVR / IV-HV / OTM% / PCR / position-cap) and the composite entry
         gate before reaching paper_trader. Returns the list of opened signals."""
+        # Book-level daily-loss lockout — checked FIRST so a losing day can't
+        # keep adding new risk (open positions are still managed by track()).
+        locked, day_pnl = self._daily_loss_locked(self.book, now)
+        if locked:
+            logger.info("OrderManager: daily-loss lockout (day P&L Rs %.0f) — no new entries", day_pnl)
+            return []
         opportunities = self._apply_pre_market_gate(opportunities, self.book)
         opportunities = self._apply_breadth_gate(opportunities)
         opportunities = self._apply_entry_gate(opportunities)
@@ -201,6 +292,11 @@ class OrderManager:
         """
         sig = dict(signal)
         sig.setdefault("strategy", "External")
+        locked, day_pnl = self._daily_loss_locked(self.book, now)
+        if locked:
+            logger.info("OrderManager: daily-loss lockout (day P&L Rs %.0f) — rejecting external %s",
+                        day_pnl, sig.get("symbol"))
+            return None
         # External strategies own their own daily cap, so skip the shared Gate-5
         # simultaneous-position cap here (the discount scanner would otherwise
         # fill those 2 slots first and block every B&B trade). Quality gates and

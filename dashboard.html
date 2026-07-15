@@ -512,6 +512,10 @@
               <span class="status-label">Expansion leaderboard is universe-wide</span>
             </div>
           </div>
+          <div class="card table-scroll" style="margin-bottom:16px">
+            <div class="section-label" style="margin-bottom:12px">★ Buy Zone — EXPANDING &amp; still cheap (long-premium candidates)</div>
+            <div id="an-buyzone"><div class="loading">Loading…</div></div>
+          </div>
           <div class="grid-2">
             <div class="card">
               <div class="section-label" style="margin-bottom:12px">I · IV Percentile — buyer rule</div>
@@ -1618,6 +1622,7 @@ async function fillIvpStat(symbol) {
 
 async function loadAnalytics() {
   const sym = ($('an-symbol').value || '').trim().toUpperCase();
+  loadAnBuyZone();
   loadAnExpansion();
   loadAnDecay(sym || null);
   if (sym) { loadAnIvp(sym); loadAnTilt(sym); }
@@ -1673,6 +1678,32 @@ async function loadAnExpansion() {
       <thead><tr><th>Symbol</th><th>Slope</th><th>IV ${d.lookback_days}d</th><th>Δ%</th><th>IVP</th><th>Buy zone</th><th>Status</th></tr></thead>
       <tbody>${rows}</tbody></table>
       <div class="status-label" style="margin-top:8px">${d.expanding_count} expanding · trade rule: EXPANDING + BUY ZONE = long premium (Vega) candidate; EXPANDING + RICH = chase, skip · ${d.note}</div>`;
+  } catch(e) {
+    el.innerHTML = `<div class="error-msg">${e.message}</div>`;
+  }
+}
+
+async function loadAnBuyZone() {
+  const el = $('an-buyzone');
+  try {
+    const d = await api('/api/analytics/buy-zone?days=4&limit=25');
+    if (!d.symbols.length) {
+      el.innerHTML = `<div class="empty-state">No names are EXPANDING and cheap right now (scanned ${d.scanned}). Best buyer setups appear here when IV is climbing while IVP is still in the buy zone.</div>`;
+      return;
+    }
+    const rows = d.symbols.map((s, i) => `<tr>
+      <td style="color:var(--text);font-weight:600">${i + 1}. ${s.symbol}</td>
+      <td class="pnl-pos">+${s.slope_iv_pts_per_day}/d</td>
+      <td>${s.iv_start}% → ${s.iv_now}%</td>
+      <td class="${s.change_pct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${s.change_pct >= 0 ? '+' : ''}${s.change_pct}%</td>
+      <td>${s.iv_percentile != null ? s.iv_percentile : '—'}</td>
+      <td style="color:var(--text);font-weight:600">${s.buy_score}</td>
+      <td><span class="tag win" title="IVP ${s.iv_percentile ?? '—'} — climbing while still cheap">BUY ZONE</span></td>
+    </tr>`).join('');
+    el.innerHTML = `<table class="data-table">
+      <thead><tr><th>#  Symbol</th><th>Slope</th><th>IV ${d.lookback_days}d</th><th>Δ%</th><th>IVP</th><th>Buy score</th><th>Zone</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+      <div class="status-label" style="margin-top:8px">${d.count} buy-zone of ${d.scanned} expanding scanned · ${d.rule}</div>`;
   } catch(e) {
     el.innerHTML = `<div class="error-msg">${e.message}</div>`;
   }

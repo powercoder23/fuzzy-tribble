@@ -232,6 +232,17 @@ FEATURE_FLAGS = [
      "label": "Max paper trades per symbol / day",
      "help": "One underlying can't take more than this many paper trades a day. "
              "0 disables the cap."},
+    {"key": "DAILY_LOSS_GATE_MODE", "type": "enum", "values": ["off", "soft", "hard"],
+     "default": "off", "env": "DAILY_LOSS_GATE_MODE",
+     "label": "Daily-loss lockout",
+     "help": "Stop booking NEW entries once the day's realized+open P&L across the "
+             "whole paper book falls to -limit. soft = log only, hard = block. "
+             "Open positions are still managed."},
+    {"key": "DAILY_LOSS_LIMIT_RUPEES", "type": "float", "default": 5000.0,
+     "env": "DAILY_LOSS_LIMIT_RUPEES",
+     "label": "Daily-loss limit (Rs)",
+     "help": "Book-wide loss floor in rupees. New entries stop when the day's P&L "
+             "<= -this value. 0 disables the guard."},
 ]
 _FLAG_BY_KEY = {f["key"]: f for f in FEATURE_FLAGS}
 

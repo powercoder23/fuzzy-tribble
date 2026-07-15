@@ -55,15 +55,22 @@ VOLATILITY_STRATEGY = "Volatility Expansion Play"
 # Pure exit-state-machine (unit-testable, no DB / no API)
 # ---------------------------------------------------------------------------
 
-def new_trade_runtime(entry, sl, t1, t2, t1_book_fraction, lot_size=1):
-    """Return the mutable runtime fields for a fresh open paper trade."""
+def new_trade_runtime(entry, sl, t1, t2, t1_book_fraction, lot_size=None):
+    """Return the mutable runtime fields for a fresh open paper trade.
+
+    lot_size is the option contract multiplier and is always >= 1 for a real
+    F&O booking (even the lot-sizer's degraded fallback of 1). Pure state-machine
+    unit tests pass lot_size=None to opt out of the fee model - the explicit
+    "no lot context" sentinel introduced for review 2026-07-09 INTEG-1, which
+    replaces overloading lot_size == 1 to mean "skip costs".
+    """
     return {
         "entry": float(entry),
         "sl": float(sl),
         "t1": float(t1),
         "t2": float(t2),
         "t1_book_fraction": float(t1_book_fraction),
-        "lot_size": int(lot_size or 1),
+        "lot_size": (int(lot_size) if lot_size else None),
         "status": "open",
         "t1_done": 0,
         "qty_frac": 1.0,
@@ -104,21 +111,31 @@ def _finalize(trade, reason):
     trade["exit_reason"] = reason
     gross = trade["booked_points"]
     entry = trade["entry"]
-    lot = trade.get("lot_size", 1) or 1
+    raw_lot = trade.get("lot_size")
+    lot = int(raw_lot) if raw_lot else 1
 
     half_spread = float(trade.get("half_spread") or 0.0)
     slippage = 2.0 * half_spread
 
     costs_total = 0.0
-    if lot > 1 and entry:
+    # Apply the NSE fee model to EVERY real trade. lot_size is a contract
+    # multiplier (>= 1 for F&O, even the lot-sizer's degraded fallback of 1),
+    # so `raw_lot is not None` is the real-trade sentinel; only pure
+    # state-machine fixtures pass lot_size=None to opt out. (review 2026-07-09
+    # INTEG-1: the old `lot > 1` gate silently booked ZERO costs for every
+    # trade on a day the sizer fell back to 1, inflating paper P&L precisely
+    # when infrastructure was degraded.)
+    if raw_lot is not None and entry:
         try:
             import costs as _costs
             buy_px = entry + half_spread
             sell_px = max(entry + gross - half_spread, 0.0)
-            n_orders = 3 if trade.get("t1_done") else 2
+            # A full T1 book ("Target full") and any pre-T1 exit are 2 orders
+            # (one buy + one sell); a partial T1 that later exits its runner is 3.
+            n_orders = 3 if (trade.get("t1_done") and reason != "Target full") else 2
             costs_total = _costs.option_trade_costs(buy_px, sell_px, lot, n_orders)["total"]
         except Exception:
-            logger.debug("costs unavailable — finalizing without fee model")
+            logger.debug("costs unavailable - finalizing without fee model")
 
     net = gross - slippage
     trade["gross_points"] = round(gross, 4)

@@ -1195,7 +1195,7 @@ class BreakBounceStrategyRunner:
                     _bb_signal = {
                         "symbol":            symbol,
                         "security_id":       sec_id,
-                        "exchange_segment":  exchange_segment,
+                        "exchange_segment":  seg,
                         "side":              side,
                         "strike":            strike_data.get("strike"),
                         "expiry":            expiry,
@@ -1230,8 +1230,9 @@ class BreakBounceStrategyRunner:
                     else:
                         logger.info("B&B paper trade not booked (gate/guard): %s %s",
                                     symbol, side)
-                except Exception as _e:
-                    logger.warning("B&B paper booking failed (non-fatal): %s", _e)
+                except Exception:
+                    logger.exception("B&B paper booking failed (non-fatal) for %s %s",
+                                     symbol, side)
 
                 risk_data = {
                     "qty":      lots * lot_size,

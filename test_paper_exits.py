@@ -62,6 +62,42 @@ def test_full_target_no_longer_lingers_to_square_off():
     assert t["exit_reason"] == "Target full"
 
 
+# -- INTEG-1: costs must not be silently skipped when lot sizer falls back ---
+
+def test_real_lot_books_costs_even_at_lot_1():
+    # Degraded lot-sizer fallback (lot_size == 1) is still a REAL trade and must
+    # carry the fee model - the old `lot > 1` gate booked ZERO costs here.
+    t = new_trade_runtime(entry=100, sl=85, t1=125, t2=125,
+                          t1_book_fraction=1.0, lot_size=1)
+    t["half_spread"] = 0.5
+    apply_tick(t, 126)
+    assert t["costs_rupees"] > 0, "a real 1-lot trade must book non-zero costs"
+
+
+def test_none_lot_opts_out_of_costs():
+    # Pure state-machine fixture: no lot context -> zero costs.
+    t = new_trade_runtime(entry=100, sl=85, t1=125, t2=125,
+                          t1_book_fraction=1.0, lot_size=None)
+    apply_tick(t, 126)
+    assert t["costs_rupees"] == 0.0, "lot_size=None must skip the fee model"
+    assert t["lot_size"] is None
+
+
+def test_full_book_costs_two_orders_not_three():
+    # "Target full" is one buy + one sell (2 orders), not 3.
+    full = new_trade_runtime(entry=100, sl=85, t1=125, t2=125,
+                             t1_book_fraction=1.0, lot_size=500)
+    full["half_spread"] = 0.5
+    apply_tick(full, 126)                 # -> "Target full"
+    partial = new_trade_runtime(entry=100, sl=85, t1=125, t2=145,
+                                t1_book_fraction=0.7, lot_size=500)
+    partial["half_spread"] = 0.5
+    apply_tick(partial, 126)              # T1 partial
+    apply_tick(partial, 146)              # -> T2 (3 orders)
+    assert full["costs_rupees"] < partial["costs_rupees"], \
+        "full T1 book (2 orders) should cost less than a partial-then-runner (3 orders)"
+
+
 # -- BUG-2: stale sonar rows must not veto entries ---------------------------
 
 def _mk_row(symbol="CIPLA", sec_id="1234"):

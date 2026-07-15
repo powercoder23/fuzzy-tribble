@@ -314,6 +314,14 @@ def analytics_expansion(days: int = Query(4, ge=3, le=10),
     return iv_analytics.vol_expansion(lookback_days=days, top_n=limit)
 
 
+@app.get("/api/analytics/buy-zone")
+def analytics_buy_zone(days: int = Query(4, ge=3, le=10),
+                       limit: int = Query(25, ge=1, le=50)):
+    """EXPANDING and still-cheap (IVP buy zone) names - the prime long-
+    premium buyer setup. Scans the full expanding set, not just top-by-slope."""
+    return iv_analytics.buy_zone_leaderboard(lookback_days=days, limit=limit)
+
+
 @app.get("/api/analytics/decay")
 def analytics_decay(symbol: Optional[str] = None,
                     days: int = Query(10, ge=1, le=60)):

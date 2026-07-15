@@ -112,17 +112,16 @@ def iv_percentile(symbol: str) -> dict:
 
 
 # ── II. Volatility Expansion (3-4 day IV slope) ──────────────────────────── #
-def vol_expansion(lookback_days: int = 4, top_n: int = 15) -> dict:
-    """Per-symbol slope of the last `lookback_days` daily ATM IV points.
-    Steep positive slope = premium expansion under way (the pre-event
-    signature) — detected from IV data; NO event calendar is collected."""
+def _expansion_rows(lookback_days: int = 4) -> list[dict]:
+    """Full per-symbol IV-slope list (unenriched), sorted steepest-first.
+    Shared by vol_expansion (leaderboard) and buy_zone_leaderboard."""
     rows = _q("""
         SELECT symbol, date(timestamp) AS d, atm_iv
         FROM   iv_history
         WHERE  data_type = 'daily' AND atm_iv BETWEEN 1 AND 200
           AND  date(timestamp) >= date('now', ?)
         ORDER  BY symbol, d ASC
-    """, (f"-{lookback_days + 3} days",))  # pad for weekends/holidays
+    """, (f"-{lookback_days + 3} days",))
 
     by_sym: dict[str, list[float]] = {}
     for r in rows:
@@ -134,7 +133,6 @@ def vol_expansion(lookback_days: int = 4, top_n: int = 15) -> dict:
         n = len(ivs)
         if n < 3:
             continue
-        # least-squares slope in IV points per day
         xm, ym = (n - 1) / 2, sum(ivs) / n
         denom = sum((i - xm) ** 2 for i in range(n))
         slope = sum((i - xm) * (ivs[i] - ym) for i in range(n)) / denom if denom else 0.0
@@ -146,9 +144,17 @@ def vol_expansion(lookback_days: int = 4, top_n: int = 15) -> dict:
             "iv_now": round(ivs[-1], 1),
             "change_pct": round(chg_pct, 1),
             "n_days": n,
-            "expanding": slope > 0.5,   # >0.5 IV pts/day = meaningful climb
+            "expanding": slope > 0.5,
         })
     out.sort(key=lambda x: x["slope_iv_pts_per_day"], reverse=True)
+    return out
+
+
+def vol_expansion(lookback_days: int = 4, top_n: int = 15) -> dict:
+    """Per-symbol slope of the last `lookback_days` daily ATM IV points.
+    Steep positive slope = premium expansion under way (the pre-event
+    signature) — detected from IV data; NO event calendar is collected."""
+    out = _expansion_rows(lookback_days)
     # Buy-zone enrichment (top rows only — one IVP lookup per displayed
     # symbol). The tradeable pattern is the COMBINATION: IV climbing (slope)
     # while STILL cheap on 52-week history (IVP in the buy zone) → long
@@ -173,6 +179,52 @@ def vol_expansion(lookback_days: int = 4, top_n: int = 15) -> dict:
 
 
 # ── III. Intraday IV Decay Curve (15-min buckets) ────────────────────────── #
+def buy_zone_leaderboard(lookback_days: int = 4, scan_n: int = 60,
+                         limit: int = 25, min_slope: float = 0.5) -> dict:
+    """The prime long-premium buyer setup: IV *climbing* (positive slope) while
+    *still cheap* on 52-wk history (IVP in the buy zone). Unlike vol_expansion,
+    which enriches only the top-`top_n` by slope, this scans the top `scan_n`
+    expanding names for IVP so a modestly-climbing-but-cheap name is not missed,
+    then keeps only BUY-verdict rows and ranks them by a climb x cheapness blend.
+
+    buy_score = slope * (1 - IVP/100): rewards a steeper climb AND a lower
+    percentile, so a cheap name that is climbing outranks a rich name climbing
+    faster (the latter is a vol-crush chase, not a buy)."""
+    rows = [r for r in _expansion_rows(lookback_days)
+            if r["slope_iv_pts_per_day"] >= min_slope][:scan_n]
+
+    picks = []
+    for row in rows:
+        try:
+            ivp = iv_percentile(row["symbol"])
+        except Exception:
+            continue
+        ivp_val = ivp.get("iv_percentile")
+        if ivp.get("verdict") != "BUY" or ivp_val is None:
+            continue
+        buy_score = row["slope_iv_pts_per_day"] * (1.0 - ivp_val / 100.0)
+        picks.append({
+            **row,
+            "iv_percentile": ivp_val,
+            "iv_rank": ivp.get("iv_rank"),
+            "buy_zone": "BUY",
+            "buy_score": round(buy_score, 2),
+        })
+
+    picks.sort(key=lambda x: x["buy_score"], reverse=True)
+    return {
+        "lookback_days": lookback_days,
+        "rule": f"EXPANDING (slope >= {min_slope}/d) AND IVP < {IVP_BUY_BELOW:.0f} "
+                f"(cheap on 52-wk history). Ranked by slope x (1 - IVP/100).",
+        "note": ("Long premium here can win on Vega before the move even "
+                 "resolves. Still cross-check event dates (RBI, budget, "
+                 "earnings) manually - no economic-calendar collector exists."),
+        "scanned": len(rows),
+        "count": len(picks),
+        "symbols": picks[:limit],
+    }
+
+
 def intraday_decay_curve(symbol: str | None = None, days: int = 10) -> dict:
     """Average ATM IV per 15-minute bucket over the last `days` sessions.
     symbol=None → cross-sectional average over the whole tracked universe.
