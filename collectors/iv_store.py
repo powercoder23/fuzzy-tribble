@@ -157,7 +157,7 @@ def save_snapshot(
     total_put_volume: float = None,
     max_oi_strike_call: float = None,
     max_oi_strike_put: float = None,
-    data_type: str = "daily",
+    data_type: str = "intraday",  # was "daily": a caller that omits this must NOT write a daily row (see NAS/pollution cleanup 2026-07-19)
     fetched_at: datetime = None,
 ) -> bool:
     """

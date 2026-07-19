@@ -10,7 +10,7 @@ from **Upstox** via `upstox_adapter.UpstoxDhanAdapter` (a Dhan-surface shim —
 the internal data contract still uses the Dhan response shape). Dhan is NOT
 used for data; it is reserved only for possible future live order placement.
 
-## Service layout (docker-compose.yml — current reality)
+## Service layout (docker-compose.prod.yml — current reality)
 
 | #  | Service         | Container               | Entry                            | Default up? | Trades? |
 |----|-----------------|-------------------------|----------------------------------|-------------|---------|

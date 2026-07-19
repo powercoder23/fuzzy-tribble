@@ -38,15 +38,29 @@ def exchange_segment(symbol: str) -> str:
 
 def underlying_bias(symbol: str, min_move_pct: float = 1.0, lookback: int = 6) -> str | None:
     """CE / PE / None from the underlying's recent daily spot trend in
-    iv_history (zero broker calls). A move inside +/-min_move_pct reads as no
-    trend (None) — don't force a directional bet on a pure-vega signal."""
+    iv_history (zero broker calls).
+
+    Deduplicated to ONE spot per calendar day (the last row of the day) before
+    taking `lookback` samples, so a polluted history (multiple 'daily' rows per
+    day - see iv_store.get_iv_history / ARCHITECTURE_REVIEW_P0 s2.1) cannot
+    silently collapse the intended N-day window into a few intraday points and
+    turn the direction into noise. Uses rowid (== id on the real table, and the
+    implicit rowid on the test schema) to pick the last row of each day.
+
+    A move inside +/-min_move_pct reads as no trend (None) - don't force a
+    directional bet on a pure-vega signal.
+    """
     try:
         with sqlite3.connect(IV_DB) as conn:
             conn.execute("PRAGMA busy_timeout=30000")
             rows = conn.execute(
-                "SELECT spot_price FROM iv_history "
-                "WHERE symbol = ? AND data_type = 'daily' AND spot_price > 0 "
-                "ORDER BY timestamp DESC LIMIT ?",
+                "SELECT spot_price FROM iv_history AS h "
+                "WHERE h.symbol = ? AND h.data_type = 'daily' AND h.spot_price > 0 "
+                "  AND h.rowid = ("
+                "        SELECT MAX(i2.rowid) FROM iv_history i2 "
+                "        WHERE i2.symbol = h.symbol AND i2.data_type = 'daily' "
+                "          AND DATE(i2.timestamp) = DATE(h.timestamp)) "
+                "ORDER BY h.timestamp DESC LIMIT ?",
                 (symbol, lookback),
             ).fetchall()
     except sqlite3.Error:
@@ -60,6 +74,58 @@ def underlying_bias(symbol: str, min_move_pct: float = 1.0, lookback: int = 6) -
     if change_pct <= -min_move_pct:
         return "PE"
     return None
+
+
+def composite_direction(symbol: str, max_age_days: int = 4,
+                        min_grade: str = "MODERATE") -> str | None:
+    """CE / PE from the composite conviction engine (composite_history) - a
+    multi-factor, direction-aware buyer signal (OI-buildup, smart-money,
+    delivery-surge, gap). Returns the side of the most recent stored row for
+    `symbol` within `max_age_days`, or None if there is no fresh row, the table
+    does not exist yet, or the row is below `min_grade`.
+
+    composite_history only stores MODERATE/STRONG directional rows (WEAK / NONE
+    are dropped at scan time), so this never returns low-conviction noise.
+    """
+    allowed = {"STRONG": ("STRONG",)}.get(
+        (min_grade or "").upper(), ("MODERATE", "STRONG"))
+    try:
+        with sqlite3.connect(IV_DB) as conn:
+            conn.execute("PRAGMA busy_timeout=30000")
+            r = conn.execute(
+                "SELECT direction, grade FROM composite_history "
+                "WHERE symbol = ? AND direction IN ('CE', 'PE') "
+                "  AND timestamp >= datetime('now', 'localtime', ?) "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (symbol, f"-{int(max_age_days)} days"),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not r:
+        return None
+    direction, grade = r[0], (r[1] or "").upper()
+    if grade not in allowed:
+        return None
+    return direction
+
+
+def pick_direction(symbol: str) -> tuple[str | None, str]:
+    """Choose CE/PE for a vol-expansion candidate.
+
+    Primary source is the composite conviction engine (a real, multi-factor
+    directional read); the hardened spot-momentum rule is only a fallback for
+    names the composite has not scored. Returns (side, source) where side may be
+    None (no lean) and source is one of 'composite' / 'momentum' / 'none'.
+    """
+    if CFG.DIRECTION_SOURCE == "composite":
+        side = composite_direction(
+            symbol, CFG.COMPOSITE_MAX_AGE_DAYS, CFG.COMPOSITE_MIN_GRADE)
+        if side:
+            return side, "composite"
+        if not CFG.COMPOSITE_FALLBACK_MOMENTUM:
+            return None, "none"
+    side = underlying_bias(symbol, CFG.MIN_MOVE_PCT, CFG.TREND_LOOKBACK)
+    return (side, "momentum") if side else (None, "none")
 
 
 def select_atm_option(oc: dict, spot: float, side: str, offset: int = 0):
@@ -141,16 +207,18 @@ class VolExpansionStrategy:
                 logger.info("VolExp: no security_id for %s — skip", symbol)
                 continue
 
-            side = underlying_bias(symbol, CFG.MIN_MOVE_PCT, CFG.TREND_LOOKBACK)
+            side, dir_source = pick_direction(symbol)
             if side is None:
                 if CFG.REQUIRE_TREND:
-                    logger.info("VolExp: %s expanding but no clear trend — skip", symbol)
+                    logger.info("VolExp: %s expanding but no directional lean "
+                                "(source=%s) — skip", symbol, CFG.DIRECTION_SOURCE)
                     continue
-                side = "CE"
+                side, dir_source = "CE", "default"
 
             sig = self._build_signal(symbol, sid, side, row, now)
             if not sig:
                 continue
+            sig["dir_source"] = dir_source
 
             if CFG.MODE == "alert":
                 self._alert(sig)
@@ -159,8 +227,8 @@ class VolExpansionStrategy:
             else:  # paper — submit_external_signal fires the PAPER-TRADE-TAKEN alert
                 booked = self.order_manager.submit_external_signal(sig, now=now)
                 if booked:
-                    logger.info("VolExp booked %s %s K%s [%s]", symbol, side,
-                                sig["strike"], CFG.STRATEGY_TAG)
+                    logger.info("VolExp booked %s %s K%s [%s] dir=%s", symbol, side,
+                                sig["strike"], CFG.STRATEGY_TAG, dir_source)
                     out.append(booked)
                     self._traded_today.add(symbol)
                 else:
@@ -244,7 +312,8 @@ class VolExpansionStrategy:
     def _alert(self, sig) -> None:
         try:
             notifications.notify(
-                f"\U0001F4C8 <b>VOL-EXPANSION signal</b> ({sig['side']})\n"
+                f"\U0001F4C8 <b>VOL-EXPANSION signal</b> ({sig['side']}"
+                f" · dir:{sig.get('dir_source', '?')})\n"
                 f"{sig['symbol']} K{sig['strike']} @ Rs {sig['entry']:.2f}\n"
                 f"IV slope {sig.get('iv_slope')}/d · IVP {sig.get('iv_percentile')}\n"
                 f"SL {sig['sl']:.2f} · T1 {sig['t1']:.2f} · T2 {sig['t2']:.2f}\n"
