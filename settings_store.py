@@ -225,9 +225,9 @@ FEATURE_FLAGS = [
              "are detected (step 2 of 3, before any retest/entry). Off = only "
              "entry-signal and paper-trade alerts."},
     {"key": "MAX_RISK_RUPEES", "type": "float", "default": 1500.0, "env": None,
-     "label": "Discount max risk / trade (Rs)",
-     "help": "Skip a discount signal whose 1-lot risk (entry-sl)*lot exceeds "
-             "this. 0 disables the cap. (Does not affect B&B.)"},
+     "label": "Max risk / trade (Rs)",
+     "help": "Skip any paper-trade signal (discount, B&B, Vol-Expansion) whose "
+             "1-lot risk (entry-sl)*lot exceeds this. 0 disables the cap."},
     {"key": "MAX_PER_SYMBOL_PER_DAY", "type": "int", "default": 1, "env": None,
      "label": "Max paper trades per symbol / day",
      "help": "One underlying can't take more than this many paper trades a day. "

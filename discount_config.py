@@ -136,10 +136,12 @@ INTRADAY = {
     "max_per_symbol_per_day": 1,  # at most N paper trades per underlying per day
                                   # (stops one symbol — e.g. ABCAPITAL — eating
                                   # every slot via different strikes)
-    "max_risk_rupees": 3000.0,    # skip a signal whose 1-lot risk
+    "max_risk_rupees": 1500.0,    # skip a signal whose 1-lot risk
                                   # (entry-sl)*lot_size exceeds this budget, so a
                                   # big-lot cheap option can't quietly risk 5x a
-                                  # small-lot one. 0/None disables the cap.
+                                  # small-lot one. 0/None disables the cap. Hard
+                                  # ceiling applied to EVERY paper-trade strategy
+                                  # (see paper_trader.book_signal), not just discount.
 }
 
 # --- Universe (DISCOUNT SCANNER ONLY) -----------------------------------

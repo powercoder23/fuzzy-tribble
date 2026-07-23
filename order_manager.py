@@ -286,7 +286,9 @@ class OrderManager:
         and breadth — then books with the signal's own `strategy` tag so it
         flows through the same monitor / fill alerts / auto-exit / EOD /
         analytics as discount trades. It deliberately does NOT apply the
-        discount's Sonar side-override or the discount's shared 5-trade cap.
+        discount's Sonar side-override or the discount's shared 5-trade cap,
+        but the hard max_risk_rupees cap (₹1500 default) IS enforced here via
+        paper_trader.book_signal, same ceiling as the discount path.
 
         Returns the booked signal dict, or None if a gate or guard rejected it.
         """

@@ -777,9 +777,11 @@ def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
     """Book ONE already-vetted signal into paper_trades.db, regardless of
     strategy. Unlike `process_signals` this applies NO discount-specific logic
     (no Volatility-Play filter, no Sonar side-override, no shared daily cap) —
-    the caller owns selection. Enforces only the universal guards: entry cutoff,
-    per symbol+strike+side dedup, and the min-premium floor. Sends the standard
-    "PAPER TRADE TAKEN" alert. Returns the booked signal dict, or None.
+    the caller owns selection. Enforces the universal guards: entry cutoff,
+    per symbol+strike+side dedup, the min-premium floor, and the hard
+    max_risk_rupees cap (₹1500 default — same ceiling as the discount path).
+    Sends the standard "PAPER TRADE TAKEN" alert. Returns the booked signal
+    dict, or None.
 
     Used by OrderManager.submit_external_signal so non-discount strategies
     (e.g. Break & Bounce) land in the same book / EOD / monitor / risk pipeline
@@ -820,9 +822,20 @@ def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
                     symbol, side, float(signal.get("entry") or 0), min_prem)
         return None
 
-    # NOTE: the rupee-risk cap is deliberately NOT applied here. External
-    # strategies (e.g. Break & Bounce) own their own SL/sizing model; the
-    # max_risk_rupees budget only governs the discount path (process_signals).
+    # Hard rupee-risk cap — applies to EVERY strategy that lands here (B&B,
+    # Vol-Expansion, etc.), not just the discount path. A big-lot cheap option
+    # must not risk many multiples of a small-lot one. (entry-sl)*lot_size is
+    # the 1-lot risk. 0/None (max_risk_rupees) disables the cap.
+    max_risk = _max_risk_rupees()
+    if max_risk:
+        risk = _risk_rupees(signal)
+        if risk > max_risk:
+            logger.info("book_signal: risk cap — skipping %s %s: 1-lot risk ₹%.0f > ₹%.0f "
+                        "(entry ₹%.2f, sl ₹%.2f, lot %s) [%s]",
+                        symbol, side, risk, max_risk,
+                        float(signal.get("entry") or 0), float(signal.get("sl") or 0),
+                        signal.get("lot_size"), signal.get("strategy", VOLATILITY_STRATEGY))
+            return None
 
     # External strategies (e.g. B&B) may not pre-fill the honest-economics
     # fields — capture them here so every booked trade carries them.
