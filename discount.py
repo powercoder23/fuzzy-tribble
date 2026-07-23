@@ -854,25 +854,28 @@ class DiscountedPremiumScanner:
             self._daily_candle_cache[cache_key] = df.copy()
         return df
 
-    def fetch_historical_iv(self, security_id, exchange_segment, lookback_days=252):
+    def fetch_historical_iv(self, security_id, exchange_segment, lookback_days=252, include_intraday=False):
         """
         Load persisted ATM IV history for IV Rank / IV Percentile calculations.
-        
+
         Args:
             security_id: Security ID
             exchange_segment: Exchange segment
             lookback_days: Number of days to look back
-        
+            include_intraday: If False (default), only 'daily' rows are used.
+                If True, all rows regardless of data_type are included.
+
         Returns:
             list: Historical ATM IV values
         """
         try:
             conn = sqlite3.connect(DB_PATH)
-            query = """
+            data_type_filter = "" if include_intraday else "AND data_type = 'daily'"
+            query = f"""
             SELECT atm_iv, timestamp
             FROM iv_history
             WHERE security_id = ?
-            AND data_type = 'daily'
+            {data_type_filter}
             ORDER BY timestamp ASC
             """
             df = pd.read_sql(query, conn, params=(str(security_id),))

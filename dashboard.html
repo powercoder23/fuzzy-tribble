@@ -1164,7 +1164,7 @@ function tradesTable(trades, showTotal = true) {
       : '—';
     const exitPx = (t.status !== 'open' && t.last_price != null) ? `₹${t.last_price.toFixed(2)}` : '—';
     const tgt = (t.t1 != null && +t.t1 > 0) ? `₹${(+t.t1).toFixed(2)}` : '—';
-    const tgtTitle = (t.t2 != null && +t.t2 > 0 && +t.t2 !== +t.t1) ? `T1 ₹${(+t.t1).toFixed(2)} · T2 ₹${(+t.t2).toFixed(2)}` : 'Target (T1)';
+    const tgtTitle = 'Target (full exit)';
     const cname = contractName(t);
     return `<tr>
       ${multiDay ? `<td data-label="Date">${(t.date || '').slice(5)}</td>` : ''}
@@ -1799,10 +1799,22 @@ async function loadTrades() {
 function renderTradesSplit(containerId, trades) {
   const openT = (trades || []).filter(t => t.status === 'open');
   const closedT = (trades || []).filter(t => t.status !== 'open');
+  // Single overall P&L across ALL positions (open unrealized + closed
+  // realized), matching the Dhan app — no separate per-section total.
+  let overall = 0, haveAny = false;
+  (trades || []).forEach(t => {
+    const { rupees } = tradePnl(t);
+    if (rupees !== null && rupees !== undefined) { overall += rupees; haveAny = true; }
+  });
+  const overallBar = `<div class="trades-total-bar">
+    <span class="ttb-label">Overall P&amp;L <span class="status-label">(${(trades||[]).length} position${(trades||[]).length === 1 ? '' : 's'})</span></span>
+    <span class="ttb-value ${overall >= 0 ? 'pnl-pos' : 'pnl-neg'}">${haveAny ? fmtPnl(overall) : '—'}</span>
+  </div>`;
   const block = (label, arr) =>
     `<div class="trades-split-label">${label} <span class="status-label">(${arr.length})</span></div>` +
-    tradesTable(arr);
+    tradesTable(arr, false);   // no per-section total; overall bar covers both
   $(containerId).innerHTML =
+    overallBar +
     block('Open positions', openT) +
     '<div style="height:16px"></div>' +
     block('Closed positions', closedT);

@@ -19,47 +19,55 @@ import paper_trader
 from paper_trader import new_trade_runtime, apply_tick
 
 
-# -- BUG-1: full-book single-target plans must close at T1 ------------------
+# -- Single SL + single target: a target hit closes 100% immediately --------
 
-def test_full_target_closes_immediately():
-    t = new_trade_runtime(entry=100, sl=85, t1=125, t2=125,
-                          t1_book_fraction=1.0, lot_size=500)
+def test_target_closes_full_position_immediately():
+    # The core fix: on a target touch the WHOLE position exits at once — no
+    # runner is left open to give profit back later.
+    t = new_trade_runtime(entry=100, sl=85, t1=125, t2=145,
+                          t1_book_fraction=0.7, lot_size=500)
     ev = apply_tick(t, 126)
-    assert ev == ["T1_FULL"], ev
+    assert ev == ["TARGET"], ev
     assert t["status"] == "closed", t["status"]
-    assert t["exit_reason"] == "Target full", t["exit_reason"]
+    assert t["exit_reason"] == "Target", t["exit_reason"]
     assert t["qty_frac"] <= 1e-9
+    # Booked at the target level (125), full size, regardless of t2.
     assert abs(t["gross_points"] - 25.0) < 1e-6, t["gross_points"]
 
 
-def test_partial_t1_keeps_runner_open():
-    t = new_trade_runtime(entry=100, sl=85, t1=125, t2=145,
-                          t1_book_fraction=0.7, lot_size=500)
-    ev = apply_tick(t, 126)
-    assert ev == ["T1"], ev
-    assert t["status"] == "open"
-    assert abs(t["qty_frac"] - 0.3) < 1e-9
-    ev2 = apply_tick(t, 146)
-    assert ev2 == ["T2"], ev2
-    assert t["status"] == "closed"
-    assert t["exit_reason"] == "T2"
-
-
-def test_gap_through_t2_books_t1_and_t2_same_tick():
+def test_target_fills_at_level_even_on_a_gap():
+    # A gap far above the target still books AT the target (conservative fill),
+    # and closes fully — t2 is irrelevant now.
     t = new_trade_runtime(entry=100, sl=85, t1=125, t2=145,
                           t1_book_fraction=0.7, lot_size=500)
     ev = apply_tick(t, 150)
-    assert ev == ["T1", "T2"], ev
+    assert ev == ["TARGET"], ev
     assert t["status"] == "closed"
+    assert abs(t["gross_points"] - 25.0) < 1e-6, t["gross_points"]
 
 
-def test_full_target_no_longer_lingers_to_square_off():
-    t = new_trade_runtime(entry=100, sl=85, t1=125, t2=125,
-                          t1_book_fraction=1.0, lot_size=500)
+def test_closed_target_does_not_reopen_or_change_at_square_off():
+    # Once the target closed the trade, a later square-off tick is a no-op —
+    # the realized profit can't be reduced afterwards.
+    t = new_trade_runtime(entry=100, sl=85, t1=125, t2=145,
+                          t1_book_fraction=0.7, lot_size=500)
     apply_tick(t, 126)
+    booked = t["gross_points"]
     ev = apply_tick(t, 90, square_off=True)
     assert ev == [], ev
-    assert t["exit_reason"] == "Target full"
+    assert t["exit_reason"] == "Target"
+    assert t["gross_points"] == booked
+
+
+def test_sl_closes_full_position():
+    t = new_trade_runtime(entry=100, sl=85, t1=125, t2=145,
+                          t1_book_fraction=0.7, lot_size=500)
+    ev = apply_tick(t, 80)          # gaps through the stop
+    assert ev == ["SL"], ev
+    assert t["status"] == "closed"
+    assert t["exit_reason"] == "SL"
+    assert t["qty_frac"] <= 1e-9
+    assert abs(t["gross_points"] - (-20.0)) < 1e-6, t["gross_points"]  # gap-aware fill
 
 
 # -- INTEG-1: costs must not be silently skipped when lot sizer falls back ---
@@ -83,19 +91,20 @@ def test_none_lot_opts_out_of_costs():
     assert t["lot_size"] is None
 
 
-def test_full_book_costs_two_orders_not_three():
-    # "Target full" is one buy + one sell (2 orders), not 3.
-    full = new_trade_runtime(entry=100, sl=85, t1=125, t2=125,
-                             t1_book_fraction=1.0, lot_size=500)
-    full["half_spread"] = 0.5
-    apply_tick(full, 126)                 # -> "Target full"
-    partial = new_trade_runtime(entry=100, sl=85, t1=125, t2=145,
-                                t1_book_fraction=0.7, lot_size=500)
-    partial["half_spread"] = 0.5
-    apply_tick(partial, 126)              # T1 partial
-    apply_tick(partial, 146)              # -> T2 (3 orders)
-    assert full["costs_rupees"] < partial["costs_rupees"], \
-        "full T1 book (2 orders) should cost less than a partial-then-runner (3 orders)"
+def test_every_exit_is_exactly_two_orders():
+    # No runner any more: a target exit and an SL exit are BOTH one buy + one
+    # sell (2 orders). Given the same booked P&L they book identical costs.
+    tgt = new_trade_runtime(entry=100, sl=85, t1=125, t2=145,
+                            t1_book_fraction=0.7, lot_size=500)
+    tgt["half_spread"] = 0.5
+    apply_tick(tgt, 126)                  # -> Target (full exit, 2 orders)
+    # A second full-exit trade with the SAME gross must cost the same (2 orders).
+    ref = new_trade_runtime(entry=100, sl=85, t1=125, t2=125,
+                            t1_book_fraction=1.0, lot_size=500)
+    ref["half_spread"] = 0.5
+    apply_tick(ref, 130)                  # gaps above target -> books at 125 too
+    assert abs(tgt["costs_rupees"] - ref["costs_rupees"]) < 1e-6, \
+        "single-target exits are always 2 orders -> identical costs for identical gross"
 
 
 # -- BUG-2: stale sonar rows must not veto entries ---------------------------

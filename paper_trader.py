@@ -8,12 +8,11 @@ What it does
    paper trades (one per symbol+strike+side per day, capped per day, no entries
    after INTRADAY["no_entry_after"]).
 2. On each 5-min monitor tick, re-prices every open paper trade against the
-   *actual* option LTP and runs the exit state machine:
-       SL (-15%)            -> full exit
-       T1 (+25%)            -> book t1_book_fraction; move runner stop to breakeven
-       T2 (+45%)            -> exit runner
-       breakeven (post-T1)  -> exit runner at entry
-       15:20 square-off     -> force-close remainder at last price
+   *actual* option LTP and runs the exit state machine (single SL + single
+   target, no runner):
+       SL               -> full exit at the stop (gap-aware)
+       Target           -> full exit at the target (closes 100% immediately)
+       15:20 square-off -> force-close anything still open at last price
 3. Persists everything to paper_trades.db (SQLite).
 4. Sends pro-level per-signal Telegram alerts + an EOD realized-P&L summary.
 
@@ -130,9 +129,9 @@ def _finalize(trade, reason):
             import costs as _costs
             buy_px = entry + half_spread
             sell_px = max(entry + gross - half_spread, 0.0)
-            # A full T1 book ("Target full") and any pre-T1 exit are 2 orders
-            # (one buy + one sell); a partial T1 that later exits its runner is 3.
-            n_orders = 3 if (trade.get("t1_done") and reason != "Target full") else 2
+            # Single SL + single target: every trade is exactly one buy + one
+            # sell (no partial book, no runner), so always 2 orders.
+            n_orders = 2
             costs_total = _costs.option_trade_costs(buy_px, sell_px, lot, n_orders)["total"]
         except Exception:
             logger.debug("costs unavailable - finalizing without fee model")
@@ -149,13 +148,18 @@ def _finalize(trade, reason):
 def apply_tick(trade, last_price, square_off=False):
     """Advance a paper trade by one observed `last_price`. Mutates `trade`.
 
-    Returns a list of event tags among {"T1","T2","SL","BE","TIME"}.
+    Single SL + single target model (no T1/T2, no runner): the FIRST level the
+    price touches closes the WHOLE position. The target field is `trade["t1"]`
+    (the DB keeps t1/t2 columns for history, but only t1 is the live target).
+
+    Returns a list of event tags among {"SL","TARGET","TIME"}.
 
     Fill model (review §3.5):
       * Stops fill at min(level, observed price) — an option premium that GAPS
         through the SL fills at the gapped price, not the level. Filling at the
         level systematically overstated paper P&L versus live.
-      * Targets fill AT the level (conservative: a gap above T2 books T2).
+      * The target fills AT the level (conservative: a gap above it books the
+        target, not the gapped price).
       * Prices are 5-min sampled LTPs, so intrabar touches between samples are
         still missed — treat paper results as an estimate, not ground truth.
     """
@@ -165,45 +169,23 @@ def apply_tick(trade, last_price, square_off=False):
 
     last_price = float(last_price)
     trade["last_price"] = last_price
-    entry = trade["entry"]
+    target = trade["t1"]
 
-    # --- Phase 1: before T1 -------------------------------------------------
-    if not trade["t1_done"]:
-        if last_price <= trade["sl"]:
-            _book(trade, 1.0, min(trade["sl"], last_price))   # gap-aware fill
-            _finalize(trade, "SL")
-            events.append("SL")
-            return events
-        if last_price >= trade["t1"]:
-            _book(trade, trade["t1_book_fraction"], trade["t1"])
-            if trade["qty_frac"] <= 1e-9:
-                # Full-book plan (t1_book_fraction == 1.0, e.g. B&B's single
-                # target with t1 == t2): nothing left to run. Finalize NOW —
-                # otherwise the trade lingers as a zero-quantity "open" row
-                # until square-off, occupying position/concentration caps and
-                # burning one chain fetch per monitor tick (review 2026-07-09
-                # BUG-1), with a wrong "Time 15:20" exit reason.
-                trade["t1_done"] = 1
-                _finalize(trade, "Target full")
-                events.append("T1_FULL")
-                return events
-            trade["t1_done"] = 1
-            trade["runner_stop"] = entry           # move runner stop to breakeven
-            events.append("T1")
-            # fall through: a gap could also fill T2 on the same tick
+    # --- Stop-loss: full exit (gap-aware fill) ------------------------------
+    if last_price <= trade["sl"]:
+        _book(trade, 1.0, min(trade["sl"], last_price))
+        _finalize(trade, "SL")
+        events.append("SL")
+        return events
 
-    # --- Phase 2: runner (post-T1) -----------------------------------------
-    if trade["status"] == "open" and trade["t1_done"] and trade["qty_frac"] > 1e-9:
-        if last_price >= trade["t2"]:
-            _book(trade, trade["qty_frac"], trade["t2"])
-            _finalize(trade, "T2")
-            events.append("T2")
-            return events
-        if last_price <= trade["runner_stop"]:
-            _book(trade, trade["qty_frac"], min(trade["runner_stop"], last_price))
-            _finalize(trade, "Runner BE")
-            events.append("BE")
-            return events
+    # --- Target: full exit, close 100% of the position immediately ----------
+    # This is the fix for "target hit but position stayed open and profit was
+    # given back at square-off" — there is no runner to leak the gain.
+    if last_price >= target:
+        _book(trade, 1.0, target)
+        _finalize(trade, "Target")
+        events.append("TARGET")
+        return events
 
     # --- Forced square-off (15:20) -----------------------------------------
     if square_off and trade["status"] == "open":
@@ -389,17 +371,18 @@ def format_signal_alert(sig):
     dot = "🟢" if side == "CE" else "🔴"
     entry = float(sig["entry"])
     lot = int(sig.get("lot_size", 1) or 1)
+    target = float(sig["t1"])
     risk_rupees = (entry - float(sig["sl"])) * lot
-    target_rupees = (float(sig["t2"]) - entry) * lot
+    target_rupees = (target - entry) * lot
+    tgt_pct = ((target - entry) / entry * 100.0) if entry else 0.0
     now_str = datetime.now().strftime("%H:%M:%S")
     lines = [
         f"{dot} <b>PAPER TRADE TAKEN</b> • <b>{sig['symbol']}</b> {side} {_fmt(sig['strike'],0)}",
         f"⏱ Entry time {now_str} • Expiry {sig.get('expiry','?')} • DTE {sig.get('dte','?')}",
         f"Score {_fmt(sig.get('score'),1)} | Spot {_fmt(sig.get('spot'),1)} | "
         f"IVR {_fmt(sig.get('iv_rank'),0)} • IV/HV {_fmt(sig.get('iv'),1)}/{_fmt(sig.get('hv'),1)}",
-        f"Entry ₹{_fmt(entry)}  SL ₹{_fmt(sig['sl'])} (-15%)",
-        f"T1 ₹{_fmt(sig['t1'])} (+25%, book {int(round(sig.get('t1_book_fraction',0.7)*100))}%)  "
-        f"T2 ₹{_fmt(sig['t2'])} (+45%, trail)",
+        f"Entry ₹{_fmt(entry)}  SL ₹{_fmt(sig['sl'])}",
+        f"Target ₹{_fmt(target)} ({'+' if tgt_pct >= 0 else ''}{tgt_pct:.0f}%, full exit)",
         f"Lot size {lot} • Qty {lot} (1 lot) • Risk ≈ ₹{_fmt(risk_rupees,0)} • Reward ≈ ₹{_fmt(target_rupees,0)}",
         f"Liq OI {sig.get('oi','?')} • Vol {sig.get('volume','?')} • Square-off {INTRADAY['square_off']}",
         "<i>#paper — simulated, no live order</i>",
@@ -410,11 +393,8 @@ def format_signal_alert(sig):
 def format_fill_update(trade, event):
     """Short HTML note when a paper trade books T1 or closes."""
     label = {
-        "T1": "✅ T1 hit — booked partial",
-        "T1_FULL": "🎯 Target hit — full exit",
-        "T2": "🎯 T2 hit — runner closed",
+        "TARGET": "🎯 Target hit — full exit",
         "SL": "🛑 SL hit — closed",
-        "BE": "➖ Runner stopped at breakeven",
         "TIME": "⏱ Squared off 15:20",
         "RISK_EXIT": "🚪 Auto-exit — risk contradiction",
     }.get(event, event)
@@ -443,22 +423,18 @@ def _why(trade):
     if trade.get("status") == "open":
         return "still open at EOD"
     if reason == "SL":
-        return "hit stop-loss (−15%); premium fell after entry"
-    if reason == "T2":
-        return "ran to T2 target (+45%); strong directional move"
-    if reason == "Target full":
-        return "hit target; booked 100% (single-target plan, no runner)"
-    if reason == "Runner BE":
-        return "booked T1, runner came back to breakeven (move stalled)"
+        return "hit stop-loss; premium fell after entry"
+    if reason in ("Target", "Target full", "T1", "T2"):
+        # "Target full"/T1/T2 are legacy exit reasons on pre-change rows.
+        return "hit target; booked 100% (full exit)"
+    if reason == "Runner BE":  # legacy rows only
+        return "runner came back to breakeven (move stalled)"
     if reason and reason.startswith("Time"):
         if pct > 5:
             return "closed in profit at square-off (trend held, no target hit)"
         if pct < -5:
             return "closed in loss at square-off (drifted against us)"
         return "flat at square-off — premium barely moved (no momentum)"
-    # T1-only partials that never fully closed elsewhere
-    if reason == "T1":
-        return "booked partial at T1; rest exited later"
     return reason or "—"
 
 
@@ -888,7 +864,7 @@ def monitor(book, scanner, now=None, bot_token=None, chat_id=None, square_off=Fa
         book.save_runtime(trade, now)
         # Mid-session fill alerts — fire on every actionable event so the
         # trader knows in real time when a SL/T1/T2 is hit.
-        for event in ("SL", "T1", "T1_FULL", "T2", "BE", "TIME"):
+        for event in ("SL", "TARGET", "TIME"):
             if event in events:
                 send_telegram(
                     format_fill_update(trade, event),
