@@ -52,6 +52,13 @@ def main():
         if now.weekday() < 5 and SCAN_START <= now.time() <= SCAN_END:
             try:
                 result = pipeline.run()
+                if cfg.PAPER_MODE != "off":
+                    from engine import paper
+                    summary = paper.book_emitted(result, pipeline.db_path, now)
+                    if summary["booked"]:
+                        logger.info("convex paper [%s]: %s (cap left %d)",
+                                    summary["mode"], ", ".join(summary["booked"]),
+                                    summary["cap_left"])
                 text = _digest(result)
                 if text and cfg.ALERT:
                     import notifications

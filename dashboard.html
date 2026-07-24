@@ -662,6 +662,12 @@
           </div>
         </div>
 
+        <!-- Grade x Outcome (E1-1) -->
+        <div class="section">
+          <div class="section-label">Grade &times; Outcome — does conviction predict edge? <span id="cvx-out-meta" style="color:var(--muted);text-transform:none;letter-spacing:normal"></span></div>
+          <div class="card" id="cvx-outcomes"><div class="loading">Loading…</div></div>
+        </div>
+
         <!-- Attribution grids -->
         <div class="grid-2">
           <div class="section" style="margin-bottom:0">
@@ -1845,11 +1851,18 @@ function renderPnlChart(daily) {
 let cvxDailyChart = null;
 
 const CVX_PHASES = [
-  { id:'P0', name:'Observe-only engine', status:'active',
-    what:'Engine runs beside V1 every 5 min. Emits WATCH / DECISION / REJECT rows + one Telegram digest. Zero orders.',
+  { id:'P0', name:'Observe-only engine — prove the brain works', status:'active',
+    what:'Engine runs beside V1 every 5 min. Emits WATCH / DECISION / REJECT rows + one Telegram digest. Zero orders. P0 is not just logging — it must END with proof the picks are good. Exit steps:',
+    steps:[
+      ['P0.1','Journal decisions beside V1 (running since Jul 3)','done'],
+      ['P0.2','Truth layer — outcome labeler + Grade × Outcome scoreboard (Jul 24)','done'],
+      ['P0.3','Verdict — ladder is INVERTED: A+ picks are the worst, all on the CE side. Cause found: 3 factors (inst_flow, gap, premium_value) vote on the wrong horizon (Jul 24)','done'],
+      ['P0.4','Fix the brain — replay tool built, 38k labeled decisions replayed train/valid: dropping inst_flow + gap + premium_value from the score un-inverts the ladder. Shipped as formula v2.1 (Jul 24)','done'],
+      ['P0.5','Re-observe 2 weeks on v2.1 (incl. one non-flat week) — ladder must hold A+ > A > B on NEW data','next'],
+    ],
     kills:'—' },
-  { id:'P1', name:'entry_gate re-point', status:'next',
-    what:'V1 order flow gated by engine_decisions (one-line shim). Cockpit v1 over engine tables.',
+  { id:'P1', name:'entry_gate re-point', status:'blocked',
+    what:'V1 order flow gated by engine_decisions (one-line shim). Cockpit v1 over engine tables. BLOCKED until P0.4 + P0.5 pass — an inverted ladder must never gate order flow.',
     kills:'composite · trade_suggester · morning_confluence' },
   { id:'P2', name:'Native triggers + factors', status:'partial',
     what:'ORB / VWAP / break-retest / sonar-band in-engine over the candle cache. NOTE: triggers.py already ported early — journal is validating them now.',
@@ -1875,7 +1888,8 @@ const CVX_PLAYBOOK = [
 
 function cvxBadge(s) {
   const map = { active:['ACTIVE','var(--green)'], next:['NEXT','var(--amber)'],
-                partial:['PARTIAL','var(--amber)'], pending:['PENDING','var(--muted)'] };
+                partial:['PARTIAL','var(--amber)'], pending:['PENDING','var(--muted)'],
+                blocked:['BLOCKED','var(--red)'], done:['DONE','var(--green)'] };
   const [t,c] = map[s] || ['—','var(--muted)'];
   return `<span style="font-size:10px;font-weight:700;color:${c};border:1px solid ${c};border-radius:4px;padding:1px 6px">${t}</span>`;
 }
@@ -1896,7 +1910,13 @@ async function loadConvexJournal() {
           <b style="font-size:12px">${p.name}</b> ${cvxBadge(p.status)}
         </div>
         <div style="font-size:11px;color:var(--muted);line-height:1.5">${p.what}</div>
-        <div style="font-size:10px;color:var(--muted);margin-top:2px">Kills after phase: <span style="color:var(--red)">${p.kills}</span></div>
+        ${(p.steps||[]).map(([sid,txt,st]) => `
+          <div style="display:flex;gap:8px;align-items:flex-start;margin-top:5px">
+            <div style="min-width:32px;font-family:var(--mono);font-size:10px;font-weight:700;color:var(--muted)">${sid}</div>
+            <div style="flex:1;font-size:11px;line-height:1.45;color:${st==='done'?'var(--muted)':'var(--text)'}">${st==='done'?'✓ ':''}${txt}</div>
+            <div>${cvxBadge(st)}</div>
+          </div>`).join('')}
+        <div style="font-size:10px;color:var(--muted);margin-top:4px">Kills after phase: <span style="color:var(--red)">${p.kills}</span></div>
       </div>
     </div>`).join('');
 
@@ -1907,7 +1927,7 @@ async function loadConvexJournal() {
   let j;
   try { j = await api('/api/convex/journal?days=30'); }
   catch (e) {
-    ['cvx-readiness','cvx-rejects','cvx-mix','cvx-symbols','cvx-formulas','cvx-daily-table']
+    ['cvx-readiness','cvx-rejects','cvx-mix','cvx-symbols','cvx-formulas','cvx-daily-table','cvx-outcomes']
       .forEach(id => $(id).innerHTML = `<div class="loading">Journal unavailable: ${e.message}</div>`);
     return;
   }
@@ -1930,10 +1950,16 @@ async function loadConvexJournal() {
       </div>
     </div>
     <div style="margin-top:12px;font-size:11px;color:var(--muted);line-height:1.6">
-      Overall readiness <b style="color:var(--text)">${rd.pct}%</b> ·
+      Evidence volume <b style="color:var(--text)">${rd.pct}%</b> (rows logged — NOT pick quality) ·
       last 30d: <b style="color:var(--green)">${j.status_counts.emitted} emitted</b> ·
       ${j.status_counts.watch} watch · <b style="color:var(--red)">${j.status_counts.rejected} rejected</b>.
-      P1 gate: enough graded Decisions across CE+PE to compare against V1 paper results — plus at least one week where engine picks ≥ V1 picks. Evidence advances the phase, not the calendar.
+    </div>
+    <div style="margin-top:8px;background:rgba(255,170,60,.08);border:1px solid var(--amber);border-radius:6px;padding:8px 10px;font-size:11px;line-height:1.6">
+      <b style="color:var(--amber)">P1 is NOT ready yet — P0.5 in progress.</b> The v2.0 ladder was
+      inverted (A+ worst); P0.4 fixed the score (formula <b>v2.1</b>, Jul 24: inst_flow / gap /
+      premium_value removed from scoring — replay-validated). Now v2.1 must prove itself on
+      2 weeks of NEW data with A+ &gt; A &gt; B in the scoreboard below (filter: formula v2.1 rows
+      only — v2.0 history stays inverted by design). Evidence advances the phase, not the calendar.
     </div>`;
 
   // Daily chart + table
@@ -2015,6 +2041,41 @@ async function loadConvexJournal() {
     `</tbody></table>
     <div style="font-size:10px;color:var(--muted);margin-top:6px">Attribution must never mix versions — weights only change with a version bump.</div>`
     : `<div class="loading">—</div>`;
+
+  // Grade × Outcome (E1-1) — the truth layer: does grade predict forward edge?
+  const go = j.grade_outcomes || [], om = j.outcomes_meta || {};
+  const edgeCell = v => (v==null) ? '<td>—</td>'
+    : `<td style="color:${v>0?'var(--green)':'var(--red)'}">${v>0?'+':''}${fmtNum(v,3)}%</td>`;
+  const hitCell = v => (v==null) ? '<td>—</td>' : `<td>${fmtNum(v,1)}%</td>`;
+  if (go.length) {
+    // one section per formula version — the playbook forbids mixing versions
+    const vers = [...new Set(go.map(g=>g.formula_ver||'—'))];
+    $('cvx-out-meta').textContent =
+      `· ${om.labeled||0} labeled · edge = direction-adjusted forward spot move · hit = edge>0`;
+    $('cvx-outcomes').innerHTML = vers.map(ver => {
+      const rows = go.filter(g=>(g.formula_ver||'—')===ver);
+      const e = Object.fromEntries(rows.map(g=>[g.grade, g.edge_60]));
+      const best = Math.max(...rows.map(g=>g.edge_60==null?-99:g.edge_60));
+      const inverted = (e['A+']!=null) && (e['A+'] < best - 1e-9);
+      const mono = (e['A+']!=null && e['A']!=null && e['B']!=null && e['A+']>e['A'] && e['A']>e['B']);
+      return `<div style="font-size:11px;font-weight:700;margin:${vers.indexOf(ver)?'12px':'0'} 0 4px">
+          Formula <span style="font-family:var(--mono);color:var(--amber)">${ver}</span>
+          ${inverted?'<span style="color:var(--red)"> — ⚠ INVERTED (A+ worst — anti-predictive)</span>'
+            : mono?'<span style="color:var(--green)"> — ✓ ladder holds (A+ &gt; A &gt; B)</span>':''}
+        </div>
+        <table class="data-table">
+        <thead><tr><th>Grade</th><th>n</th><th>Hit 30m</th><th>Hit 60m</th><th>Hit 90m</th><th>Edge 30m</th><th>Edge 60m</th><th>Edge 90m</th></tr></thead><tbody>` +
+        rows.map(g=>`<tr><td><b>${g.grade}</b></td><td>${g.n}</td>${hitCell(g.hit_30)}${hitCell(g.hit_60)}${hitCell(g.hit_90)}${edgeCell(g.edge_30)}${edgeCell(g.edge_60)}${edgeCell(g.edge_90)}</tr>`).join('') +
+        `</tbody></table>`;
+    }).join('') +
+      `<table class="data-table" style="margin-top:8px"><thead><tr><th>Direction</th><th>n</th><th>Hit 60m</th><th>Edge 60m</th></tr></thead><tbody>` +
+      (j.direction_outcomes||[]).map(d=>`<tr><td style="color:${d.direction==='CE'?'var(--green)':'var(--red)'}">${d.direction}</td><td>${d.n}</td>${hitCell(d.hit_60)}${edgeCell(d.edge_60)}</tr>`).join('') +
+      `</tbody></table>
+      <div style="font-size:10px;color:var(--muted);margin-top:6px">Spot-move edge only (not option P&L / costs). P0.5 pass = v2.1 rows show a monotone ladder (A+ &gt; A &gt; B) after 2 weeks. v2.0 history stays inverted — that is the before/after proof, not a bug.</div>`;
+  } else {
+    $('cvx-out-meta').textContent = '';
+    $('cvx-outcomes').innerHTML = `<div class="loading">No labeled outcomes yet. Run <code>python -m engine.labeler</code> to populate engine_outcomes.</div>`;
+  }
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────

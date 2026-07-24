@@ -826,7 +826,11 @@ def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
     # Vol-Expansion, etc.), not just the discount path. A big-lot cheap option
     # must not risk many multiples of a small-lot one. (entry-sl)*lot_size is
     # the 1-lot risk. 0/None (max_risk_rupees) disables the cap.
-    max_risk = _max_risk_rupees()
+    # A signal may opt out with skip_risk_cap=True: the Convex measurement book
+    # records signal quality (% edge per grade), where 1-lot rupee affordability
+    # (epic E5-1) is orthogonal — honest-economics fields still apply, so
+    # realized_pct stays realistic.
+    max_risk = 0.0 if signal.get("skip_risk_cap") else _max_risk_rupees()
     if max_risk:
         risk = _risk_rupees(signal)
         if risk > max_risk:

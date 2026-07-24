@@ -94,8 +94,61 @@ def _market_breadth(db_path: str) -> float | None:
         return None
 
 
+# --- index slope (self-contained SuperSmoother, no sonar/pandas dependency) -- #
+def _super_smoother(series: list[float], period: int) -> list[float]:
+    """Ehlers 2-pole SuperSmoother low-pass filter — same math as the sonar
+    scanner, inlined so the engine stays dependency-free (README: P2 pulls
+    computations in-engine)."""
+    import math
+    n = len(series)
+    if n < 3 or period < 2:
+        return list(series)
+    arg = 1.414 * math.pi / period
+    a1 = math.exp(-arg)
+    c2 = 2 * a1 * math.cos(arg)
+    c3 = -a1 * a1
+    c1 = 1 - c2 - c3
+    ss = list(series)  # seed first two with raw prices
+    for i in range(2, n):
+        ss[i] = c1 * (series[i] + series[i - 1]) / 2.0 + c2 * ss[i - 1] + c3 * ss[i - 2]
+    return ss
+
+
+def _index_slope(db_path: str) -> float | None:
+    """NIFTY SuperSmoother slope over the latest session, signed % of price.
+
+    Fail-open: any missing data / error returns None (regime then falls back to
+    breadth-only lean, exactly as before this fix)."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            day = conn.execute(
+                "SELECT MAX(substr(ts,1,10)) FROM candles_5m WHERE security_id=?",
+                (cfg.INDEX_SECURITY_ID,),
+            ).fetchone()
+            if not day or not day[0]:
+                return None
+            rows = conn.execute(
+                "SELECT close FROM candles_5m WHERE security_id=? "
+                "AND substr(ts,1,10)=? ORDER BY ts",
+                (cfg.INDEX_SECURITY_ID, day[0]),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    closes = [float(r[0]) for r in rows if r[0] is not None]
+    lb = cfg.INDEX_SLOPE_LOOKBACK
+    if len(closes) < max(cfg.INDEX_SLOPE_MIN_BARS, lb + 1) or not closes[-1]:
+        return None
+    ss = _super_smoother(closes, cfg.INDEX_SLOPE_PERIOD)
+    return (ss[-1] - ss[-1 - lb]) / closes[-1] * 100.0
+
+
 def load(db_path: str, index_slope_pct: float | None = None,
          event_blackout: bool = False) -> RegimeState:
-    """Read current inputs and classify. Missing inputs degrade to AMBER, never crash."""
+    """Read current inputs and classify. Missing inputs degrade to AMBER, never crash.
+
+    When ``index_slope_pct`` is not supplied it is computed from NIFTY candles
+    (E2-1); pass an explicit value only to override (e.g. tests)."""
+    if index_slope_pct is None:
+        index_slope_pct = _index_slope(db_path)
     return classify(_latest_vix(db_path), _market_breadth(db_path),
                     index_slope_pct, event_blackout)

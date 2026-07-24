@@ -869,6 +869,36 @@ def convex_journal(days: int = Query(30, ge=1, le=120)):
         "SELECT formula_ver, COUNT(*) AS n, MIN(date(ts)) AS since_day "
         "FROM engine_decisions GROUP BY formula_ver ORDER BY since_day")
 
+    # ── Grade x Outcome (E1-1) — does conviction actually predict edge? ──
+    # engine_outcomes is written by the labeler; missing table fails open to [].
+    # edge = direction-adjusted forward spot move (CE wants up, PE wants down);
+    # hit = edge > 0. This is the row the playbook's "A+ vs B outcomes" needs.
+    # Grouped by formula_ver — attribution must NEVER mix formula versions
+    # (the playbook rule): v2.0's inverted history must not dilute v2.1's ladder.
+    grade_outcomes = _iv_safe(
+        "SELECT formula_ver, grade, COUNT(*) AS n, "
+        "  ROUND(AVG(hit_30)*100,1) AS hit_30, ROUND(AVG(hit_60)*100,1) AS hit_60, "
+        "  ROUND(AVG(hit_90)*100,1) AS hit_90, "
+        "  ROUND(AVG(edge_30),3) AS edge_30, ROUND(AVG(edge_60),3) AS edge_60, "
+        "  ROUND(AVG(edge_90),3) AS edge_90 "
+        "FROM engine_outcomes "
+        "WHERE grade IS NOT NULL AND edge_60 IS NOT NULL "
+        "  AND date(ts) >= date('now','localtime', ?) "
+        "GROUP BY formula_ver, grade "
+        "ORDER BY formula_ver DESC, "
+        "  CASE grade WHEN 'A+' THEN 0 WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 3 END",
+        (since,))
+    direction_outcomes = _iv_safe(
+        "SELECT direction, COUNT(*) AS n, "
+        "  ROUND(AVG(hit_60)*100,1) AS hit_60, ROUND(AVG(edge_60),3) AS edge_60 "
+        "FROM engine_outcomes WHERE direction IS NOT NULL AND edge_60 IS NOT NULL "
+        "  AND grade IS NOT NULL "   # emitted only — rejected rows are also labeled now
+        "  AND date(ts) >= date('now','localtime', ?) GROUP BY direction", (since,))
+    outcomes_meta = _iv_safe(
+        "SELECT COUNT(*) AS labeled, MAX(labeled_at) AS last_labeled "
+        "FROM engine_outcomes WHERE date(ts) >= date('now','localtime', ?)", (since,))
+    outcomes_meta = outcomes_meta[0] if outcomes_meta else {"labeled": 0, "last_labeled": None}
+
     # P1 readiness — evidence-gated, not calendar-gated
     emitted_total = _scalar(IV_DB,
         "SELECT COUNT(*) FROM engine_decisions WHERE status='EMITTED'", default=0) or 0
@@ -898,6 +928,9 @@ def convex_journal(days: int = Query(30, ge=1, le=120)):
         "daily": daily,
         "top_symbols": top_symbols,
         "formula_versions": formula_vers,
+        "grade_outcomes": grade_outcomes,
+        "direction_outcomes": direction_outcomes,
+        "outcomes_meta": outcomes_meta,
         "readiness": readiness,
         "window_days": days,
         "server_time": datetime.now().isoformat(),
