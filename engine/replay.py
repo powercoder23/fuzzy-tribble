@@ -62,6 +62,10 @@ VARIANTS = [
             weights={"inst_flow": 0.0, "gap": 0.0}, w_premium_value=0.0),
     Variant("combo_fade", "inst0 + gapflip + pv0",
             weights={"inst_flow": 0.0}, flip_bias=("gap",), w_premium_value=0.0),
+    Variant("oi0", "oi_flow weight -> 0 (same-day co-movement tag, not tested in P0.4)",
+            weights={"oi_flow": 0.0}),
+    Variant("combo_drop_oi", "inst0 + gap0 + pv0 + oi0 (shipped v2.1 formula, plus oi_flow)",
+            weights={"inst_flow": 0.0, "gap": 0.0, "oi_flow": 0.0}, w_premium_value=0.0),
 ]
 
 

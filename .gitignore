@@ -64,3 +64,5 @@ data/premarket_warmup_state.json
 .claude/*
 .claude/worktrees/elated-nightingale-65b1dd
 data/*
+research/output/
+research/__pycache__/
