@@ -53,6 +53,20 @@ made the ladder monotone on train AND validation. Gap-as-FADE showed top-grade
 alpha (A+ +0.226/+0.126) but hurt grade B — parked as a v2.2 research candidate.
 A+ is now rare by design (~2–3/day max score 82.5).
 
+`oi_flow` (weight 20.0, still live) was replayed the same way (`oi0` /
+`combo_drop_oi` variants, Jul 28) after a dev-machine proxy audit flagged it
+as a possible same-day-snapshot vote. Result: inconclusive, not confirmed
+broken. Zeroing it collapses A+ and A to n=0 in both train and validation —
+`oi_flow`'s 20 points look like they're what pushes scores over the A/B
+grade thresholds, so the drop can't be judged against the same A+>A>B bar
+the other three factors were held to (two of three rungs go empty). The
+higher "ALL edge" left behind (train 0.86, valid 0.36) is a ~6–46-row B-only
+remnant, not a like-for-like comparison. Also thin data either way: v2.1
+rows only go back to Jul 24, so this whole read is 5 calendar days. Parked
+— left at weight 20.0. Re-test once more v2.1 days accrue, and/or replay
+`oi_flow` at a reduced (not zeroed) weight to see if the collapse is a
+magnitude effect before deciding.
+
 ## Ignore
 The "Evidence volume %" number on the dashboard is row-count only. It is NOT readiness.
 Readiness = P0.4 + P0.5 passed. (The dashboard banner now says this explicitly.)

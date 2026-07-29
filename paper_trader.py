@@ -54,7 +54,7 @@ VOLATILITY_STRATEGY = "Volatility Expansion Play"
 # Pure exit-state-machine (unit-testable, no DB / no API)
 # ---------------------------------------------------------------------------
 
-def new_trade_runtime(entry, sl, t1, t2, t1_book_fraction, lot_size=None):
+def new_trade_runtime(entry, sl, t1, t2, t1_book_fraction, lot_size=None, direction="long"):
     """Return the mutable runtime fields for a fresh open paper trade.
 
     lot_size is the option contract multiplier and is always >= 1 for a real
@@ -62,6 +62,11 @@ def new_trade_runtime(entry, sl, t1, t2, t1_book_fraction, lot_size=None):
     unit tests pass lot_size=None to opt out of the fee model - the explicit
     "no lot context" sentinel introduced for review 2026-07-09 INTEG-1, which
     replaces overloading lot_size == 1 to mean "skip costs".
+
+    direction is "long" (buy premium, the original behaviour: sl below entry,
+    profit on price rising) or "short" (sell premium — IV-seller strangle/
+    straddle legs: sl above entry, profit on price falling). See `_book`/
+    `_finalize`/`apply_tick` for the mirrored math.
     """
     return {
         "entry": float(entry),
@@ -70,6 +75,7 @@ def new_trade_runtime(entry, sl, t1, t2, t1_book_fraction, lot_size=None):
         "t2": float(t2),
         "t1_book_fraction": float(t1_book_fraction),
         "lot_size": (int(lot_size) if lot_size else None),
+        "direction": direction or "long",
         "status": "open",
         "t1_done": 0,
         "qty_frac": 1.0,
@@ -84,11 +90,18 @@ def new_trade_runtime(entry, sl, t1, t2, t1_book_fraction, lot_size=None):
 
 
 def _book(trade, frac, price):
-    """Realize `frac` of the position at `price` (premium points)."""
+    """Realize `frac` of the position at `price` (premium points).
+
+    Long: profit when price rises above entry. Short (premium sold): profit
+    when price falls below entry — the sign is simply flipped.
+    """
     frac = min(frac, trade["qty_frac"])
     if frac <= 0:
         return
-    trade["booked_points"] += frac * (price - trade["entry"])
+    if trade.get("direction") == "short":
+        trade["booked_points"] += frac * (trade["entry"] - price)
+    else:
+        trade["booked_points"] += frac * (price - trade["entry"])
     trade["qty_frac"] = max(trade["qty_frac"] - frac, 0.0)
 
 
@@ -127,8 +140,15 @@ def _finalize(trade, reason):
     if raw_lot is not None and entry:
         try:
             import costs as _costs
-            buy_px = entry + half_spread
-            sell_px = max(entry + gross - half_spread, 0.0)
+            if trade.get("direction") == "short":
+                # Sell-to-open, buy-to-close: entry is the SELL leg (credit
+                # received), the exit is the BUY leg (debit paid to close).
+                # gross = entry - exit_price here, so exit_price = entry - gross.
+                sell_px = max(entry - half_spread, 0.0)
+                buy_px = max((entry - gross) + half_spread, 0.0)
+            else:
+                buy_px = entry + half_spread
+                sell_px = max(entry + gross - half_spread, 0.0)
             # Single SL + single target: every trade is exactly one buy + one
             # sell (no partial book, no runner), so always 2 orders.
             n_orders = 2
@@ -162,6 +182,11 @@ def apply_tick(trade, last_price, square_off=False):
         target, not the gapped price).
       * Prices are 5-min sampled LTPs, so intrabar touches between samples are
         still missed — treat paper results as an estimate, not ground truth.
+
+    direction="short" (premium sold, e.g. IV-seller strangle/straddle legs)
+    mirrors every comparison: sl sits ABOVE entry (stopped out if price rises
+    through it, gap-aware fill via max()), target sits BELOW entry (booked if
+    price decays through it).
     """
     events = []
     if trade.get("status") != "open":
@@ -170,10 +195,13 @@ def apply_tick(trade, last_price, square_off=False):
     last_price = float(last_price)
     trade["last_price"] = last_price
     target = trade["t1"]
+    short = trade.get("direction") == "short"
 
     # --- Stop-loss: full exit (gap-aware fill) ------------------------------
-    if last_price <= trade["sl"]:
-        _book(trade, 1.0, min(trade["sl"], last_price))
+    sl_hit = (last_price >= trade["sl"]) if short else (last_price <= trade["sl"])
+    if sl_hit:
+        fill = max(trade["sl"], last_price) if short else min(trade["sl"], last_price)
+        _book(trade, 1.0, fill)
         _finalize(trade, "SL")
         events.append("SL")
         return events
@@ -181,7 +209,8 @@ def apply_tick(trade, last_price, square_off=False):
     # --- Target: full exit, close 100% of the position immediately ----------
     # This is the fix for "target hit but position stayed open and profit was
     # given back at square-off" — there is no runner to leak the gain.
-    if last_price >= target:
+    target_hit = (last_price <= target) if short else (last_price >= target)
+    if target_hit:
         _book(trade, 1.0, target)
         _finalize(trade, "Target")
         events.append("TARGET")
@@ -214,7 +243,8 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     booked_points REAL DEFAULT 0.0, runner_stop REAL, last_price REAL,
     exit_reason TEXT, realized_points REAL, realized_pct REAL, realized_rupees REAL,
     half_spread REAL, gross_points REAL, slippage_points REAL,
-    costs_rupees REAL, factors_json TEXT
+    costs_rupees REAL, factors_json TEXT,
+    direction TEXT DEFAULT 'long', combo_id TEXT
 );
 """
 
@@ -233,6 +263,8 @@ _MIGRATE_COLUMNS = {
     "slippage_points": "REAL",
     "costs_rupees":    "REAL",
     "factors_json":    "TEXT",
+    "direction":       "TEXT DEFAULT 'long'",
+    "combo_id":        "TEXT",
 }
 
 
@@ -301,6 +333,7 @@ class PaperTradeBook:
             signal["entry"], signal["sl"], signal["t1"], signal["t2"],
             signal.get("t1_book_fraction", TRADE_PLAN["t1_book_fraction"]),
             signal.get("lot_size", 1),
+            signal.get("direction", "long"),
         )
         with self._conn() as conn:
             cur = conn.execute(
@@ -309,8 +342,8 @@ class PaperTradeBook:
                     strike, expiry, entry, sl, t1, t2, t1_book_fraction, lot_size,
                     score, iv, hv, iv_rank, dte, strategy, status, t1_done, qty_frac,
                     booked_points, runner_stop, last_price,
-                    half_spread, factors_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    half_spread, factors_json, direction, combo_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     date, now.strftime("%Y-%m-%d %H:%M:%S"),
                     signal["symbol"], str(signal.get("security_id")),
@@ -323,6 +356,7 @@ class PaperTradeBook:
                     signal.get("strategy", VOLATILITY_STRATEGY),
                     "open", 0, 1.0, 0.0, rt["runner_stop"], rt["entry"],
                     signal.get("half_spread"), signal.get("factors_json"),
+                    rt["direction"], signal.get("combo_id"),
                 ),
             )
             return cur.lastrowid
@@ -520,14 +554,19 @@ def _hhmm(now):
 
 
 def _risk_rupees(signal) -> float:
-    """1-lot rupee risk of a signal: (entry - sl) * lot_size. Accepts either
-    the paper-signal shape ('sl') or a raw scan row ('stop_loss')."""
+    """1-lot rupee risk of a signal. Accepts either the paper-signal shape
+    ('sl') or a raw scan row ('stop_loss').
+
+    Long: risk = entry - sl (sl sits below entry). Short (premium sold, e.g.
+    IV-seller legs): risk = sl - entry (sl sits above entry — the loss if the
+    written option's premium runs up against you)."""
     try:
         entry = float(signal.get("entry") or 0)
         sl = float(signal.get("sl") if signal.get("sl") is not None
                    else signal.get("stop_loss") or 0)
         lot = int(signal.get("lot_size") or 1)
-        return max(entry - sl, 0.0) * lot
+        diff = (sl - entry) if signal.get("direction") == "short" else (entry - sl)
+        return max(diff, 0.0) * lot
     except (TypeError, ValueError):
         return 0.0
 

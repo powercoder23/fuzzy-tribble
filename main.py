@@ -22,7 +22,7 @@ import schedule
 
 from config import Config
 from discount import DiscountedPremiumScanner
-from discount_config import INTRADAY
+from discount_config import INTRADAY, PAPER_TRADING_ENABLED
 from directional_iv_runner import run_directional_scan
 import paper_trader
 from order_manager import OrderManager
@@ -160,9 +160,15 @@ class StrategySchedulerApp:
                 logger.info("Scan results saved to %s", output_path)
 
             # Booking a trade == handing it to the OrderManager.
-            self.order_manager().submit_signals(
-                opportunities, now=now, lot_size_fn=self.lot_fn()
-            )
+            # Kill switch (2026-07-29): discount-sourced paper trades went bad
+            # after the grouping change. Scan + suggester alerts stay live below;
+            # only the paper-trade hand-off is disabled. See discount_config.py.
+            if PAPER_TRADING_ENABLED:
+                self.order_manager().submit_signals(
+                    opportunities, now=now, lot_size_fn=self.lot_fn()
+                )
+            else:
+                logger.info("Discount paper trading disabled (PAPER_TRADING_ENABLED=False) — scan-only")
 
             # Emit a fused suggestion list only once per COMPLETED cycle of the
             # repeated scans (gap/oi/iv), not on every discount tick.

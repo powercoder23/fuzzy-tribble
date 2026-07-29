@@ -144,6 +144,13 @@ INTRADAY = {
                                   # (see paper_trader.book_signal), not just discount.
 }
 
+# --- Kill switch (2026-07-29) --------------------------------------------
+# Post-grouping review showed the discount scanner's paper trades had turned
+# bad. Scanning + Telegram alerts stay on; only the paper_trader.process_signals
+# hand-off in main.py's run_scan_cycle is gated on this flag. Flip back to True
+# once the scanner is re-tuned and re-validated.
+PAPER_TRADING_ENABLED = False
+
 # --- Universe (DISCOUNT SCANNER ONLY) -----------------------------------
 # Trim the scan universe to the most liquid F&O names. Ranking uses the latest
 # OI x volume from the local iv_history.db (zero extra API calls). Does NOT
