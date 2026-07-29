@@ -37,7 +37,8 @@ WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday"]
 SCAN_TIMES = ["09:45", "11:15", "13:15", "14:45", "15:05"]
 
 # How many top directional-IV candidates to submit as paper trades per scan.
-MAX_PAPER_TRADES_PER_SCAN = int(os.getenv("DIV_MAX_PAPER_PER_SCAN", "3"))
+# 0 = unlimited (testing mode). Override: DIV_MAX_PAPER_PER_SCAN env var.
+MAX_PAPER_TRADES_PER_SCAN = int(os.getenv("DIV_MAX_PAPER_PER_SCAN", "0"))
 
 
 def _make_signal(row: dict) -> dict:
@@ -94,7 +95,7 @@ def run_directional_scan():
         rows = opportunities.to_dict("records")
         submitted = 0
         for row in rows:
-            if submitted >= MAX_PAPER_TRADES_PER_SCAN:
+            if MAX_PAPER_TRADES_PER_SCAN and submitted >= MAX_PAPER_TRADES_PER_SCAN:
                 break
             sig = _make_signal(row)
             if not sig.get("symbol") or not sig.get("entry") or not sig.get("t1"):

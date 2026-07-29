@@ -49,4 +49,4 @@ MAX_PCR_PE = float(os.getenv("PMG_MAX_PCR_PE", "1.50"))
 PCR_FAIL_OPEN = os.getenv("PMG_PCR_FAIL_OPEN", "true").strip().lower() == "true"
 
 # ── Gate 5: simultaneous position cap ────────────────────────────────────── #
-MAX_SIMULTANEOUS = int(os.getenv("PMG_MAX_SIMULTANEOUS", "2"))
+MAX_SIMULTANEOUS = int(os.getenv("PMG_MAX_SIMULTANEOUS", "0"))  # 0 = unlimited

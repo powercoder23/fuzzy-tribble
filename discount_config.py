@@ -7,6 +7,8 @@ convention already used by momentum (momentum_config.py), break-and-bounce
 (break_bounce_config.py), and directional-IV (directional_iv_config.py).
 """
 
+import os
+
 # --- IV history / volatility mode ---------------------------------------
 # Minimum number of *daily* ATM IV samples before IV Rank / IV Percentile are
 # trusted. Below this the scanner falls back to skew-only ("skew") mode.
@@ -131,11 +133,11 @@ INTRADAY = {
     "square_off": "15:20",        # force-close any open paper trade
     "monitor_until": "15:20",     # keep re-pricing open trades until square-off
     "eod_summary_at": "15:25",    # send realized-P&L summary
-    "max_signals_per_day": 5,     # max 5 paper trades per day (per-symbol cap)
+    # 0 = unlimited (testing mode); set PAPER_MAX_SIGNALS env var to override.
+    "max_signals_per_day": int(os.getenv("PAPER_MAX_SIGNALS", "0")),
     "min_premium": 5.0,           # skip options trading below ₹5 (far-OTM junk)
-    "max_per_symbol_per_day": 1,  # at most N paper trades per underlying per day
-                                  # (stops one symbol — e.g. ABCAPITAL — eating
-                                  # every slot via different strikes)
+    # 0 = unlimited (testing mode); set PAPER_MAX_PER_SYMBOL env var to override.
+    "max_per_symbol_per_day": int(os.getenv("PAPER_MAX_PER_SYMBOL", "0")),
     "max_risk_rupees": 1500.0,    # skip a signal whose 1-lot risk
                                   # (entry-sl)*lot_size exceeds this budget, so a
                                   # big-lot cheap option can't quietly risk 5x a

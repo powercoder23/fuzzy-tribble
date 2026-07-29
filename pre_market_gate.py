@@ -255,9 +255,11 @@ def evaluate(
     # otherwise reject them whenever the discount scanner has already filled its
     # slots, so it is skipped when enforce_position_cap is False.
     if enforce_position_cap:
-        ok = open_positions < cfg.MAX_SIMULTANEOUS
+        # 0 = unlimited — skip the cap entirely
+        ok = (not cfg.MAX_SIMULTANEOUS) or open_positions < cfg.MAX_SIMULTANEOUS
         g  = _gate("simultaneous", ok, open_positions, cfg.MAX_SIMULTANEOUS,
-                   f"{open_positions} open {'<' if ok else '≥'} {cfg.MAX_SIMULTANEOUS} max")
+                   "unlimited" if not cfg.MAX_SIMULTANEOUS
+                   else f"{open_positions} open {'<' if ok else '≥'} {cfg.MAX_SIMULTANEOUS} max")
         gates.append(g)
         if not ok:
             failures.append(g["reason"])

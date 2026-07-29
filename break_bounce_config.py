@@ -10,8 +10,10 @@ BB_RISK = {
     "sl_pct":               0.30,   # 30% SL on option premium
     "target_ratio":         2.5,    # Target = 2.5x SL distance (between 2x and 3x)
     "daily_loss_limit_pct": 0.03,   # Hard stop if down 3% on day
-    "max_trades_per_day":   3,
-    "max_open_positions":   2,
+    # 0 = unlimited (testing mode). Override: BB_MAX_TRADES_PER_DAY env var.
+    "max_trades_per_day":   int(os.getenv("BB_MAX_TRADES_PER_DAY", "0")),
+    # 0 = unlimited. Override: BB_MAX_OPEN_POSITIONS env var.
+    "max_open_positions":   int(os.getenv("BB_MAX_OPEN_POSITIONS", "0")),
 }
 
 BB_BREAKOUT = {

@@ -197,7 +197,7 @@ class VolExpansionStrategy:
 
         out = []
         for row in self.candidates():
-            if len(self._traded_today) >= CFG.MAX_TRADES_PER_DAY:
+            if CFG.MAX_TRADES_PER_DAY and len(self._traded_today) >= CFG.MAX_TRADES_PER_DAY:
                 break
             symbol = row.get("symbol")
             if not symbol or symbol in self._traded_today:

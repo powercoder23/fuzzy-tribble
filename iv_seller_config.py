@@ -63,8 +63,9 @@ TARGET_CREDIT_MULT = float(os.getenv("IV_SELLER_TARGET_CREDIT_MULT", "0.35"))  #
 # Per-leg 1-lot rupee risk ceiling, same enforcement point as discount's
 # max_risk_rupees (paper_trader.book_signal / _risk_rupees, direction-aware).
 MAX_RISK_RUPEES_PER_LEG = float(os.getenv("IV_SELLER_MAX_RISK_RUPEES", "3000"))
-MAX_COMBOS_PER_DAY             = int(os.getenv("IV_SELLER_MAX_COMBOS_PER_DAY", "5"))
-MAX_COMBOS_PER_SYMBOL_PER_DAY  = int(os.getenv("IV_SELLER_MAX_COMBOS_PER_SYMBOL_PER_DAY", "1"))
+# 0 = unlimited (testing mode).
+MAX_COMBOS_PER_DAY             = int(os.getenv("IV_SELLER_MAX_COMBOS_PER_DAY", "0"))
+MAX_COMBOS_PER_SYMBOL_PER_DAY  = int(os.getenv("IV_SELLER_MAX_COMBOS_PER_SYMBOL_PER_DAY", "0"))
 
 DEFAULT_UNIVERSE_SIZE = int(os.getenv("IV_SELLER_UNIVERSE_SIZE", "30"))
 OUTPUT_CSV = str(Path("data") / "iv_seller_opportunities.csv")

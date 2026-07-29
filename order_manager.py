@@ -45,8 +45,8 @@ def _resolve_limit(key: str, fallback: float) -> float:
 # ---- portfolio concentration limits (review §3.7) -------------------------- #
 # Dedup alone allows 5 same-sector same-direction CEs — one correlated bet at
 # 5x intended risk. These caps count OPEN positions + candidates in-batch.
-PORTFOLIO_MAX_SAME_DIRECTION = int(os.getenv("PORTFOLIO_MAX_SAME_DIRECTION", "3"))
-PORTFOLIO_MAX_PER_SECTOR     = int(os.getenv("PORTFOLIO_MAX_PER_SECTOR", "2"))
+PORTFOLIO_MAX_SAME_DIRECTION = int(os.getenv("PORTFOLIO_MAX_SAME_DIRECTION", "0"))  # 0 = unlimited
+PORTFOLIO_MAX_PER_SECTOR     = int(os.getenv("PORTFOLIO_MAX_PER_SECTOR", "0"))      # 0 = unlimited
 PORTFOLIO_GATE_MODE          = os.getenv("PORTFOLIO_GATE_MODE", "hard").lower()  # off|soft|hard
 
 
@@ -516,10 +516,12 @@ class OrderManager:
                 sym  = str(r.get("symbol", "")).upper()
                 sec  = sector_map.get(sym)
                 block_reason = None
-                if dir_count[side] >= PORTFOLIO_MAX_SAME_DIRECTION:
+                if PORTFOLIO_MAX_SAME_DIRECTION and \
+                        dir_count[side] >= PORTFOLIO_MAX_SAME_DIRECTION:
                     block_reason = (f"direction cap {side} "
                                     f">= {PORTFOLIO_MAX_SAME_DIRECTION}")
-                elif sec and sector_count.get(sec, 0) >= PORTFOLIO_MAX_PER_SECTOR:
+                elif PORTFOLIO_MAX_PER_SECTOR and sec and \
+                        sector_count.get(sec, 0) >= PORTFOLIO_MAX_PER_SECTOR:
                     block_reason = f"sector cap {sec} >= {PORTFOLIO_MAX_PER_SECTOR}"
 
                 if block_reason and pmode == "hard":

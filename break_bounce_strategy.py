@@ -87,9 +87,11 @@ class BreakBounceRiskManager:
         daily_loss_limit = -(self.capital * BB_RISK["daily_loss_limit_pct"])
         if self.daily_pnl <= daily_loss_limit:
             return False, f"daily_loss_limit_hit(pnl={self.daily_pnl:.0f})"
-        if self.trades_today >= BB_RISK["max_trades_per_day"]:
+        _max_t = BB_RISK["max_trades_per_day"]
+        if _max_t and self.trades_today >= _max_t:
             return False, f"max_trades_reached({self.trades_today})"
-        if len(self.open_positions) >= BB_RISK["max_open_positions"]:
+        _max_p = BB_RISK["max_open_positions"]
+        if _max_p and len(self.open_positions) >= _max_p:
             return False, f"max_positions_open({len(self.open_positions)})"
         return True, "OK"
 

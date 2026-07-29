@@ -24,7 +24,7 @@ MIN_SLOPE       = float(os.getenv("VOL_EXP_MIN_SLOPE", "0.5"))   # IV pts/day
 # trade the top expanding names by slope regardless of IVP (includes rich chases).
 BUY_ZONE_ONLY   = os.getenv("VOL_EXP_BUY_ZONE_ONLY", "true").strip().lower() == "true"
 MAX_SCAN        = int(os.getenv("VOL_EXP_MAX_SCAN", "40"))       # names to consider
-MAX_TRADES_PER_DAY = int(os.getenv("VOL_EXP_MAX_TRADES", "3"))
+MAX_TRADES_PER_DAY = int(os.getenv("VOL_EXP_MAX_TRADES", "0"))  # 0 = unlimited
 
 # ── Direction ────────────────────────────────────────────────────────────── #
 # CE/PE from the underlying's recent daily spot trend (iv_history). If the move

@@ -80,9 +80,10 @@ class IVSellerRunner:
         return self._lot_fn
 
     def _combo_caps_ok(self, combos_booked_today, symbol_booked_today, symbol):
-        if combos_booked_today >= cfg.MAX_COMBOS_PER_DAY:
+        if cfg.MAX_COMBOS_PER_DAY and combos_booked_today >= cfg.MAX_COMBOS_PER_DAY:
             return False
-        if symbol_booked_today.get(symbol, 0) >= cfg.MAX_COMBOS_PER_SYMBOL_PER_DAY:
+        if cfg.MAX_COMBOS_PER_SYMBOL_PER_DAY and \
+                symbol_booked_today.get(symbol, 0) >= cfg.MAX_COMBOS_PER_SYMBOL_PER_DAY:
             return False
         return True
 

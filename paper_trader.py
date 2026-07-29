@@ -743,10 +743,10 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
     except Exception:
         _sonar_available = False
 
-    cap = INTRADAY["max_signals_per_day"]
+    cap = INTRADAY["max_signals_per_day"]  # 0 = unlimited
     opened = []
     for row in rows:
-        if book.count_today(date) >= cap:
+        if cap and book.count_today(date) >= cap:
             break
         symbol, strike, side = row.get("symbol"), row.get("strike"), row.get("type")
         if symbol is None or strike is None or side is None:
