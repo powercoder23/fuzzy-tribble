@@ -1183,50 +1183,55 @@ class BreakBounceStrategyRunner:
                 }
                 self._journal.log_entry(trade)
 
-                # ── Paper trade: route through the shared OrderManager ────────
-                # B&B keeps its OWN selection (pattern/liquidity/affordability)
-                # and its OWN daily cap; this path only adds the shared quality
-                # gates (pre-market + breadth) and tags the trade so it flows
-                # through the same monitor / fill alerts / auto-exit / EOD /
-                # analytics as discount trades. The exit model is B&B's fixed
-                # single target (full exit, no runner): t1 == t2, book 100%.
+                # ── Paper trade: debit spread via shared OrderManager ────────
+                # B&B owns its own selection (pattern/liquidity/affordability)
+                # and its own daily cap. submit_with_hedge books the primary
+                # long leg PLUS an OTM short hedge leg (same direction, same
+                # expiry, N strikes further OTM) as a combo, giving a capped
+                # debit spread rather than a naked long. Passes chain data so
+                # hedge.find_hedge_leg can pick the strike without a new API call.
                 try:
                     from order_manager import OrderManager
                     _bb_signal = {
-                        "symbol":            symbol,
-                        "security_id":       sec_id,
-                        "exchange_segment":  seg,
-                        "side":              side,
-                        "strike":            strike_data.get("strike"),
-                        "expiry":            expiry,
-                        "spot":              spot,
-                        "entry":             premium,
-                        "sl":                sl,
-                        "t1":                target,
-                        "t2":                target,   # fixed single target — full exit, no runner
-                        "t1_book_fraction":  1.0,
-                        "lot_size":          lot_size,
-                        "iv":                strike_data.get("iv"),
-                        # bid/ask let paper_trader compute the REAL half-spread
-                        # for honest slippage instead of the 2% fallback.
-                        "bid":               strike_data.get("bid"),
-                        "ask":               strike_data.get("ask"),
-                        "oi":                strike_data.get("oi"),
-                        "volume":            strike_data.get("volume"),
-                        # B&B's own paper-booking floor (see BB_PAPER) — the
-                        # shared ₹5 discount floor dropped cheap large-lot names.
-                        "min_premium":       BB_PAPER["min_premium"],
-                        "strategy":          ("Break & Bounce (discount strike)"
-                                              if strike_data.get("strike_source") == "discount"
-                                              else "Break & Bounce"),
+                        "symbol":               symbol,
+                        "security_id":          sec_id,
+                        "exchange_segment":     seg,
+                        "side":                 side,
+                        "strike":               strike_data.get("strike"),
+                        "expiry":               expiry,
+                        "spot":                 spot,
+                        "entry":                premium,
+                        "sl":                   sl,
+                        "t1":                   target,
+                        "t2":                   target,
+                        "t1_book_fraction":     1.0,
+                        "lot_size":             lot_size,
+                        "iv":                   strike_data.get("iv"),
+                        "bid":                  strike_data.get("bid"),
+                        "ask":                  strike_data.get("ask"),
+                        "oi":                   strike_data.get("oi"),
+                        "volume":               strike_data.get("volume"),
+                        "min_premium":          BB_PAPER["min_premium"],
+                        # B&B has its own risk model (BB_RISK) — bypass the
+                        # shared ₹1500 cap that was blocking large-lot stocks.
+                        "skip_risk_cap":        True,
+                        # B&B has its own pattern/liquidity gates — bypass the
+                        # discount buyer-quality gate (IVR/IV-HV/OTM%).
+                        "skip_pre_market_gate": True,
+                        "strategy":             ("Break & Bounce (discount strike)"
+                                                 if strike_data.get("strike_source") == "discount"
+                                                 else "Break & Bounce"),
                     }
                     _om = getattr(self, "_order_manager", None)
                     if _om is None:
                         self._order_manager = OrderManager()
                         _om = self._order_manager
-                    if _om.submit_external_signal(_bb_signal):
-                        logger.info("B&B paper trade booked via OrderManager: %s %s %s",
-                                    symbol, side, strike_data.get("strike"))
+                    _chain_data_for_hedge = {"oc": chain, "last_price": spot}
+                    _booked = _om.submit_with_hedge(
+                        _bb_signal, chain_data=_chain_data_for_hedge)
+                    if _booked:
+                        logger.info("B&B paper trade(s) booked (%d leg(s)): %s %s %s",
+                                    len(_booked), symbol, side, strike_data.get("strike"))
                     else:
                         logger.info("B&B paper trade not booked (gate/guard): %s %s",
                                     symbol, side)

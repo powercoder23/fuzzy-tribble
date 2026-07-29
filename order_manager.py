@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from datetime import datetime
 
 import paper_trader
@@ -319,6 +320,67 @@ class OrderManager:
                         sig.get("symbol"), sig.get("side"), sig.get("strategy"))
         return booked
 
+    def submit_with_hedge(self, primary_signal: dict, chain_data: dict | None = None,
+                          now=None) -> list:
+        """Book a primary (long) signal and, if hedge is enabled and chain_data
+        is provided, also book the OTM short hedge leg as the second side of a
+        debit spread.
+
+        Both legs share a combo_id so they appear linked in the DB and EOD
+        summary. If the primary is rejected by gates the hedge is never booked.
+        If the hedge leg is unavailable or rejected, the primary is still booked
+        as a single leg (graceful degradation).
+
+        Returns list of booked signal dicts ([] primary rejected, [p] single-leg,
+        [p, h] full spread).
+        """
+        import hedge_config
+        import hedge as hedge_mod
+
+        combo_id = (f"{primary_signal.get('symbol','?')}_"
+                    f"{(now or datetime.now()).date().isoformat()}_"
+                    f"{uuid.uuid4().hex[:6]}")
+
+        primary = dict(primary_signal)
+        primary["combo_id"] = combo_id
+
+        booked: list = []
+        primary_booked = self.submit_external_signal(primary, now=now)
+        if not primary_booked:
+            return booked
+        booked.append(primary_booked)
+
+        if not hedge_config.ENABLED or not chain_data:
+            return booked
+
+        try:
+            oc = chain_data.get("oc", {})
+            spot = float(chain_data.get("last_price") or 0)
+            hedge_sig = hedge_mod.find_hedge_leg(
+                chain=oc,
+                spot=spot,
+                primary_strike=float(primary.get("strike") or 0),
+                primary_side=str(primary.get("side") or ""),
+                n_strikes=hedge_config.HEDGE_STRIKES_OTM,
+                signal_template=primary,
+            )
+            if hedge_sig:
+                hedge_sig["combo_id"] = combo_id
+                hedge_booked = self.submit_external_signal(hedge_sig, now=now)
+                if hedge_booked:
+                    booked.append(hedge_booked)
+                    logger.info("OrderManager: hedge leg booked %s %s K%.0f [combo=%s]",
+                                hedge_sig.get("symbol"), hedge_sig.get("side"),
+                                float(hedge_sig.get("strike") or 0), combo_id)
+                else:
+                    logger.info("OrderManager: hedge leg rejected by gate/guard for %s",
+                                primary.get("symbol"))
+        except Exception:
+            logger.exception("submit_with_hedge: hedge failed (non-fatal) for %s",
+                             primary.get("symbol"))
+
+        return booked
+
     def _apply_pre_market_gate(self, opportunities, book=None, enforce_position_cap=True):
         """
         Apply the 5-gate pre-market quality filter before booking.
@@ -356,6 +418,16 @@ class OrderManager:
             accepted_this_batch = 0   # running tally within this submit call
 
             for r in rows:
+                # pre_market_gate is a BUYER quality filter (Gate 1 rejects high
+                # IVR, Gate 2 rejects IV/HV > 1.0, Gate 3 rejects far-OTM) — the
+                # exact opposite of what an IV-seller short leg wants. Sold
+                # premium legs skip straight through; Gate 5's position cap and
+                # the daily-loss/concentration gates (checked elsewhere in the
+                # caller) still apply.
+                if r.get("direction") == "short" or r.get("skip_pre_market_gate"):
+                    kept.append(r)
+                    accepted_this_batch += 1
+                    continue
                 result = pre_market_gate.evaluate(
                     security_id   = r.get("security_id"),
                     symbol        = r.get("symbol", ""),
@@ -435,6 +507,11 @@ class OrderManager:
 
             kept = []
             for r in rows:
+                # Short legs (hedge or IV-seller) are risk-reducing relative to
+                # the same direction — don't count them against the long-CE/PE cap.
+                if r.get("direction") == "short":
+                    kept.append(r)
+                    continue
                 side = norm_side(r.get("side") or r.get("type"))
                 sym  = str(r.get("symbol", "")).upper()
                 sec  = sector_map.get(sym)
@@ -496,6 +573,12 @@ class OrderManager:
 
             kept = []
             for r in rows:
+                # Same buyer-direction assumption as pre_market_gate (CE bought
+                # into a red tape is a bad bet; CE SOLD into a red tape is fine
+                # or better) — short legs skip this gate too.
+                if r.get("direction") == "short":
+                    kept.append(r)
+                    continue
                 side = r.get("side") or r.get("type")
                 block, reason = breadth.breadth_blocks(side, r.get("symbol", ""), snap, bcfg)
                 if block and bmode == "hard":

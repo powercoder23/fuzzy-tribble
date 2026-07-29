@@ -441,11 +441,22 @@ class DirectionalIVScanner:
             )
             for entry in entries:
                 entry["symbol"] = symbol
+                entry["security_id"] = security_id
+                entry["exchange_segment"] = segment
+                entry["expiry"] = expiry
                 entry["trend"] = trend_context.get("trend", "neutral")
                 entry["trend_strength"] = trend_context.get("trend_strength", "neutral")  # FIX 5
                 entry["hv"] = round(hv_metrics.get("weighted_hv") or 0, 2)
                 entry["atm_iv"] = round(atm_context.get("atm_iv") or 0, 2)
                 candidates.append(entry)
+
+        # Cache the chain data so the runner can pass it to submit_with_hedge
+        # for hedge-leg selection without a second API call.
+        self._chain_cache = getattr(self, "_chain_cache", {})
+        self._chain_cache[str(security_id)] = {
+            "last_price": spot_price,
+            "oc": option_chain,
+        }
 
         candidates.sort(key=lambda item: item["score"], reverse=True)
         return candidates

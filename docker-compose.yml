@@ -104,11 +104,11 @@ services:
       - iv-collector
     command: python vol_expansion_runner.py
 
-  # ── Service 5: Directional IV Strategy (DISCONTINUED) ───────────────────
-  # Excluded from default `docker-compose up` via profile.
-  # To run manually: docker-compose --profile directional-iv up directional-iv
+  # ── Service 5: Directional IV Strategy ───────────────────────────────────
+  # Re-enabled: now paper-trades top candidates as debit spreads via
+  # OrderManager.submit_with_hedge. Monitoring is handled by the discount
+  # container's 5-min monitor cycle.
   directional-iv:
-    profiles: [directional-iv]
     build:
       context: .
       dockerfile: Dockerfile.directional
@@ -125,6 +125,27 @@ services:
     depends_on:
       - iv-collector
     command: python directional_iv_runner.py
+
+  # ── IV Seller Strategy (short strangle/straddle on rich IV) ─────────────
+  # Paper dryrun activated: books short combos into paper_trades.db via
+  # OrderManager.submit_external_signal. No live orders (AUTO_EXECUTE not set).
+  iv-seller:
+    build:
+      context: .
+      dockerfile: Dockerfile.directional
+    container_name: iv-seller-strategy
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - iv-collector
+    command: python iv_seller_runner.py
 
   # ── Option-buyer scanners (alert-only, zero broker/NSE calls) ─────────────
   # No `profiles:` -> these start automatically with the normal daily command:
@@ -285,6 +306,7 @@ services:
     environment:
       TZ: Asia/Kolkata
       APP_TIMEZONE: Asia/Kolkata
+      ENGINE_PAPER_MODE: paper
     volumes:
       - .:/app
       - ./data:/app/data
