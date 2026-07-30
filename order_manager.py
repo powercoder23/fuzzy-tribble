@@ -255,11 +255,16 @@ class OrderManager:
             logger.exception("daily-loss alert could not be sent")
 
     # ---- intake: a scanner hands booked signals to the manager ------------- #
-    def submit_signals(self, opportunities, now=None, lot_size_fn=None):
+    def submit_signals(self, opportunities, now=None, lot_size_fn=None,
+                      hedge_chain_fetcher=None, hedge_n_strikes=None):
         """Book the top qualifying signals (caps / dedup / cutoff enforced by
         paper_trader.process_signals). Applies the pre-market quality gate
         (IVR / IV-HV / OTM% / PCR / position-cap) and the composite entry
-        gate before reaching paper_trader. Returns the list of opened signals."""
+        gate before reaching paper_trader. Returns the list of opened signals.
+
+        hedge_chain_fetcher / hedge_n_strikes: passed straight through to
+        paper_trader.process_signals — see its docstring. Pass a fetcher to
+        have every opened primary paired with an OTM short hedge leg."""
         # Book-level daily-loss lockout — checked FIRST so a losing day can't
         # keep adding new risk (open positions are still managed by track()).
         locked, day_pnl = self._daily_loss_locked(self.book, now)
@@ -271,7 +276,8 @@ class OrderManager:
         opportunities = self._apply_entry_gate(opportunities)
         opportunities = self._apply_concentration_gate(opportunities, self.book)
         opened = paper_trader.process_signals(
-            self.book, opportunities, now=now, lot_size_fn=lot_size_fn
+            self.book, opportunities, now=now, lot_size_fn=lot_size_fn,
+            hedge_chain_fetcher=hedge_chain_fetcher, hedge_n_strikes=hedge_n_strikes,
         )
         if opened:
             logger.info("OrderManager: accepted %d new position(s)", len(opened))

@@ -146,12 +146,23 @@ INTRADAY = {
                                   # (see paper_trader.book_signal), not just discount.
 }
 
-# --- Kill switch (2026-07-29) --------------------------------------------
+# --- Kill switch (2026-07-29, re-enabled 2026-07-30) ---------------------
 # Post-grouping review showed the discount scanner's paper trades had turned
-# bad. Scanning + Telegram alerts stay on; only the paper_trader.process_signals
-# hand-off in main.py's run_scan_cycle is gated on this flag. Flip back to True
-# once the scanner is re-tuned and re-validated.
-PAPER_TRADING_ENABLED = False
+# bad (naked long premium, unhedged). Re-enabled now that the hand-off routes
+# through submit_with_hedge (see main.py run_scan_cycle) — every discount buy
+# is a capped debit spread, not a naked long, addressing the loss profile that
+# triggered the original kill switch. Scanning + Telegram alerts were never
+# affected; this flag only ever gated the paper_trader hand-off.
+PAPER_TRADING_ENABLED = True
+
+# Discount's hedge leg sits closer to the primary strike than B&B/directional-
+# IV's shared default (hedge_config.HEDGE_STRIKES_OTM=3) — a deliberate
+# difference so discount's spreads aren't just a copy of the other strategies':
+# narrower spread -> smaller net debit and higher probability of reaching max
+# profit, at the cost of a lower profit cap. Gives the paper book a genuinely
+# different risk/reward shape to compare against B&B/directional-IV's wider
+# spreads once there's enough sample size to judge.
+DISCOUNT_HEDGE_STRIKES_OTM = int(os.getenv("DISCOUNT_HEDGE_STRIKES_OTM", "2"))
 
 # --- Universe (DISCOUNT SCANNER ONLY) -----------------------------------
 # Trim the scan universe to the most liquid F&O names. Ranking uses the latest

@@ -2005,6 +2005,15 @@ class DiscountedPremiumScanner:
         A strong directional signal (clear trend + tradeable delta + not-cheap IV)
         takes PRIORITY and returns "directional". Otherwise the volatility check
         decides; anything that is neither returns None and is skipped upstream.
+
+        2026-07-30: dropped the `iv_trend <= 0.05` requirement that used to hard-
+        exclude expanding-IV names from the volatility bucket (that edge was
+        deliberately left to the separate vol_expansion_strategy.py module, whose
+        own liquidity floor is tight enough that it rarely books — so the edge was
+        going unexploited). Cheap-vs-peers (skew_discount) or cheap-vs-own-history
+        (iv_rank<40) is now sufficient regardless of which way IV is currently
+        trending; see the context_adjustment below for how trend still affects
+        scoring instead of gating.
         """
         # Priority: a strong directional signal wins over volatility.
         is_strong_directional = (
@@ -2015,10 +2024,10 @@ class DiscountedPremiumScanner:
         if is_strong_directional:
             return "directional"
 
-        # Then check volatility (existing logic unchanged).
+        # Then check volatility — cheap on either measure qualifies, independent
+        # of iv_trend direction (see docstring).
         is_volatility_trade = (
-            ((iv_rank is not None and iv_rank < 40) or (skew_discount is not None and skew_discount > 0.1)) and
-            (iv_trend is None or iv_trend <= 0.05)
+            (iv_rank is not None and iv_rank < 40) or (skew_discount is not None and skew_discount > 0.1)
         )
         return "volatility" if is_volatility_trade else None
 
@@ -2375,8 +2384,12 @@ class DiscountedPremiumScanner:
                 if iv_trend is not None:
                     if iv_trend < 0:
                         context_adjustment += 8
-                    elif iv_trend > 0:
-                        context_adjustment -= 10
+                    # 2026-07-30: expanding IV (iv_trend > 0) used to be
+                    # penalized here to steer clear of vol_expansion_strategy.py's
+                    # turf; that filter is removed (see classify_trade_type) so
+                    # expansion setups are no longer scored down either — neutral,
+                    # not rewarded, since we don't yet have data on whether
+                    # discount's cheap-vs-peers edge holds up on expanding names.
 
             score += context_adjustment
 

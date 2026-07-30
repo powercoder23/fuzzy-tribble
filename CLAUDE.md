@@ -10,15 +10,21 @@ from **Upstox** via `upstox_adapter.UpstoxDhanAdapter` (a Dhan-surface shim —
 the internal data contract still uses the Dhan response shape). Dhan is NOT
 used for data; it is reserved only for possible future live order placement.
 
-## Service layout (docker-compose.prod.yml — current reality)
+## Service layout (docker-compose.yml — current reality, verified 2026-07-30)
+
+Only `momentum` is profile-gated (`profiles: [momentum]`) — everything else,
+including `discount`, `directional-iv`, and `iv-seller`, starts automatically
+with the normal `docker-compose up` (no profile needed). A comment in the
+compose file above the always-on scanner block says as much: "No `profiles:`
+-> these start automatically with the normal daily command."
 
 | #  | Service         | Container               | Entry                            | Default up? | Trades? |
 |----|-----------------|-------------------------|----------------------------------|-------------|---------|
 | 1  | iv-collector    | iv-collector            | `collectors.iv_collector_service`| yes         | No (data only) |
 | 2  | momentum        | momentum-strategy       | `momentum_runner.py`             | no (`profiles: [momentum]`, discontinued) | Yes |
-| 3  | discount        | discount-strategy       | `main.py`                        | **yes**     | Paper |
-| 4  | break-bounce    | break-bounce-strategy   | `break_bounce_runner.py`         | yes         | Yes |
-| 5  | directional-iv  | directional-iv-strategy | `directional_iv_runner.py`       | no (profile, discontinued) | Yes |
+| 3  | discount        | discount-strategy       | `main.py`                        | yes         | Paper — **but `discount_config.PAPER_TRADING_ENABLED = False`** (hardcoded kill switch since 2026-07-29), so it currently scans/alerts only and never books |
+| 4  | break-bounce    | break-bounce-strategy   | `break_bounce_runner.py`         | yes         | Paper (+ debit-spread hedge leg, see below) |
+| 5  | directional-iv  | directional-iv-strategy | `directional_iv_runner.py`       | yes (no profile gate) | Paper (+ hedge leg); gated by a tight `IV_FILTER` (ATM IV ≤45, IV rank ≤65, delta 0.18–0.40, `MIN_SCORE`=65) so it often finds nothing to book |
 | 6  | iv-rank         | iv-rank-scanner         | `iv_rank_runner.py`              | yes         | No (alerts) |
 | 7  | oi-buildup      | oi-buildup-scanner      | `oi_buildup_runner.py`           | yes         | No (alerts; feeds auto-exit) |
 | 8  | gap-scan        | gap-scanner             | `gap_scanner_runner.py`          | yes         | No (alerts) |
@@ -26,7 +32,9 @@ used for data; it is reserved only for possible future live order placement.
 | 10 | smart-money     | smart-money-scanner     | `smart_money_runner.py`          | yes         | No (alerts) |
 | 11 | composite       | composite-scanner       | `composite_runner.py`            | yes         | No (feeds entry gate) |
 | 12 | sonar           | sonar-scanner           | `sonar_laplace_runner.py`        | yes         | No (feeds entry veto + risk warnings) |
-| 13 | vol-expansion   | vol-expansion-strategy  | `vol_expansion_runner.py`        | yes         | Paper |
+| 13 | vol-expansion   | vol-expansion-strategy  | `vol_expansion_runner.py`        | yes         | Paper; gated by `BUY_ZONE_ONLY=true` + liquidity floor (`LIQ_MIN_OI`/`LIQ_MIN_VOLUME`) — a tight combination that can leave every scan (09:45/11:00/13:00) empty |
+| 14 | iv-seller       | iv-seller-strategy      | `iv_seller_runner.py`            | yes (no profile gate) | Paper dry-run (short legs); gated by `SELL_ZONE_MIN`=65 (needs genuinely rich IV) |
+| 15 | convex-engine   | convex-engine           | `engine_runner.py`               | yes         | No — P0 observe-only journal (decisions logged, no order path yet) |
 
 API callers: `iv-collector` sweeps option chains continuously; the `discount`
 service also fetches chains + candles during its 15-min scans, and `sonar`

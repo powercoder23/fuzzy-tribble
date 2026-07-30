@@ -140,6 +140,64 @@ class IVSellerRunner:
                 combos_booked_today += 1
                 symbol_booked_today[combo["symbol"]] = symbol_booked_today.get(combo["symbol"], 0) + 1
 
+    def run_scan_0dte(self):
+        """Weekly-expiry-day short premium — separate from run_scan's 7-15 DTE
+        swing window. Same booking path/caps, different candidate set (must be
+        today's expiry) and tighter risk multiples (see iv_seller_config)."""
+        if not cfg.ZERO_DTE_ENABLED:
+            return
+        now = datetime.now()
+        if now.strftime("%H:%M") >= INTRADAY["no_entry_after"]:
+            logger.info("Past entry cutoff %s — no new 0DTE combos", INTRADAY["no_entry_after"])
+            return
+
+        logger.info("=" * 70)
+        logger.info("IV Seller 0DTE scan (find + book weekly-expiry-day combos)")
+        logger.info("=" * 70)
+        try:
+            combos = self.scanner.scan_all_underlyings_0dte()
+        except Exception:
+            logger.exception("IV seller 0DTE scan failed")
+            return
+
+        if not combos:
+            logger.info("IV seller 0DTE: no qualifying combos this cycle (not expiry day for any rich-IV name)")
+            return
+
+        om = self._om()
+        lot_fn = self.lot_fn()
+        combos_booked_today = 0
+        symbol_booked_today: dict = {}
+
+        for combo in combos:
+            if not self._combo_caps_ok(combos_booked_today, symbol_booked_today, combo["symbol"]):
+                logger.info("IV seller 0DTE: cap reached — skipping remaining combos")
+                break
+
+            combo_id = f"{combo['symbol']}_{now.date().isoformat()}_0dte_{uuid.uuid4().hex[:8]}"
+            lot = lot_fn(combo["symbol"]) or 1
+            booked_legs = 0
+            for leg in combo["legs"]:
+                sig = dict(leg)
+                sig["lot_size"] = lot
+                sig["combo_id"] = combo_id
+                try:
+                    booked = om.submit_external_signal(sig, now=now)
+                except Exception:
+                    logger.exception("IV seller 0DTE: booking failed for %s %s", combo["symbol"], leg["side"])
+                    booked = None
+                if booked:
+                    booked_legs += 1
+                    logger.info("IV seller 0DTE: booked %s %s %s @ %.2f [%s] combo=%s",
+                                combo["symbol"], leg["side"], leg["strike"], leg["entry"],
+                                combo["structure"], combo_id)
+                else:
+                    logger.info("IV seller 0DTE: leg not booked (gate/guard) %s %s", combo["symbol"], leg["side"])
+
+            if booked_legs:
+                combos_booked_today += 1
+                symbol_booked_today[combo["symbol"]] = symbol_booked_today.get(combo["symbol"], 0) + 1
+
     def run_eod(self):
         """Backstop square-off, mirroring break_bounce_strategy.run_eod — the
         discount container's own 15:20 square-off is the primary backstop; this
@@ -163,6 +221,10 @@ def main():
     for day in WEEKDAYS:
         for t in SCAN_TIMES:
             getattr(schedule.every(), day).at(t).do(runner.run_scan)
+        # 0DTE: scheduled every day rather than hardcoding a weekday, since
+        # scan_all_underlyings_0dte() naturally no-ops on any day that isn't
+        # actually an expiry day for a rich-IV name (see _select_expiry_0dte).
+        getattr(schedule.every(), day).at(cfg.ZERO_DTE_ENTRY_TIME).do(runner.run_scan_0dte)
         getattr(schedule.every(), day).at(EOD_TIME).do(runner.run_eod)
 
     logger.info("IV Seller strategy scheduler started")

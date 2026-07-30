@@ -116,6 +116,17 @@ class IVSellerScanner:
                 return expiry
         return expiries[0]
 
+    def _select_expiry_0dte(self, security_id, segment):
+        """The expiry landing TODAY (DTE=0) — no fallback; if today isn't this
+        underlying's expiry day, there is no 0DTE trade for it."""
+        expiries = self.scanner.get_expiry_list(security_id, segment)
+        if not expiries:
+            return None
+        for expiry in expiries:
+            if self.scanner.days_to_expiry(expiry) == 0:
+                return expiry
+        return None
+
     def _pick_strangle_leg(self, option_chain, side_key, target_delta):
         """Nearest-delta strike (by |delta - target|) among liquid strikes."""
         best = None
@@ -154,15 +165,25 @@ class IVSellerScanner:
         return (float(atm_strike), opt, pricing, delta)
 
     def _build_leg(self, symbol, security_id, segment, expiry, dte, side_label,
-                    strike, pricing, delta, candidate):
+                    strike, pricing, delta, candidate, dte_mode="swing"):
         """One short leg: entry = bid (what selling actually fills at), SL/target
         are credit multiples of that entry (mirrors discount_config.TRADE_PLAN's
-        "multiples of entry" style, inverted for a sold position)."""
+        "multiples of entry" style, inverted for a sold position).
+
+        dte_mode="0dte" uses the tighter ZERO_DTE_* multiples (faster gamma =
+        cut losses sooner) and tags the strategy label so it's distinguishable
+        in the paper book from the 7-15 DTE swing structure."""
         entry = round(pricing["bid"] or pricing["mid_price"] or 0.0, 2)
         if entry <= 0:
             return None
-        sl = round(entry * cfg.SL_CREDIT_MULT, 2)
-        target = round(entry * cfg.TARGET_CREDIT_MULT, 2)
+        if dte_mode == "0dte":
+            sl_mult, target_mult = cfg.ZERO_DTE_SL_CREDIT_MULT, cfg.ZERO_DTE_TARGET_CREDIT_MULT
+            strategy_label = f"{candidate['structure']} [0DTE]"
+        else:
+            sl_mult, target_mult = cfg.SL_CREDIT_MULT, cfg.TARGET_CREDIT_MULT
+            strategy_label = candidate["structure"]
+        sl = round(entry * sl_mult, 2)
+        target = round(entry * target_mult, 2)
         return {
             "symbol": symbol,
             "security_id": security_id,
@@ -185,17 +206,19 @@ class IVSellerScanner:
             "dte": dte,
             "direction": "short",
             "structure": candidate["structure"],
-            "strategy": candidate["structure"],
+            "strategy": strategy_label,
         }
 
-    def scan_underlying(self, candidate: dict) -> dict | None:
+    def scan_underlying(self, candidate: dict, dte_mode: str = "swing") -> dict | None:
         symbol = candidate["symbol"]
         security_id = candidate["security_id"]
         segment = "IDX_I" if symbol in {"NIFTY", "BANKNIFTY"} else "NSE_FNO"
 
-        expiry = self._select_expiry(security_id, segment)
+        expiry = (self._select_expiry_0dte(security_id, segment) if dte_mode == "0dte"
+                  else self._select_expiry(security_id, segment))
         if not expiry:
-            logger.info("IV seller: no expiry in DTE band for %s", symbol)
+            logger.info("IV seller%s: no expiry for %s",
+                        " 0DTE" if dte_mode == "0dte" else "", symbol)
             return None
         dte = self.scanner.days_to_expiry(expiry)
 
@@ -235,9 +258,9 @@ class IVSellerScanner:
         pe_strike, pe_opt, pe_pricing, pe_delta = pe
 
         ce_leg = self._build_leg(symbol, security_id, segment, expiry, dte, "CE",
-                                  ce_strike, ce_pricing, ce_delta, candidate)
+                                  ce_strike, ce_pricing, ce_delta, candidate, dte_mode=dte_mode)
         pe_leg = self._build_leg(symbol, security_id, segment, expiry, dte, "PE",
-                                  pe_strike, pe_pricing, pe_delta, candidate)
+                                  pe_strike, pe_pricing, pe_delta, candidate, dte_mode=dte_mode)
         if not ce_leg or not pe_leg:
             return None
 
@@ -263,5 +286,22 @@ class IVSellerScanner:
                 time.sleep(1)  # rate-limit, same convention as directional_iv
             except Exception:
                 logger.exception("IV seller: scan failed for %s", candidate.get("symbol"))
+        combos.sort(key=lambda c: c["iv_percentile"], reverse=True)
+        return combos
+
+    def scan_all_underlyings_0dte(self) -> list[dict]:
+        """0DTE variant: same rich-IV candidate list, a stricter IV bar
+        (ZERO_DTE_SELL_ZONE_MIN), and an expiry that must land today."""
+        combos = []
+        for candidate in self._iv_sell_candidates():
+            if candidate["iv_percentile"] < cfg.ZERO_DTE_SELL_ZONE_MIN:
+                continue
+            try:
+                combo = self.scan_underlying(candidate, dte_mode="0dte")
+                if combo:
+                    combos.append(combo)
+                time.sleep(1)
+            except Exception:
+                logger.exception("IV seller 0DTE: scan failed for %s", candidate.get("symbol"))
         combos.sort(key=lambda c: c["iv_percentile"], reverse=True)
         return combos

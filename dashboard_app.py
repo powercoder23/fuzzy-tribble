@@ -340,7 +340,8 @@ def analytics_skew_tilt(symbol: str, wing: int = Query(3, ge=1, le=7)):
 _PT_COLS = """date, symbol, side, strike, expiry, entry, last_price,
                sl, t1, t2, lot_size, score, iv, hv, iv_rank,
                realized_pct, realized_rupees, status, strategy,
-               opened_at, closed_at, exit_reason, factors_json"""
+               opened_at, closed_at, exit_reason, factors_json,
+               direction, combo_id"""
 
 
 @app.get("/api/paper-trades")

@@ -701,12 +701,22 @@ def signal_from_row(row, lot_size_fn=None):
 
 
 def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
-                    lot_size_fn=None):
+                    lot_size_fn=None, hedge_chain_fetcher=None, hedge_n_strikes=None):
     """Open paper trades for the top volatility plays and send alerts.
 
     `opportunities` may be a pandas DataFrame or a list of dicts. Only
     "Volatility Expansion Play" rows are considered. Honors no_entry_after,
     the daily cap, and per symbol+strike+side dedup.
+
+    hedge_chain_fetcher : optional callable(sig) -> {"oc": {...}, "last_price": n}
+        or None. When provided and hedge_config.ENABLED, every opened primary
+        also gets an OTM short hedge leg booked as the second side of a debit
+        spread (mirrors OrderManager.submit_with_hedge, but inline here since
+        discount's batch already passed the shared quality gates before
+        reaching this function — the hedge leg itself never needs those gates,
+        same as every other strategy's hedge leg).
+    hedge_n_strikes : optional int override for how many strikes OTM the hedge
+        leg sits (falls back to hedge_config.HEDGE_STRIKES_OTM).
     """
     now = now or datetime.now()
     date = now.date().isoformat()
@@ -805,10 +815,38 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
                             float(sig.get("entry") or 0), float(sig.get("sl") or 0),
                             sig.get("lot_size"))
                 continue
+        if hedge_chain_fetcher is not None:
+            import uuid
+            sig["combo_id"] = f"{symbol}_{date}_{uuid.uuid4().hex[:6]}"
         book.open_trade(sig, now)
         send_telegram(format_signal_alert(sig), bot_token, chat_id)
         opened.append(sig)
         logger.info("Opened paper trade: %s %s %s", symbol, side, strike)
+
+        if hedge_chain_fetcher is not None:
+            try:
+                import hedge_config
+                import hedge as hedge_mod
+                if hedge_config.ENABLED:
+                    chain = hedge_chain_fetcher(sig)
+                    if chain:
+                        hedge_sig = hedge_mod.find_hedge_leg(
+                            chain=chain.get("oc"),
+                            spot=chain.get("last_price"),
+                            primary_strike=float(sig.get("strike") or 0),
+                            primary_side=str(sig.get("side") or ""),
+                            n_strikes=hedge_n_strikes or hedge_config.HEDGE_STRIKES_OTM,
+                            signal_template=sig,
+                        )
+                        if hedge_sig:
+                            hedge_sig["combo_id"] = sig["combo_id"]
+                            book.open_trade(hedge_sig, now)
+                            send_telegram(format_signal_alert(hedge_sig), bot_token, chat_id)
+                            opened.append(hedge_sig)
+                            logger.info("Opened hedge leg: %s %s %s",
+                                        symbol, hedge_sig.get("side"), hedge_sig.get("strike"))
+            except Exception:
+                logger.exception("Discount hedge leg failed (non-fatal) for %s %s", symbol, side)
     return opened
 
 

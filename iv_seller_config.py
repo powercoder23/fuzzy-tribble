@@ -73,3 +73,23 @@ TELEGRAM_ALERT_THRESHOLD = float(os.getenv("IV_SELLER_TELEGRAM_ALERT_THRESHOLD",
 
 STRATEGY_STRANGLE = "IV Short Strangle"
 STRATEGY_STRADDLE = "IV Short Straddle"
+
+# --------------------------------------------------------------------------- #
+# 0DTE mode (2026-07-30): sell premium specifically on the weekly expiry DAY
+# itself (DTE=0), separate from the DTE_MIN..DTE_MAX swing window above. Same
+# rich-IV candidate list and strike-selection logic, but the expiry pick MUST
+# land today (no DTE-band fallback — if it isn't expiry day for a name, there
+# is no 0DTE trade for it), a stricter IV bar, and a tighter stop: 0DTE gamma
+# moves far faster than a 7-15 DTE short, so losses need to be cut sooner.
+# (No separate risk-rupee cap here — iv_seller signals don't set
+# skip_risk_cap, so they're already bound by the same global
+# INTRADAY["max_risk_rupees"] ceiling every other strategy without its own
+# risk model uses; a second unused constant would just be dead config.)
+# --------------------------------------------------------------------------- #
+ZERO_DTE_ENABLED            = os.getenv("IV_SELLER_0DTE_ENABLED", "true").strip().lower() == "true"
+ZERO_DTE_SELL_ZONE_MIN       = float(os.getenv("IV_SELLER_0DTE_SELL_ZONE_MIN", "70"))
+ZERO_DTE_SL_CREDIT_MULT      = float(os.getenv("IV_SELLER_0DTE_SL_CREDIT_MULT", "1.5"))    # cut at -50%, not -100%
+ZERO_DTE_TARGET_CREDIT_MULT  = float(os.getenv("IV_SELLER_0DTE_TARGET_CREDIT_MULT", "0.40"))
+# Entry only after the opening-45-min volatility settles — 0DTE gamma is worst
+# right at the open.
+ZERO_DTE_ENTRY_TIME = os.getenv("IV_SELLER_0DTE_ENTRY_TIME", "10:30")

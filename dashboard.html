@@ -188,6 +188,17 @@
   .tag.blockdeal  { background: rgba(99,102,241,.15); color: var(--blue); }
   .tag.delivery   { background: rgba(226,232,240,.12); color: var(--text); }
   .tag.na { background: var(--surface2); color: var(--muted); }
+  .tag.buy  { background: rgba(16,185,129,.15); color: var(--green); }
+  .tag.sell { background: rgba(239,68,68,.15); color: var(--red); }
+
+  /* ── Hedge/combo grouping (paired long+short legs) ───────────── */
+  .data-table tr.combo-header td {
+    background: var(--surface2); border-bottom: 1px solid var(--border);
+    font-size: 11px; color: var(--muted); padding: 8px;
+  }
+  .data-table tr.combo-header .combo-label { color: var(--text); font-weight: 600; margin-right: 12px; }
+  .data-table tr.combo-header .combo-meta span { margin-right: 14px; white-space: nowrap; }
+  .data-table tr.combo-leg td { background: rgba(245,158,11,.04); }
 
   .pnl-pos { color: var(--green); } .pnl-neg { color: var(--red); }
   .pnl-live { color: var(--amber); font-size: 9px; vertical-align: middle; animation: pnlPulse 1.6s ease-in-out infinite; }
@@ -329,6 +340,9 @@
       letter-spacing: .04em; flex: 0 0 auto;
     }
     .data-table.stack td:first-child { font-weight: 600; border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 2px; }
+    .data-table.stack tr.combo-header { border: none; background: transparent; padding: 0 2px; margin-bottom: 4px; }
+    .data-table.stack tr.combo-header td { display: block; text-align: left; padding: 4px 0; }
+    .data-table.stack tr.combo-header .combo-meta span { display: inline-block; margin: 2px 10px 2px 0; }
   }
 </style>
 </head>
@@ -817,8 +831,12 @@ function fmtTime(ts) {
 function tradePnl(t) {
   if (t.status === 'open') {
     const lot = t.lot_size || 1;
-    const rupees = ((t.last_price || 0) - (t.entry || 0)) * lot;
-    const pct = t.entry ? ((t.last_price || 0) - t.entry) / t.entry * 100 : 0;
+    const short = t.direction === 'short';
+    // Short (hedge) leg: premium sold, so it profits when price FALLS —
+    // sign is flipped vs. a long leg.
+    const diff = short ? (t.entry || 0) - (t.last_price || 0) : (t.last_price || 0) - (t.entry || 0);
+    const rupees = diff * lot;
+    const pct = t.entry ? diff / t.entry * 100 : 0;
     return { rupees, pct, live: true };
   }
   return { rupees: t.realized_rupees, pct: t.realized_pct, live: false };
@@ -1156,12 +1174,19 @@ function factorTip(t) {
   } catch(e) { return ''; }
 }
 
+function legSideTag(t) {
+  const short = t.direction === 'short';
+  return `<span class="tag ${short ? 'sell' : 'buy'}">${short ? 'SELL' : 'BUY'}</span>`;
+}
+
 function tradesTable(trades, showTotal = true) {
   if (!trades || !trades.length) return '<div class="empty-state">No trades in this view</div>';
   let totalPnl = 0, havePnl = false;
   // Show a Date column only when the set spans more than one trading day.
   const multiDay = new Set((trades || []).map(t => t.date).filter(Boolean)).size > 1;
-  const rows = trades.map(t => {
+  const colCount = (multiDay ? 1 : 0) + 11; // Date?, Side, Contract, Strategy, Entry, LTP, Target, Exit, In, Out, P&L, Status
+
+  const legRow = (t) => {
     const { rupees, pct, live } = tradePnl(t);
     if (rupees !== null && rupees !== undefined) { totalPnl += rupees; havePnl = true; }
     const status = t.status === 'open' ? 'open' : ((t.realized_rupees || 0) >= 0 ? 'win' : 'loss');
@@ -1172,10 +1197,14 @@ function tradesTable(trades, showTotal = true) {
     const tgt = (t.t1 != null && +t.t1 > 0) ? `₹${(+t.t1).toFixed(2)}` : '—';
     const tgtTitle = 'Target (full exit)';
     const cname = contractName(t);
-    return `<tr>
+    // Hedge legs carry a " [hedge]" strategy suffix for identification when
+    // ungrouped; once grouped under a combo header it's redundant — strip it.
+    const strategyLabel = t.combo_id ? (t.strategy || '—').replace(/\s*\[hedge\]\s*$/i, '') : (t.strategy || '—');
+    return `<tr class="${t.combo_id ? 'combo-leg' : ''}">
       ${multiDay ? `<td data-label="Date">${(t.date || '').slice(5)}</td>` : ''}
+      <td data-label="Side">${legSideTag(t)}</td>
       <td data-label="Contract" class="contract-cell" data-copy="${cname}" title="Click to copy" onclick="copyContract(this)">${cname}</td>
-      <td data-label="Strategy">${t.strategy || '—'}</td>
+      <td data-label="Strategy">${strategyLabel}</td>
       <td data-label="Entry">₹${(t.entry||0).toFixed(2)}</td>
       <td data-label="LTP">₹${(t.last_price||0).toFixed(2)}</td>
       <td data-label="Target" title="${tgtTitle}">${tgt}</td>
@@ -1185,8 +1214,60 @@ function tradesTable(trades, showTotal = true) {
       <td data-label="P&amp;L">${pnlCell}</td>
       <td data-label="Status"><span class="tag ${status}" title="${factorTip(t)}">${status.toUpperCase()}</span></td>
     </tr>`;
-  }).join('');
-  const table = `<table class="data-table stack"><thead><tr>${multiDay ? '<th>Date</th>' : ''}<th>Contract</th><th>Strategy</th><th>Entry</th><th>LTP</th><th>Target</th><th>Exit</th><th>In</th><th>Out</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>`;
+  };
+
+  // comboHeaderRow is rendered BEFORE its legs' tradePnl() calls run, so it
+  // computes its own combined P&L from the same legs rather than reading
+  // totalPnl (which is still mid-accumulation at that point).
+  const comboHeaderRow = (legs) => {
+    const long = legs.find(t => t.direction !== 'short') || legs[0];
+    const short = legs.find(t => t.direction === 'short');
+    const lot = long.lot_size || 1;
+    let combined = 0, haveCombined = false;
+    legs.forEach(t => {
+      const { rupees } = tradePnl(t);
+      if (rupees !== null && rupees !== undefined) { combined += rupees; haveCombined = true; }
+    });
+    let meta = `<span class="${combined>=0?'pnl-pos':'pnl-neg'}">Combined P&amp;L ${haveCombined ? fmtPnl(combined) : '—'}</span>`;
+    if (long && short) {
+      const nakedCost = (long.entry || 0) * lot;
+      const credit = (short.entry || 0) * lot;
+      const netDebit = nakedCost - credit;
+      const benefitPct = nakedCost ? (credit / nakedCost * 100) : 0;
+      meta = `<span>Margin required ₹${Math.round(netDebit).toLocaleString('en-IN')}</span>` +
+             `<span>Hedge benefit ₹${Math.round(credit).toLocaleString('en-IN')} saved (${benefitPct.toFixed(0)}% cheaper)</span>` +
+             meta;
+    }
+    const strikes = short ? `${fmtStrike(long.strike)}/${fmtStrike(short.strike)}` : fmtStrike(long.strike);
+    const label = `${long.symbol || ''} ${fmtExpiry(long.expiry)} ${ceOrPe(long.side)} ${strikes} spread`;
+    return `<tr class="combo-header"><td colspan="${colCount}"><span class="combo-label">🔗 ${label}</span><span class="combo-meta">${meta}</span></td></tr>`;
+  };
+
+  // Group legs sharing a combo_id (debit-spread hedge pairs) so they render
+  // together with a combined-P&L / margin / hedge-benefit header; everything
+  // else renders as a plain single-leg row.
+  const comboOrder = [];
+  const comboMap = new Map();
+  const singles = [];
+  trades.forEach(t => {
+    if (t.combo_id) {
+      if (!comboMap.has(t.combo_id)) { comboMap.set(t.combo_id, []); comboOrder.push(t.combo_id); }
+      comboMap.get(t.combo_id).push(t);
+    } else {
+      singles.push(t);
+    }
+  });
+
+  const rowsHtml = [];
+  singles.forEach(t => rowsHtml.push(legRow(t)));
+  comboOrder.forEach(id => {
+    const legs = comboMap.get(id);
+    rowsHtml.push(comboHeaderRow(legs));
+    legs.forEach(t => rowsHtml.push(legRow(t)));
+  });
+  const rows = rowsHtml.join('');
+
+  const table = `<table class="data-table stack"><thead><tr>${multiDay ? '<th>Date</th>' : ''}<th>Side</th><th>Contract</th><th>Strategy</th><th>Entry</th><th>LTP</th><th>Target</th><th>Exit</th><th>In</th><th>Out</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>`;
   if (!showTotal) return table;
   const totalBar = `<div class="trades-total-bar">
     <span class="ttb-label">Current Total P&amp;L</span>

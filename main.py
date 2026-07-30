@@ -21,7 +21,8 @@ from pathlib import Path
 import schedule
 
 from config import Config
-from discount import DiscountedPremiumScanner
+from discount import DiscountedPremiumScanner, unwrap_dhan_payload
+import discount_config
 from discount_config import INTRADAY, PAPER_TRADING_ENABLED
 from directional_iv_runner import run_directional_scan
 import paper_trader
@@ -137,6 +138,30 @@ class StrategySchedulerApp:
                 self._lot_fn = (lambda _s: 1)
         return self._lot_fn
 
+    def _hedge_chain_fetcher(self, sig):
+        """Fresh option-chain fetch for the hedge leg lookup — discount's
+        opportunity rows carry the single strike's data, not the full chain
+        hedge.find_hedge_leg needs, so refetch at signal time (same pattern
+        break_bounce_strategy.py uses for its own hedge leg)."""
+        try:
+            sec_id = sig.get("security_id")
+            seg = sig.get("exchange_segment")
+            expiry = sig.get("expiry")
+            if not (sec_id and seg and expiry):
+                return None
+            resp = self.scanner().get_option_chain(sec_id, seg, expiry)
+            if not (isinstance(resp, dict) and resp.get("status") == "success"):
+                return None
+            data = unwrap_dhan_payload(resp.get("data") or {})
+            oc = data.get("oc") or {}
+            spot = data.get("last_price")
+            if not oc or not spot:
+                return None
+            return {"oc": oc, "last_price": spot}
+        except Exception:
+            logger.exception("Discount hedge chain fetch failed for %s", sig.get("symbol"))
+            return None
+
     # --- jobs ---------------------------------------------------------------
     def run_scan_cycle(self):
         """Scanner job (every scan_interval_min, 15): find signals and SUBMIT the
@@ -160,12 +185,15 @@ class StrategySchedulerApp:
                 logger.info("Scan results saved to %s", output_path)
 
             # Booking a trade == handing it to the OrderManager.
-            # Kill switch (2026-07-29): discount-sourced paper trades went bad
-            # after the grouping change. Scan + suggester alerts stay live below;
-            # only the paper-trade hand-off is disabled. See discount_config.py.
+            # Kill switch (2026-07-29, re-enabled 2026-07-30): discount-sourced
+            # paper trades went bad as naked longs; re-enabled now that every
+            # buy routes through the hedge chain fetcher below, giving each
+            # trade a capped debit spread instead. See discount_config.py.
             if PAPER_TRADING_ENABLED:
                 self.order_manager().submit_signals(
-                    opportunities, now=now, lot_size_fn=self.lot_fn()
+                    opportunities, now=now, lot_size_fn=self.lot_fn(),
+                    hedge_chain_fetcher=self._hedge_chain_fetcher,
+                    hedge_n_strikes=discount_config.DISCOUNT_HEDGE_STRIKES_OTM,
                 )
             else:
                 logger.info("Discount paper trading disabled (PAPER_TRADING_ENABLED=False) — scan-only")

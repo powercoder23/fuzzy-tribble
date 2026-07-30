@@ -59,9 +59,12 @@ export function fmtTime(ts) {
 export function tradePnl(t) {
   if (t.status === 'open') {
     const lot = t.lot_size || 1;
+    const short = t.direction === 'short';
+    // Short (hedge) leg: premium sold, so it profits when price FALLS.
+    const diff = short ? (t.entry || 0) - (t.last_price || 0) : (t.last_price || 0) - (t.entry || 0);
     return {
-      rupees: ((t.last_price || 0) - (t.entry || 0)) * lot,
-      pct: t.entry ? ((t.last_price || 0) - t.entry) / t.entry * 100 : 0,
+      rupees: diff * lot,
+      pct: t.entry ? diff / t.entry * 100 : 0,
       live: true,
     };
   }

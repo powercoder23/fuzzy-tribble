@@ -74,8 +74,14 @@ T1_BOOK_FRACTION = float(os.getenv("VOL_EXP_T1_BOOK_FRACTION", "0.5"))
 MIN_PREMIUM     = float(os.getenv("VOL_EXP_MIN_PREMIUM", "5.0"))
 
 # ── Liquidity floor ──────────────────────────────────────────────────────── #
-LIQ_MIN_OI      = int(os.getenv("VOL_EXP_MIN_OI", "50000"))
-LIQ_MIN_VOLUME  = int(os.getenv("VOL_EXP_MIN_VOLUME", "1000"))
+# 2026-07-30: was min_oi=50000/min_volume=1000 — a 20x-tighter floor than every
+# sibling strategy (iv_seller/directional_iv both use 2500/500) with no
+# documented reason for the gap. Confirmed via live check that this was
+# starving the strategy: today's leaderboard had 2 genuine buy-zone names
+# (TCS, VEDL) with fresh directional reads, and 0 trades booked across the
+# first two daily scans. Aligned to the same floor the rest of the system uses.
+LIQ_MIN_OI      = int(os.getenv("VOL_EXP_MIN_OI", "2500"))
+LIQ_MIN_VOLUME  = int(os.getenv("VOL_EXP_MIN_VOLUME", "500"))
 LIQ_MAX_SPREAD  = float(os.getenv("VOL_EXP_MAX_SPREAD", "0.20")) # 20% of mid
 
 # ── Schedule (IST) ───────────────────────────────────────────────────────── #
