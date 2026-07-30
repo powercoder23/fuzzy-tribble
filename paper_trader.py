@@ -225,6 +225,54 @@ def apply_tick(trade, last_price, square_off=False):
     return events
 
 
+def apply_combo_tick(long_leg, short_leg, long_price, short_price):
+    """Evaluate a 2-leg debit-spread COMBO (one long + one short, same
+    combo_id) as a single unit — combined SL/target on the spread's net value,
+    not either leg's own SL/T1 (see hedge_config.py SPREAD_SL_PCT /
+    SPREAD_TARGET_CAPTURE_PCT for the rationale). When triggered, BOTH legs
+    are booked and finalized together, at their own observed prices (no
+    per-leg gap-fill logic — the trigger is the combined value, so each leg
+    just fills at its live LTP the instant the combined level is crossed).
+
+    Mutates both `long_leg` and `short_leg` in place. Returns the trigger
+    reason ("SPREAD_SL" / "SPREAD_TARGET"), or None if neither level is hit
+    (both legs untouched in that case — the caller falls through to whatever
+    handling it wants for a non-triggered combo).
+    """
+    import hedge_config
+
+    if long_leg.get("status") != "open" or short_leg.get("status") != "open":
+        return None
+
+    long_price = float(long_price)
+    short_price = float(short_price)
+    entry_debit = float(long_leg["entry"]) - float(short_leg["entry"])
+    if entry_debit <= 0:
+        return None  # not a real debit spread (credit/zero-cost) — skip combo logic
+
+    spread_value = long_price - short_price
+    strike_width = abs(float(long_leg["strike"]) - float(short_leg["strike"]))
+    sl_level = entry_debit * (1 - hedge_config.SPREAD_SL_PCT)
+    max_profit_potential = max(strike_width - entry_debit, 0.0)
+    target_level = entry_debit + max_profit_potential * hedge_config.SPREAD_TARGET_CAPTURE_PCT
+
+    reason = None
+    if spread_value <= sl_level:
+        reason = "SPREAD_SL"
+    elif spread_value >= target_level:
+        reason = "SPREAD_TARGET"
+    if reason is None:
+        return None
+
+    long_leg["last_price"] = long_price
+    short_leg["last_price"] = short_price
+    _book(long_leg, long_leg["qty_frac"], long_price)
+    _finalize(long_leg, reason)
+    _book(short_leg, short_leg["qty_frac"], short_price)
+    _finalize(short_leg, reason)
+    return reason
+
+
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
@@ -244,7 +292,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     exit_reason TEXT, realized_points REAL, realized_pct REAL, realized_rupees REAL,
     half_spread REAL, gross_points REAL, slippage_points REAL,
     costs_rupees REAL, factors_json TEXT,
-    direction TEXT DEFAULT 'long', combo_id TEXT
+    direction TEXT DEFAULT 'long', combo_id TEXT, spot REAL
 );
 """
 
@@ -265,6 +313,9 @@ _MIGRATE_COLUMNS = {
     "factors_json":    "TEXT",
     "direction":       "TEXT DEFAULT 'long'",
     "combo_id":        "TEXT",
+    # Spot at signal time — needed to estimate the naked-short margin a hedge
+    # leg would otherwise require (see hedge.py estimate_naked_short_margin).
+    "spot":            "REAL",
 }
 
 
@@ -342,8 +393,8 @@ class PaperTradeBook:
                     strike, expiry, entry, sl, t1, t2, t1_book_fraction, lot_size,
                     score, iv, hv, iv_rank, dte, strategy, status, t1_done, qty_frac,
                     booked_points, runner_stop, last_price,
-                    half_spread, factors_json, direction, combo_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    half_spread, factors_json, direction, combo_id, spot)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     date, now.strftime("%Y-%m-%d %H:%M:%S"),
                     signal["symbol"], str(signal.get("security_id")),
@@ -356,7 +407,7 @@ class PaperTradeBook:
                     signal.get("strategy", VOLATILITY_STRATEGY),
                     "open", 0, 1.0, 0.0, rt["runner_stop"], rt["entry"],
                     signal.get("half_spread"), signal.get("factors_json"),
-                    rt["direction"], signal.get("combo_id"),
+                    rt["direction"], signal.get("combo_id"), signal.get("spot"),
                 ),
             )
             return cur.lastrowid
@@ -431,6 +482,8 @@ def format_fill_update(trade, event):
         "SL": "🛑 SL hit — closed",
         "TIME": "⏱ Squared off 15:20",
         "RISK_EXIT": "🚪 Auto-exit — risk contradiction",
+        "SPREAD_TARGET": "🎯 Spread target hit — both legs closed",
+        "SPREAD_SL": "🛑 Spread SL hit — both legs closed",
     }.get(event, event)
     side = "CE" if str(trade.get("side", "")).upper() in ("CALL", "CE") else "PE"
     bits = [f"{label} • <b>{trade['symbol']}</b> {side} {_fmt(trade['strike'],0)} @ ₹{_fmt(trade['last_price'])}"]
@@ -815,22 +868,30 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
                             float(sig.get("entry") or 0), float(sig.get("sl") or 0),
                             sig.get("lot_size"))
                 continue
+        hedge_sig = None
         if hedge_chain_fetcher is not None:
             import uuid
             sig["combo_id"] = f"{symbol}_{date}_{uuid.uuid4().hex[:6]}"
-        book.open_trade(sig, now)
-        send_telegram(format_signal_alert(sig), bot_token, chat_id)
-        opened.append(sig)
-        logger.info("Opened paper trade: %s %s %s", symbol, side, strike)
 
-        if hedge_chain_fetcher is not None:
+            # Determine the hedge outcome BEFORE opening the primary so the
+            # reason (booked, or exactly why not) can be persisted into the
+            # primary's own factors_json pre-insert — this system's
+            # containers don't reliably persist stdout logs, so a silent,
+            # systemic hedge-booking failure (as happened for ~half of
+            # discount's first hedged batch on 2026-07-30) must be
+            # diagnosable from the DB, not require guesswork.
+            hedge_reason = None
             try:
                 import hedge_config
                 import hedge as hedge_mod
-                if hedge_config.ENABLED:
+                if not hedge_config.ENABLED:
+                    hedge_reason = "hedge_config.ENABLED=False"
+                else:
                     chain = hedge_chain_fetcher(sig)
-                    if chain:
-                        hedge_sig = hedge_mod.find_hedge_leg(
+                    if not chain:
+                        hedge_reason = "chain fetch failed or returned no usable data"
+                    else:
+                        hedge_sig, hedge_reason = hedge_mod.find_hedge_leg(
                             chain=chain.get("oc"),
                             spot=chain.get("last_price"),
                             primary_strike=float(sig.get("strike") or 0),
@@ -838,15 +899,31 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
                             n_strikes=hedge_n_strikes or hedge_config.HEDGE_STRIKES_OTM,
                             signal_template=sig,
                         )
-                        if hedge_sig:
-                            hedge_sig["combo_id"] = sig["combo_id"]
-                            book.open_trade(hedge_sig, now)
-                            send_telegram(format_signal_alert(hedge_sig), bot_token, chat_id)
-                            opened.append(hedge_sig)
-                            logger.info("Opened hedge leg: %s %s %s",
-                                        symbol, hedge_sig.get("side"), hedge_sig.get("strike"))
             except Exception:
-                logger.exception("Discount hedge leg failed (non-fatal) for %s %s", symbol, side)
+                logger.exception("Discount hedge lookup failed (non-fatal) for %s %s", symbol, side)
+                hedge_sig, hedge_reason = None, "exception during hedge lookup (see logs)"
+
+            try:
+                f = json.loads(sig.get("factors_json") or "{}")
+            except (TypeError, ValueError):
+                f = {}
+            f["hedge_attempt"] = {"booked": bool(hedge_sig), "reason": hedge_reason}
+            sig["factors_json"] = json.dumps(f)
+
+        book.open_trade(sig, now)
+        send_telegram(format_signal_alert(sig), bot_token, chat_id)
+        opened.append(sig)
+        logger.info("Opened paper trade: %s %s %s", symbol, side, strike)
+
+        if hedge_sig:
+            hedge_sig["combo_id"] = sig["combo_id"]
+            book.open_trade(hedge_sig, now)
+            send_telegram(format_signal_alert(hedge_sig), bot_token, chat_id)
+            opened.append(hedge_sig)
+            logger.info("Opened hedge leg: %s %s %s",
+                        symbol, hedge_sig.get("side"), hedge_sig.get("strike"))
+        elif hedge_chain_fetcher is not None:
+            logger.info("Discount hedge leg not booked for %s %s — %s", symbol, side, hedge_reason)
     return opened
 
 
@@ -932,27 +1009,92 @@ def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
     return signal
 
 
+def _combo_pairs(open_trades):
+    """Group open trades into 2-leg debit-spread pairs (one long + one short
+    sharing a combo_id). Combos with only one leg still open (the other
+    already closed independently, or a non-spread combo like iv-seller's
+    strangle/straddle where both legs are short) are excluded — those fall
+    through to the ordinary per-leg handling below."""
+    by_combo: dict = {}
+    for t in open_trades:
+        cid = t.get("combo_id")
+        if cid:
+            by_combo.setdefault(cid, []).append(t)
+    pairs = {}
+    for cid, legs in by_combo.items():
+        if len(legs) != 2:
+            continue
+        long_leg = next((l for l in legs if l.get("direction") != "short"), None)
+        short_leg = next((l for l in legs if l.get("direction") == "short"), None)
+        if long_leg is not None and short_leg is not None:
+            pairs[cid] = (long_leg, short_leg)
+    return pairs
+
+
+def _requote(scanner, trade):
+    """Fetch the latest LTP for one trade. Returns None if unavailable."""
+    try:
+        quote = scanner.get_current_option_premium(
+            trade["security_id"], trade["exchange_segment"],
+            trade["expiry"], trade["strike"], trade["side"],
+        )
+    except Exception:
+        logger.exception("Re-price failed for trade %s", trade.get("id"))
+        return None
+    if not quote or quote.get("last") in (None, 0):
+        return None
+    return quote.get("last") or quote.get("mid")
+
+
 def monitor(book, scanner, now=None, bot_token=None, chat_id=None, square_off=False):
-    """Re-price every open paper trade and advance its exit state machine."""
+    """Re-price every open paper trade and advance its exit state machine.
+
+    Debit-spread combos (one long + one short leg sharing a combo_id) enter
+    and exit TOGETHER: their combined spread value is checked against the
+    combined SL/target (hedge_config.SPREAD_SL_PCT / SPREAD_TARGET_CAPTURE_PCT)
+    instead of either leg's own individual SL/T1 — see apply_combo_tick.
+    Everything else (single-leg trades, and iv-seller's 2-short strangle/
+    straddle combos which aren't a defined-risk spread) keeps the ordinary
+    per-trade apply_tick behaviour unchanged. square_off always force-closes
+    per-leg at last known price regardless of combo status, so both legs of
+    a combo still exit in the SAME monitor pass at EOD.
+    """
     now = now or datetime.now()
     date = now.date().isoformat()
     closed = []
-    for trade in book.open_trades(date):
-        quote = None
-        try:
-            quote = scanner.get_current_option_premium(
-                trade["security_id"], trade["exchange_segment"],
-                trade["expiry"], trade["strike"], trade["side"],
-            )
-        except Exception:
-            logger.exception("Re-price failed for trade %s", trade.get("id"))
-        if not quote or quote.get("last") in (None, 0):
-            # No usable price; only act if we must square off (use last known).
+    open_trades = book.open_trades(date)
+
+    # Re-quote everything up front so the combo check and the per-leg
+    # fallback below both see the same tick's prices.
+    prices = {}
+    for trade in open_trades:
+        prices[trade["id"]] = _requote(scanner, trade)
+
+    combo_pairs = _combo_pairs(open_trades) if not square_off else {}
+    handled_ids = set()
+
+    for cid, (long_leg, short_leg) in combo_pairs.items():
+        lp, sp = prices.get(long_leg["id"]), prices.get(short_leg["id"])
+        if lp is None or sp is None:
+            continue  # can't evaluate the combined value this tick — skip, try next tick
+        reason = apply_combo_tick(long_leg, short_leg, lp, sp)
+        if reason is None:
+            continue
+        handled_ids.add(long_leg["id"])
+        handled_ids.add(short_leg["id"])
+        for leg in (long_leg, short_leg):
+            book.save_runtime(leg, now)
+            send_telegram(format_fill_update(leg, reason), bot_token=bot_token, chat_id=chat_id)
+            closed.append(leg)
+
+    for trade in open_trades:
+        if trade["id"] in handled_ids:
+            continue
+        last_price = prices.get(trade["id"])
+        if last_price is None:
             if not square_off:
                 continue
             last_price = trade.get("last_price") or trade["entry"]
-        else:
-            last_price = quote.get("last") or quote.get("mid") or trade["entry"]
 
         events = apply_tick(trade, last_price, square_off=square_off)
         book.save_runtime(trade, now)

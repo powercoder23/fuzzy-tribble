@@ -335,11 +335,17 @@ class OrderManager:
         Both legs share a combo_id so they appear linked in the DB and EOD
         summary. If the primary is rejected by gates the hedge is never booked.
         If the hedge leg is unavailable or rejected, the primary is still booked
-        as a single leg (graceful degradation).
+        as a single leg (graceful degradation) — but the reason is now
+        persisted into the primary's own factors_json (`hedge_attempt`) before
+        it's booked, since this system's containers don't reliably persist
+        stdout logs. A silent, systemic hedge-booking failure (as happened for
+        ~half of discount's first hedged batch on 2026-07-30) must be
+        diagnosable from the DB, not require guesswork.
 
         Returns list of booked signal dicts ([] primary rejected, [p] single-leg,
         [p, h] full spread).
         """
+        import json as _json
         import hedge_config
         import hedge as hedge_mod
 
@@ -350,40 +356,57 @@ class OrderManager:
         primary = dict(primary_signal)
         primary["combo_id"] = combo_id
 
+        # Determine the hedge outcome BEFORE booking the primary so the
+        # reason can be attached to its factors_json pre-insert.
+        hedge_sig = None
+        if not hedge_config.ENABLED:
+            hedge_reason = "hedge_config.ENABLED=False"
+        elif not chain_data:
+            hedge_reason = "no chain_data provided by caller"
+        else:
+            try:
+                oc = chain_data.get("oc", {})
+                spot = float(chain_data.get("last_price") or 0)
+                hedge_sig, hedge_reason = hedge_mod.find_hedge_leg(
+                    chain=oc,
+                    spot=spot,
+                    primary_strike=float(primary.get("strike") or 0),
+                    primary_side=str(primary.get("side") or ""),
+                    n_strikes=hedge_config.HEDGE_STRIKES_OTM,
+                    signal_template=primary,
+                )
+            except Exception:
+                logger.exception("submit_with_hedge: hedge lookup failed for %s",
+                                 primary.get("symbol"))
+                hedge_sig, hedge_reason = None, "exception during hedge lookup (see logs)"
+
+        try:
+            base = _json.loads(paper_trader.collect_factor_snapshot(primary))
+        except Exception:
+            base = {}
+        base["hedge_attempt"] = {"booked": bool(hedge_sig), "reason": hedge_reason}
+        primary["factors_json"] = _json.dumps(base)
+
         booked: list = []
         primary_booked = self.submit_external_signal(primary, now=now)
         if not primary_booked:
             return booked
         booked.append(primary_booked)
 
-        if not hedge_config.ENABLED or not chain_data:
-            return booked
-
-        try:
-            oc = chain_data.get("oc", {})
-            spot = float(chain_data.get("last_price") or 0)
-            hedge_sig = hedge_mod.find_hedge_leg(
-                chain=oc,
-                spot=spot,
-                primary_strike=float(primary.get("strike") or 0),
-                primary_side=str(primary.get("side") or ""),
-                n_strikes=hedge_config.HEDGE_STRIKES_OTM,
-                signal_template=primary,
-            )
-            if hedge_sig:
-                hedge_sig["combo_id"] = combo_id
-                hedge_booked = self.submit_external_signal(hedge_sig, now=now)
-                if hedge_booked:
-                    booked.append(hedge_booked)
-                    logger.info("OrderManager: hedge leg booked %s %s K%.0f [combo=%s]",
-                                hedge_sig.get("symbol"), hedge_sig.get("side"),
-                                float(hedge_sig.get("strike") or 0), combo_id)
-                else:
-                    logger.info("OrderManager: hedge leg rejected by gate/guard for %s",
-                                primary.get("symbol"))
-        except Exception:
-            logger.exception("submit_with_hedge: hedge failed (non-fatal) for %s",
-                             primary.get("symbol"))
+        if hedge_sig:
+            hedge_sig["combo_id"] = combo_id
+            hedge_booked = self.submit_external_signal(hedge_sig, now=now)
+            if hedge_booked:
+                booked.append(hedge_booked)
+                logger.info("OrderManager: hedge leg booked %s %s K%.0f [combo=%s]",
+                            hedge_sig.get("symbol"), hedge_sig.get("side"),
+                            float(hedge_sig.get("strike") or 0), combo_id)
+            else:
+                logger.info("OrderManager: hedge leg rejected by gate/guard for %s",
+                            primary.get("symbol"))
+        else:
+            logger.info("OrderManager: hedge leg not booked for %s — %s",
+                        primary.get("symbol"), hedge_reason)
 
         return booked
 
@@ -656,6 +679,14 @@ class OrderManager:
           soft → log the would-be exit, don't close
           hard → market-exit the contradicting position now
 
+        2026-07-30: if the contradicting trade is one leg of a still-paired
+        debit-spread combo (see paper_trader._combo_pairs / apply_combo_tick),
+        BOTH legs are closed together here too — otherwise this was the one
+        risk-exit path that could split a combo the combined SL/target design
+        is built to keep together (it doesn't check direction=="short" the
+        way the other gates do, since the long leg is what actually carries
+        the directional thesis this check judges).
+
         Reads oi_buildup_history only (zero broker calls). Fail-open: any
         exception leaves positions untouched. Returns the trades it closed.
         """
@@ -671,7 +702,16 @@ class OrderManager:
             if amode == "off":
                 return closed
 
+            combo_pairs = paper_trader._combo_pairs(open_trades)
+            leg_partner = {}
+            for long_leg, short_leg in combo_pairs.values():
+                leg_partner[long_leg["id"]] = short_leg
+                leg_partner[short_leg["id"]] = long_leg
+            already_closed_ids: set = set()
+
             for trade in open_trades:
+                if trade["id"] in already_closed_ids:
+                    continue
                 symbol = trade.get("symbol", "")
                 side   = "CE" if str(trade.get("side", "")).upper() in ("CE", "CALL") else "PE"
                 entry  = float(trade.get("entry") or 0)
@@ -714,16 +754,20 @@ class OrderManager:
                     continue
 
                 reason = f"OI contradiction ({classification} {oi_chg_f:+.0f}% OI)"
-                t = paper_trader.close_position(
-                    self.book, scanner, trade, reason, now=now,
-                    bot_token=self.bot_token, chat_id=self.chat_id,
-                )
-                if t:
-                    closed.append(t)
-                    logger.info(
-                        "AUTO-EXIT closed %s %s @ ₹%.2f — %s",
-                        symbol, side, t.get("last_price") or last, reason,
+                partner = leg_partner.get(trade["id"])
+                for leg, is_partner in ((trade, False), (partner, True)) if partner else ((trade, False),):
+                    t = paper_trader.close_position(
+                        self.book, scanner, leg, reason, now=now,
+                        bot_token=self.bot_token, chat_id=self.chat_id,
                     )
+                    if t:
+                        closed.append(t)
+                        already_closed_ids.add(leg["id"])
+                        logger.info(
+                            "AUTO-EXIT closed %s %s @ ₹%.2f — %s%s",
+                            leg.get("symbol"), leg.get("side"), t.get("last_price") or last, reason,
+                            " (combo partner, closed together)" if is_partner else "",
+                        )
 
         except Exception:
             logger.exception("_auto_exit_on_oi_contradiction failed (non-fatal)")

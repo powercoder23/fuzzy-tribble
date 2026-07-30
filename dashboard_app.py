@@ -341,7 +341,7 @@ _PT_COLS = """date, symbol, side, strike, expiry, entry, last_price,
                sl, t1, t2, lot_size, score, iv, hv, iv_rank,
                realized_pct, realized_rupees, status, strategy,
                opened_at, closed_at, exit_reason, factors_json,
-               direction, combo_id"""
+               direction, combo_id, spot"""
 
 
 @app.get("/api/paper-trades")
@@ -404,6 +404,20 @@ def paper_trades_history(days: int = Query(30, ge=1, le=90)):
             "net_rupees":   round(total_pnl, 0),
             "expectancy":   round(total_pnl / total_trades, 0) if total_trades else 0,
         },
+    }
+
+
+@app.get("/api/hedge-config")
+def hedge_config_api():
+    """Combined-spread exit thresholds + margin-estimate assumptions the
+    dashboard needs to render combo positions consistently with what
+    paper_trader.apply_combo_tick will actually trigger on. Sourced live from
+    hedge_config.py so the UI can never drift from the real thresholds."""
+    import hedge_config as hc
+    return {
+        "spread_sl_pct":               hc.SPREAD_SL_PCT,
+        "spread_target_capture_pct":   hc.SPREAD_TARGET_CAPTURE_PCT,
+        "naked_span_pct_of_notional":  hc.NAKED_SPAN_PCT_OF_NOTIONAL,
     }
 
 

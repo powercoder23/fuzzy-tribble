@@ -2477,6 +2477,19 @@ class DiscountedPremiumScanner:
             if market_strength == "STRONG_BEARISH" and option_label == "PUT":
                 score_adjustment += 6.0
 
+            # 2026-07-30: every discount trade booked today scored EXACTLY
+            # 95.0 (confirmed across all 120 combos, zero variance) — this
+            # stack of bonuses (wall +10, buildup +8, market-direction
+            # alignment up to +20, volume spike +5, market strength +6 — up
+            # to +57 if several co-occur, which they routinely do) was
+            # overwhelming score_option's already-fixed 0-100 base almost
+            # every time, re-creating the exact ceiling-saturation problem
+            # the review at calculate_discount_score (~line 2160) already
+            # fixed for THAT function — min_discount_score=45 and "pick
+            # highest conviction" were both silent no-ops with everyone tied
+            # at the ceiling. Capping the stacked adjustment to a nudge
+            # rather than letting it swamp the base restores differentiation.
+            score_adjustment = clip_score(score_adjustment, floor=-25.0, ceiling=25.0)
             score = round(clip_score(score + score_adjustment, floor=0.0, ceiling=95.0), 2)
             score_breakdown = {
                 "base": native_number(round(base_discount_score, 2)),

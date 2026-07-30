@@ -193,12 +193,42 @@
 
   /* ── Hedge/combo grouping (paired long+short legs) ───────────── */
   .data-table tr.combo-header td {
-    background: var(--surface2); border-bottom: 1px solid var(--border);
-    font-size: 11px; color: var(--muted); padding: 8px;
+    background: var(--surface2); border-bottom: 1px solid var(--border); padding: 10px;
   }
-  .data-table tr.combo-header .combo-label { color: var(--text); font-weight: 600; margin-right: 12px; }
-  .data-table tr.combo-header .combo-meta span { margin-right: 14px; white-space: nowrap; }
   .data-table tr.combo-leg td { background: rgba(245,158,11,.04); }
+
+  .combo-card { display: flex; flex-direction: column; gap: 8px; }
+  .combo-card-top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+  .combo-label { color: var(--text); font-weight: 600; font-size: 12px; }
+  .combo-stats { display: flex; flex-wrap: wrap; gap: 6px; }
+  .combo-chip {
+    display: inline-flex; align-items: center; font-family: var(--mono); font-size: 10.5px;
+    padding: 3px 8px; border-radius: 5px; white-space: nowrap;
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+  }
+  .combo-chip.pnl-pos { border-color: rgba(16,185,129,.35); color: var(--green); }
+  .combo-chip.pnl-neg { border-color: rgba(239,68,68,.35); color: var(--red); }
+  .combo-chip.highlight { background: rgba(16,185,129,.12); border-color: rgba(16,185,129,.35); color: var(--green); font-weight: 600; }
+  .combo-chip.na { color: var(--muted); font-style: italic; }
+
+  /* Combined SL <-> Target progress bar — same levels apply_combo_tick checks. */
+  .combo-progress { display: flex; flex-direction: column; gap: 3px; margin-top: 2px; }
+  .combo-progress-track {
+    position: relative; height: 6px; border-radius: 3px;
+    background: linear-gradient(90deg, rgba(239,68,68,.35), rgba(148,163,184,.25) 50%, rgba(16,185,129,.35));
+  }
+  .combo-progress-entry-mark {
+    position: absolute; top: -3px; width: 2px; height: 12px; background: var(--muted); transform: translateX(-1px);
+  }
+  .combo-progress-now {
+    position: absolute; top: -4px; width: 10px; height: 14px; border-radius: 3px; transform: translateX(-5px);
+    background: var(--amber); box-shadow: 0 0 0 2px var(--surface2);
+  }
+  .combo-progress-now.pos { background: var(--green); }
+  .combo-progress-now.neg { background: var(--red); }
+  .combo-progress-labels {
+    display: flex; justify-content: space-between; font-family: var(--mono); font-size: 9.5px; color: var(--muted);
+  }
 
   .pnl-pos { color: var(--green); } .pnl-neg { color: var(--red); }
   .pnl-live { color: var(--amber); font-size: 9px; vertical-align: middle; animation: pnlPulse 1.6s ease-in-out infinite; }
@@ -340,9 +370,12 @@
       letter-spacing: .04em; flex: 0 0 auto;
     }
     .data-table.stack td:first-child { font-weight: 600; border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 2px; }
-    .data-table.stack tr.combo-header { border: none; background: transparent; padding: 0 2px; margin-bottom: 4px; }
-    .data-table.stack tr.combo-header td { display: block; text-align: left; padding: 4px 0; }
-    .data-table.stack tr.combo-header .combo-meta span { display: inline-block; margin: 2px 10px 2px 0; }
+    .data-table.stack tr.combo-header {
+      border: 1px solid var(--border); border-radius: 8px; background: var(--surface2);
+      padding: 8px 10px; margin-bottom: 6px;
+    }
+    .data-table.stack tr.combo-header td { display: block; text-align: left; padding: 0; }
+    .data-table.stack .combo-progress-labels { flex-wrap: wrap; gap: 4px 10px; }
   }
 </style>
 </head>
@@ -1219,6 +1252,11 @@ function tradesTable(trades, showTotal = true) {
   // comboHeaderRow is rendered BEFORE its legs' tradePnl() calls run, so it
   // computes its own combined P&L from the same legs rather than reading
   // totalPnl (which is still mid-accumulation at that point).
+  //
+  // The combined SL/target and margin math here MIRRORS paper_trader's
+  // apply_combo_tick / hedge.py estimate_*_margin exactly (same formulas,
+  // same hedgeCfg thresholds fetched from /api/hedge-config) — this is what
+  // actually decides when the spread exits, not just a display estimate.
   const comboHeaderRow = (legs) => {
     const long = legs.find(t => t.direction !== 'short') || legs[0];
     const short = legs.find(t => t.direction === 'short');
@@ -1228,29 +1266,91 @@ function tradesTable(trades, showTotal = true) {
       const { rupees } = tradePnl(t);
       if (rupees !== null && rupees !== undefined) { combined += rupees; haveCombined = true; }
     });
-    let meta = `<span class="${combined>=0?'pnl-pos':'pnl-neg'}">Combined P&amp;L ${haveCombined ? fmtPnl(combined) : '—'}</span>`;
+    const combinedCls = combined >= 0 ? 'pnl-pos' : 'pnl-neg';
+    const pnlChip = `<span class="combo-chip ${combinedCls}">Combined P&amp;L ${haveCombined ? fmtPnl(combined) : '—'}</span>`;
+
+    let statChips = '';
+    let progressBar = '';
     if (long && short) {
-      const nakedCost = (long.entry || 0) * lot;
-      const credit = (short.entry || 0) * lot;
-      const netDebit = nakedCost - credit;
-      const benefitPct = nakedCost ? (credit / nakedCost * 100) : 0;
-      meta = `<span>Margin required ₹${Math.round(netDebit).toLocaleString('en-IN')}</span>` +
-             `<span>Hedge benefit ₹${Math.round(credit).toLocaleString('en-IN')} saved (${benefitPct.toFixed(0)}% cheaper)</span>` +
-             meta;
+      // ── Margin: naked-short SPAN estimate vs. hedged-spread margin ──────
+      const spot = long.spot || short.spot || null;
+      const nakedMargin = spot ? (spot * lot * hedgeCfg.naked_span_pct_of_notional + (short.entry || 0) * lot) : null;
+      const entryDebit = (long.entry || 0) - (short.entry || 0);
+      const spreadMargin = Math.max(entryDebit, 0) * lot;
+      const benefit = nakedMargin != null ? Math.max(nakedMargin - spreadMargin, 0) : null;
+
+      // ── Combined exit levels — same formula as apply_combo_tick ─────────
+      const strikeWidth = Math.abs((long.strike || 0) - (short.strike || 0));
+      const maxProfitPotential = Math.max(strikeWidth - entryDebit, 0);
+      const slLevel = entryDebit * (1 - hedgeCfg.spread_sl_pct);
+      const targetLevel = entryDebit + maxProfitPotential * hedgeCfg.spread_target_capture_pct;
+      const maxProfitRupees = maxProfitPotential * lot;
+
+      statChips =
+        `<span class="combo-chip">Net debit (cost) ₹${Math.round(entryDebit * lot).toLocaleString('en-IN')}</span>` +
+        `<span class="combo-chip">Max profit ₹${Math.round(maxProfitRupees).toLocaleString('en-IN')}</span>` +
+        `<span class="combo-chip">Margin required ₹${Math.round(spreadMargin).toLocaleString('en-IN')}</span>` +
+        (benefit != null
+          ? `<span class="combo-chip highlight" title="Naked short would need ~₹${Math.round(nakedMargin).toLocaleString('en-IN')} margin (rough SPAN estimate, ~${(hedgeCfg.naked_span_pct_of_notional*100).toFixed(0)}% of notional) — hedged spread only needs the net debit">Margin saved ₹${Math.round(benefit).toLocaleString('en-IN')}</span>`
+          : `<span class="combo-chip na" title="Needs spot-at-entry, not recorded for older trades">Margin saved —</span>`);
+
+      // ── Progress bar: SL level ── entry ── now ── target level ──────────
+      if (long.status === 'open' && short.status === 'open') {
+        const nowValue = (long.last_price || 0) - (short.last_price || 0);
+        const span = (targetLevel - slLevel) || 1;
+        const pct = v => Math.min(100, Math.max(0, (v - slLevel) / span * 100));
+        const entryPct = pct(entryDebit);
+        const nowPct = pct(nowValue);
+        progressBar = `
+          <div class="combo-progress">
+            <div class="combo-progress-track">
+              <div class="combo-progress-entry-mark" style="left:${entryPct}%"></div>
+              <div class="combo-progress-now ${nowValue >= entryDebit ? 'pos' : 'neg'}" style="left:${nowPct}%"></div>
+            </div>
+            <div class="combo-progress-labels">
+              <span>SL ₹${Math.round(slLevel*lot).toLocaleString('en-IN')}</span>
+              <span>Entry ₹${Math.round(entryDebit*lot).toLocaleString('en-IN')}</span>
+              <span>Now ₹${Math.round(nowValue*lot).toLocaleString('en-IN')}</span>
+              <span>Target ₹${Math.round(targetLevel*lot).toLocaleString('en-IN')}</span>
+            </div>
+          </div>`;
+      }
     }
+
     const strikes = short ? `${fmtStrike(long.strike)}/${fmtStrike(short.strike)}` : fmtStrike(long.strike);
     const label = `${long.symbol || ''} ${fmtExpiry(long.expiry)} ${ceOrPe(long.side)} ${strikes} spread`;
-    return `<tr class="combo-header"><td colspan="${colCount}"><span class="combo-label">🔗 ${label}</span><span class="combo-meta">${meta}</span></td></tr>`;
+    return `<tr class="combo-header"><td colspan="${colCount}">
+      <div class="combo-card">
+        <div class="combo-card-top"><span class="combo-label">🔗 ${label}</span>${pnlChip}</div>
+        <div class="combo-stats">${statChips}</div>
+        ${progressBar}
+      </div>
+    </td></tr>`;
   };
 
   // Group legs sharing a combo_id (debit-spread hedge pairs) so they render
   // together with a combined-P&L / margin / hedge-benefit header; everything
-  // else renders as a plain single-leg row.
+  // else renders as a plain single-leg row. A combo_id with only ONE leg
+  // present means the hedge leg was never actually booked (chain fetch
+  // failed, or hedge.find_hedge_leg's own gates rejected it — see
+  // paper_trader.process_signals) — that's a naked single leg, not a spread,
+  // so it must NOT get the "spread"/"Combined P&L" header (that was
+  // literally just this one leg's own P&L, mislabeled as combined).
+  const rawGroups = new Map();
+  trades.forEach(t => {
+    if (t.combo_id) {
+      if (!rawGroups.has(t.combo_id)) rawGroups.set(t.combo_id, []);
+      rawGroups.get(t.combo_id).push(t);
+    }
+  });
   const comboOrder = [];
   const comboMap = new Map();
   const singles = [];
   trades.forEach(t => {
-    if (t.combo_id) {
+    const group = t.combo_id ? rawGroups.get(t.combo_id) : null;
+    const isRealPair = group && group.length === 2 &&
+      group.some(g => g.direction === 'short') && group.some(g => g.direction !== 'short');
+    if (isRealPair) {
       if (!comboMap.has(t.combo_id)) { comboMap.set(t.combo_id, []); comboOrder.push(t.combo_id); }
       comboMap.get(t.combo_id).push(t);
     } else {
@@ -2160,10 +2260,18 @@ async function loadConvexJournal() {
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────
+// Combined-spread exit thresholds, fetched once from the same hedge_config.py
+// paper_trader.apply_combo_tick actually uses — so the UI's SL/target/margin
+// numbers can never drift from what will actually trigger the exit. Fallback
+// values match hedge_config.py's own defaults in case the fetch fails before
+// first paint; self-corrects once boot()'s fetch resolves.
+let hedgeCfg = { spread_sl_pct: 0.40, spread_target_capture_pct: 0.55, naked_span_pct_of_notional: 0.15 };
+
 async function boot() {
   checkHealth();
   setInterval(checkHealth, 60000);
   try { allSymbols = await api('/api/symbols'); } catch(e) {}
+  try { hedgeCfg = await api('/api/hedge-config'); } catch(e) {}
   loadOverview();
 }
 
