@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 import iv_analytics
@@ -975,6 +975,72 @@ def settings_page():
 def settings_page_legacy():
     p = Path(__file__).parent / "settings.html"
     return p.read_text() if p.exists() else HTMLResponse("<h1>not found</h1>", status_code=500)
+
+
+def _serve_page(name: str) -> HTMLResponse:
+    """Serve web/pages/<name>.html — the shared skeleton every new-design-
+    system page uses (shell.js renders sidebar/topbar, page JS fills the
+    content). Every sidebar nav link (shell.js NAV) must resolve to one of
+    these; 2026-07-30 fix — they used to 404 because only '/', '/settings',
+    '/settings-legacy' were ever registered."""
+    p = WEB_DIR / "pages" / f"{name}.html"
+    if p.exists():
+        return HTMLResponse(p.read_text())
+    return HTMLResponse(f"<h1>{name} page not found</h1>", status_code=500)
+
+
+# Fully built pages (new design system, real data).
+@app.get("/overview", response_class=HTMLResponse)
+def overview_page(): return _serve_page("overview")
+
+
+@app.get("/positions", response_class=HTMLResponse)
+def positions_page(): return _serve_page("positions")
+
+
+@app.get("/scanners", response_class=HTMLResponse)
+def scanners_page(): return _serve_page("scanners")
+
+
+@app.get("/market", response_class=HTMLResponse)
+def market_page(): return _serve_page("market")
+
+
+@app.get("/alerts", response_class=HTMLResponse)
+def alerts_page(): return _serve_page("alerts")
+
+
+# "Dashboard" in the new sidebar nav means "the original all-in-one page" —
+# keep it reachable at its own URL rather than duplicating that page's content.
+@app.get("/dashboard")
+def dashboard_alias():
+    return RedirectResponse(url="/")
+
+
+# Not wired up yet — same shell/theme, honest "coming later" card instead of
+# a 404 (see web/static/js/pages/placeholder.js).
+@app.get("/signals", response_class=HTMLResponse)
+def signals_page(): return _serve_page("placeholder")
+
+
+@app.get("/reports", response_class=HTMLResponse)
+def reports_page(): return _serve_page("placeholder")
+
+
+@app.get("/logs", response_class=HTMLResponse)
+def logs_page(): return _serve_page("placeholder")
+
+
+@app.get("/system-health", response_class=HTMLResponse)
+def system_health_page(): return _serve_page("placeholder")
+
+
+@app.get("/backtest", response_class=HTMLResponse)
+def backtest_page(): return _serve_page("placeholder")
+
+
+@app.get("/data-explorer", response_class=HTMLResponse)
+def data_explorer_page(): return _serve_page("placeholder")
 
 
 # ── Settings page data: system metrics + scanner list (real where cheap) ──── #

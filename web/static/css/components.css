@@ -192,6 +192,83 @@ select.inp {
 
 .loading, .empty { color: var(--dim); font-size: 13px; padding: var(--s5); text-align: center; }
 
+/* ── Buy/Sell leg tags (paper trades) ────────────────────────────────────── */
+.tag.buy  { background: var(--green-fill); color: #6ee7b7; }
+.tag.sell { background: var(--red-fill);   color: #fca5a5; }
+
+/* ── Total P&L bar (trades tables) ───────────────────────────────────────── */
+.total-bar {
+  display: flex; align-items: baseline; justify-content: space-between;
+  padding: var(--s3) var(--s4); margin-bottom: var(--s4); border-radius: var(--r-sm);
+  background: var(--surface-2); border: 1px solid var(--border);
+}
+.total-bar .tb-label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--dim); }
+.total-bar .tb-value { font-size: 19px; font-weight: 700; font-family: var(--mono); }
+.pnl-live { color: var(--amber); font-size: 9px; vertical-align: middle; animation: pnlPulse 1.6s ease-in-out infinite; }
+@keyframes pnlPulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+.split-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); font-weight: 600; margin: var(--s4) 0 var(--s3); }
+.split-label:first-child { margin-top: 0; }
+
+/* ── Hedge/combo spread card (2-leg debit spreads) ───────────────────────── */
+tr.combo-header td {
+  background: var(--surface-2); border-bottom: 1px solid var(--border); padding: var(--s3);
+}
+tr.combo-leg td { background: rgba(245,158,11,.04); }
+.combo-card { display: flex; flex-direction: column; gap: var(--s2); }
+.combo-card-top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--s2); }
+.combo-label { color: var(--text); font-weight: 600; font-size: 12px; }
+.combo-stats { display: flex; flex-wrap: wrap; gap: 6px; }
+.combo-chip {
+  display: inline-flex; align-items: center; font-family: var(--mono); font-size: 10.5px;
+  padding: 3px 8px; border-radius: var(--r-sm); white-space: nowrap;
+  background: var(--surface); border: 1px solid var(--border); color: var(--text);
+}
+.combo-chip.pos { border-color: rgba(16,185,129,.35); color: var(--green); }
+.combo-chip.neg { border-color: rgba(239,68,68,.35); color: var(--red); }
+.combo-chip.highlight { background: var(--green-fill); border-color: rgba(16,185,129,.35); color: var(--green); font-weight: 600; }
+.combo-chip.na { color: var(--dim); font-style: italic; }
+.combo-progress { display: flex; flex-direction: column; gap: 3px; margin-top: 2px; }
+.combo-progress-track {
+  position: relative; height: 6px; border-radius: 3px;
+  background: linear-gradient(90deg, rgba(239,68,68,.35), rgba(139,152,176,.25) 50%, rgba(16,185,129,.35));
+}
+.combo-progress-entry-mark { position: absolute; top: -3px; width: 2px; height: 12px; background: var(--muted); transform: translateX(-1px); }
+.combo-progress-now { position: absolute; top: -4px; width: 10px; height: 14px; border-radius: 3px; transform: translateX(-5px); background: var(--amber); box-shadow: 0 0 0 2px var(--surface-2); }
+.combo-progress-now.pos { background: var(--green); }
+.combo-progress-now.neg { background: var(--red); }
+.combo-progress-labels { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 9.5px; color: var(--dim); }
+
+/* ── Market snapshot grid ────────────────────────────────────────────────── */
+.snap-grid { display: grid; gap: var(--s4); grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.snap-cell { padding: var(--s3); border: 1px solid var(--border-soft); border-radius: var(--r-sm); }
+.snap-label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+.snap-value { font-size: 19px; font-weight: 700; font-family: var(--mono); }
+.snap-sub { font-size: 11px; margin-top: 2px; }
+.snap-blank { color: var(--dim); font-size: 12px; font-style: italic; }
+
+/* ── Activity feed ───────────────────────────────────────────────────────── */
+.activity-list { display: flex; flex-direction: column; gap: 2px; max-height: 420px; overflow-y: auto; }
+.activity-row { display: flex; align-items: flex-start; gap: var(--s3); padding: var(--s3) var(--s2); border-bottom: 1px solid var(--border-soft); }
+.activity-row:last-child { border-bottom: none; }
+.activity-ic { font-size: 15px; flex: none; width: 20px; text-align: center; }
+.activity-body { flex: 1; min-width: 0; }
+.activity-label { font-size: 12.5px; font-weight: 600; color: var(--text); }
+.activity-detail { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+.activity-time { font-size: 10.5px; color: var(--dim); font-family: var(--mono); flex: none; white-space: nowrap; }
+
+/* ── Symbol filter grid (universe-style pages) ───────────────────────────── */
+.stock-search {
+  background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--r-sm); font-family: var(--sans); font-size: 13px; padding: 8px 12px; width: 100%;
+}
+
+/* ── Mobile: combo-header row shouldn't get the label/value flex treatment
+   table.data.stack applies to ordinary td's — it's one wide content block. ── */
+@media (max-width: 600px) {
+  table.data.stack tr.combo-header td { display: block; text-align: left; padding: 0; }
+  .combo-progress-labels { flex-wrap: wrap; gap: 4px 10px; }
+}
+
 /* ── Phone: restack wide tables as key/value cards ───────────────────────── */
 @media (max-width: 600px) {
   .stat-card .sc-val { font-size: 18px; }

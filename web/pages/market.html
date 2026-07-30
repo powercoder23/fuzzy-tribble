@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fuzzy Tribble — Market</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/tokens.css">
+  <link rel="stylesheet" href="/static/css/base.css">
+  <link rel="stylesheet" href="/static/css/components.css">
+  <link rel="stylesheet" href="/static/css/shell.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar"></aside>
+    <div class="main">
+      <header class="topbar" id="topbar"></header>
+      <main class="page" id="page">
+        <div class="card">
+          <div class="card-head"><div class="card-title">Market Snapshot</div></div>
+          <div id="snapshot"><div class="loading">Loading…</div></div>
+        </div>
+        <div class="card" style="margin-top:var(--s5)">
+          <div class="card-head"><div><div class="card-title">Sector Trend</div><div class="card-sub">Market &amp; sector breadth — refreshes with data</div></div></div>
+          <div class="table-wrap" id="sectorTrend"><div class="loading">Loading…</div></div>
+        </div>
+      </main>
+    </div>
+  </div>
+  <nav class="bottom-nav" id="bottomNav"></nav>
+  <div class="scrim" id="scrim"></div>
+  <script type="module" src="/static/js/pages/market.js"></script>
+</body>
+</html>

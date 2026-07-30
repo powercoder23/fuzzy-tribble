@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fuzzy Tribble — Scanner Hub</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/tokens.css">
+  <link rel="stylesheet" href="/static/css/base.css">
+  <link rel="stylesheet" href="/static/css/components.css">
+  <link rel="stylesheet" href="/static/css/shell.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar"></aside>
+    <div class="main">
+      <header class="topbar" id="topbar"></header>
+      <main class="page" id="page">
+        <div class="stat-row" id="scannerGrid"></div>
+        <div class="card" style="margin-top:var(--s5)">
+          <div class="card-head"><div><div class="card-title">Live Signal Feed</div><div class="card-sub">Composite Conviction — fused across every zero-API scanner</div></div>
+            <button class="btn" id="refresh">↻ Refresh</button></div>
+          <div class="table-wrap" id="opportunities"><div class="loading">Loading…</div></div>
+        </div>
+      </main>
+    </div>
+  </div>
+  <nav class="bottom-nav" id="bottomNav"></nav>
+  <div class="scrim" id="scrim"></div>
+  <script type="module" src="/static/js/pages/scanners.js"></script>
+</body>
+</html>
