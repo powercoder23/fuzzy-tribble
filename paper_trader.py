@@ -30,6 +30,7 @@ import sqlite3
 from datetime import datetime
 
 import notifications
+import scan_log
 
 try:
     from discount_config import INTRADAY, TRADE_PLAN
@@ -82,6 +83,8 @@ def new_trade_runtime(entry, sl, t1, t2, t1_book_fraction, lot_size=None, direct
         "booked_points": 0.0,
         "runner_stop": float(sl),   # before T1 the whole position uses the hard SL
         "last_price": float(entry),
+        "peak_price": float(entry),  # most favorable price seen — trailing_config
+
         "exit_reason": None,
         "realized_points": None,
         "realized_pct": None,
@@ -165,6 +168,50 @@ def _finalize(trade, reason):
     trade["realized_rupees"] = round(net * lot - costs_total, 2)
 
 
+def _apply_trailing(trade, last_price):
+    """Ratchet `trade["sl"]` toward the best price seen so far, once the
+    trade is up trailing_config.ACTIVATION_PCT on premium. Only ever
+    tightens the stop (never loosens it) and never crosses the fixed
+    target. Mutates `trade["peak_price"]`/`trade["sl"]` in place.
+
+    Config-gated + fail-soft: any error, or ENABLED=False, leaves the trade
+    untouched. Only meaningful for apply_tick's single-leg trades — combo
+    legs are evaluated via apply_combo_tick's combined spread SL/target
+    instead and never reach this function.
+    """
+    try:
+        import trailing_config
+        if not trailing_config.ENABLED:
+            return
+        entry = float(trade["entry"])
+        if not entry:
+            return
+        short = trade.get("direction") == "short"
+
+        peak = float(trade.get("peak_price", entry))
+        peak = min(peak, last_price) if short else max(peak, last_price)
+        trade["peak_price"] = peak
+
+        unrealized_pct = ((entry - peak) if short else (peak - entry)) / entry
+        if unrealized_pct < trailing_config.ACTIVATION_PCT:
+            return
+
+        target = float(trade["t1"])
+        giveback = abs(peak - entry) * trailing_config.GIVEBACK_PCT
+        if short:
+            # sl sits above entry and walks DOWN toward peak+giveback as the
+            # trade decays favorably; never let it go below the target.
+            candidate = max(peak + giveback, target)
+            trade["sl"] = min(float(trade["sl"]), candidate)
+        else:
+            # sl sits below entry and walks UP toward peak-giveback as the
+            # trade runs favorably; never let it exceed the target.
+            candidate = min(peak - giveback, target)
+            trade["sl"] = max(float(trade["sl"]), candidate)
+    except Exception:
+        logger.debug("trailing stop update failed for trade %s", trade.get("id"))
+
+
 def apply_tick(trade, last_price, square_off=False):
     """Advance a paper trade by one observed `last_price`. Mutates `trade`.
 
@@ -196,6 +243,9 @@ def apply_tick(trade, last_price, square_off=False):
     trade["last_price"] = last_price
     target = trade["t1"]
     short = trade.get("direction") == "short"
+
+    if not square_off:
+        _apply_trailing(trade, last_price)
 
     # --- Stop-loss: full exit (gap-aware fill) ------------------------------
     sl_hit = (last_price >= trade["sl"]) if short else (last_price <= trade["sl"])
@@ -292,7 +342,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     exit_reason TEXT, realized_points REAL, realized_pct REAL, realized_rupees REAL,
     half_spread REAL, gross_points REAL, slippage_points REAL,
     costs_rupees REAL, factors_json TEXT,
-    direction TEXT DEFAULT 'long', combo_id TEXT, spot REAL
+    direction TEXT DEFAULT 'long', combo_id TEXT, spot REAL, peak_price REAL
 );
 """
 
@@ -301,6 +351,10 @@ _RUNTIME_FIELDS = (
     "last_price", "exit_reason", "realized_points", "realized_pct",
     "realized_rupees", "closed_at", "gross_points", "slippage_points",
     "costs_rupees",
+    # sl/peak_price ratchet via trailing_config (_apply_trailing) — must be
+    # persisted each tick or the next monitor() re-read from the DB would
+    # silently discard the trailing update and re-load the original fixed SL.
+    "sl", "peak_price",
 )
 
 # Additive columns for DBs created before they existed (see _migrate).
@@ -316,6 +370,8 @@ _MIGRATE_COLUMNS = {
     # Spot at signal time — needed to estimate the naked-short margin a hedge
     # leg would otherwise require (see hedge.py estimate_naked_short_margin).
     "spot":            "REAL",
+    # Most favorable price seen — trailing_config.py's ratchet.
+    "peak_price":      "REAL",
 }
 
 
@@ -393,8 +449,8 @@ class PaperTradeBook:
                     strike, expiry, entry, sl, t1, t2, t1_book_fraction, lot_size,
                     score, iv, hv, iv_rank, dte, strategy, status, t1_done, qty_frac,
                     booked_points, runner_stop, last_price,
-                    half_spread, factors_json, direction, combo_id, spot)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    half_spread, factors_json, direction, combo_id, spot, peak_price)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     date, now.strftime("%Y-%m-%d %H:%M:%S"),
                     signal["symbol"], str(signal.get("security_id")),
@@ -408,6 +464,7 @@ class PaperTradeBook:
                     "open", 0, 1.0, 0.0, rt["runner_stop"], rt["entry"],
                     signal.get("half_spread"), signal.get("factors_json"),
                     rt["direction"], signal.get("combo_id"), signal.get("spot"),
+                    rt["peak_price"],
                 ),
             )
             return cur.lastrowid
@@ -829,6 +886,11 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
             signal = sonar.get("signal", "")
             if signal == "FLAT":
                 logger.info("Sonar FLAT — skipping %s", symbol)
+                scan_log.record_decision(
+                    strategy=row.get("strategy", VOLATILITY_STRATEGY), symbol=symbol,
+                    side=side, strike=strike, iv_rank=row.get("iv_rank"), score=row.get("score"),
+                    decision="sonar_flat", reason="sonar signal FLAT",
+                )
                 continue
             side_norm = "CALL" if str(side).upper() in ("CALL", "CE") else "PUT"
             bullish = signal in ("BREAKOUT_UP", "REVERSAL_UP")
@@ -836,6 +898,11 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
             if (bullish and side_norm == "PUT") or (bearish and side_norm == "CALL"):
                 logger.info("Sonar %s contradicts %s %s — skipping (no side-flip)",
                             signal, symbol, side_norm)
+                scan_log.record_decision(
+                    strategy=row.get("strategy", VOLATILITY_STRATEGY), symbol=symbol,
+                    side=side, strike=strike, iv_rank=row.get("iv_rank"), score=row.get("score"),
+                    decision="sonar_contradiction", reason=f"sonar {signal} contradicts {side_norm}",
+                )
                 continue
 
         if book.has_trade_today(date, symbol, strike, side):
@@ -846,6 +913,11 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
         if sym_cap and book.count_symbol_today(date, symbol) >= sym_cap:
             logger.info("Per-symbol cap — %s already has %d trade(s) today (max %d)",
                         symbol, book.count_symbol_today(date, symbol), sym_cap)
+            scan_log.record_decision(
+                strategy=row.get("strategy", VOLATILITY_STRATEGY), symbol=symbol,
+                side=side, strike=strike, iv_rank=row.get("iv_rank"), score=row.get("score"),
+                decision="per_symbol_cap", reason=f"{symbol} already has {sym_cap}+ trade(s) today",
+            )
             continue
         if not row.get("entry") or not row.get("t1"):
             continue
@@ -854,6 +926,11 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
         if float(row.get("entry") or 0) < min_prem:
             logger.info("Min premium filter — skipping %s %s @ ₹%.2f < ₹%.2f",
                         symbol, side, float(row.get("entry") or 0), min_prem)
+            scan_log.record_decision(
+                strategy=row.get("strategy", VOLATILITY_STRATEGY), symbol=symbol,
+                side=side, strike=strike, iv_rank=row.get("iv_rank"), score=row.get("score"),
+                decision="min_premium", reason=f"entry {row.get('entry')} < {min_prem}",
+            )
             continue
         sig = signal_from_row(row, lot_size_fn)
         # Rupee-risk cap — a big-lot cheap option must not risk many multiples of
@@ -914,6 +991,11 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
         send_telegram(format_signal_alert(sig), bot_token, chat_id)
         opened.append(sig)
         logger.info("Opened paper trade: %s %s %s", symbol, side, strike)
+        scan_log.record_decision(
+            strategy=sig.get("strategy", VOLATILITY_STRATEGY), symbol=symbol,
+            side=side, strike=strike, iv_rank=row.get("iv_rank"), score=row.get("score"),
+            decision="booked", reason=None, extra={"factors_json": sig.get("factors_json")},
+        )
 
         if hedge_sig:
             hedge_sig["combo_id"] = sig["combo_id"]
@@ -964,6 +1046,11 @@ def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
     if sym_cap and book.count_symbol_today(date, symbol) >= sym_cap:
         logger.info("book_signal: per-symbol cap — %s already has %d trade(s) today (max %d)",
                     symbol, book.count_symbol_today(date, symbol), sym_cap)
+        scan_log.record_decision(
+            strategy=signal.get("strategy", VOLATILITY_STRATEGY), symbol=symbol,
+            side=side, strike=strike, iv_rank=signal.get("iv_rank"), score=signal.get("score"),
+            decision="per_symbol_cap", reason=f"{symbol} already has {sym_cap}+ trade(s) today",
+        )
         return None
 
     # Per-signal floor override: external strategies (e.g. B&B) own their own
@@ -974,6 +1061,11 @@ def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
     if float(signal.get("entry") or 0) < min_prem:
         logger.info("book_signal: %s %s premium ₹%.2f < min ₹%.2f — skip",
                     symbol, side, float(signal.get("entry") or 0), min_prem)
+        scan_log.record_decision(
+            strategy=signal.get("strategy", VOLATILITY_STRATEGY), symbol=symbol,
+            side=side, strike=strike, iv_rank=signal.get("iv_rank"), score=signal.get("score"),
+            decision="min_premium", reason=f"entry {signal.get('entry')} < {min_prem}",
+        )
         return None
 
     # Hard rupee-risk cap — applies to EVERY strategy that lands here (B&B,
@@ -993,6 +1085,11 @@ def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
                         symbol, side, risk, max_risk,
                         float(signal.get("entry") or 0), float(signal.get("sl") or 0),
                         signal.get("lot_size"), signal.get("strategy", VOLATILITY_STRATEGY))
+            scan_log.record_decision(
+                strategy=signal.get("strategy", VOLATILITY_STRATEGY), symbol=symbol,
+                side=side, strike=strike, iv_rank=signal.get("iv_rank"), score=signal.get("score"),
+                decision="risk_cap", reason=f"1-lot risk Rs{risk:.0f} > Rs{max_risk:.0f}",
+            )
             return None
 
     # External strategies (e.g. B&B) may not pre-fill the honest-economics
@@ -1006,6 +1103,11 @@ def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
     send_telegram(format_signal_alert(signal), bot_token, chat_id)
     logger.info("book_signal: opened %s %s %s [%s]",
                 symbol, side, strike, signal.get("strategy", VOLATILITY_STRATEGY))
+    scan_log.record_decision(
+        strategy=signal.get("strategy", VOLATILITY_STRATEGY), symbol=symbol,
+        side=side, strike=strike, iv_rank=signal.get("iv_rank"), score=signal.get("score"),
+        decision="booked", reason=None, extra={"factors_json": signal.get("factors_json")},
+    )
     return signal
 
 

@@ -243,6 +243,52 @@ FEATURE_FLAGS = [
      "label": "Daily-loss limit (Rs)",
      "help": "Book-wide loss floor in rupees. New entries stop when the day's P&L "
              "<= -this value. 0 disables the guard."},
+    {"key": "DAILY_LOSS_FLATTEN_ON_BREACH", "type": "bool", "default": False,
+     "env": "DAILY_LOSS_FLATTEN_ON_BREACH",
+     "label": "Daily-loss breaker flattens open positions",
+     "help": "Requires Daily-loss lockout = hard. Once the floor is breached, "
+             "force-close every open position at market (once/day) instead of "
+             "only blocking new entries."},
+    {"key": "TRAILING_SL_ENABLED", "type": "bool", "default": False,
+     "env": "TRAILING_SL_ENABLED",
+     "label": "Trailing stop-loss",
+     "help": "Ratchet a single-leg trade's SL toward its best price once it's "
+             "up Trailing activation %, locking in gains instead of the fixed "
+             "SL/target model giving it all back. Combo (hedged) legs are "
+             "unaffected — they use the combined spread SL/target instead."},
+    {"key": "TRAILING_SL_ACTIVATION_PCT", "type": "float", "default": 0.20,
+     "env": "TRAILING_SL_ACTIVATION_PCT",
+     "label": "Trailing activation (%)",
+     "help": "Profit-on-premium fraction required before the trailing ratchet "
+             "starts (0.20 = 20%)."},
+    {"key": "TRAILING_SL_GIVEBACK_PCT", "type": "float", "default": 0.15,
+     "env": "TRAILING_SL_GIVEBACK_PCT",
+     "label": "Trailing giveback (%)",
+     "help": "Fraction of the gain from entry to the peak allowed to give "
+             "back before the trailing stop fires (0.15 = 15%)."},
+    {"key": "SONAR_EXIT_MODE", "type": "enum", "values": ["off", "soft", "hard"],
+     "default": "off", "env": "SONAR_EXIT_MODE",
+     "label": "Auto-exit on Sonar reversal",
+     "help": "Close a position when the latest Sonar read (BREAKDOWN/"
+             "REVERSAL_DOWN on a CE, BREAKOUT_UP/REVERSAL_UP on a PE) reverses "
+             "against its side. Was warn-only; hard = exit at market, soft = "
+             "log only. Defaults off (unlike the OI-contradiction gate) since "
+             "this promotes a previously warn-only signal to act-on."},
+    {"key": "EXPOSURE_GATE_MODE", "type": "enum", "values": ["off", "soft", "hard"],
+     "default": "off", "env": "EXPOSURE_GATE_MODE",
+     "label": "Portfolio exposure gate",
+     "help": "Cap total open position count and/or total open premium (Rs) "
+             "across the WHOLE book, on top of the per-direction/sector "
+             "concentration gate."},
+    {"key": "EXPOSURE_MAX_OPEN_POSITIONS", "type": "int", "default": 0,
+     "env": "EXPOSURE_MAX_OPEN_POSITIONS",
+     "label": "Max open positions (book-wide)",
+     "help": "Max concurrent open legs across every strategy combined. 0 = unlimited."},
+    {"key": "EXPOSURE_MAX_OPEN_PREMIUM_RUPEES", "type": "float", "default": 0.0,
+     "env": "EXPOSURE_MAX_OPEN_PREMIUM_RUPEES",
+     "label": "Max open premium (Rs, book-wide)",
+     "help": "Max total premium deployed (sum of entry*lot_size) across every "
+             "open leg. 0 = unlimited."},
 ]
 _FLAG_BY_KEY = {f["key"]: f for f in FEATURE_FLAGS}
 

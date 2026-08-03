@@ -8,9 +8,14 @@ const BRAND = { name: 'Fuzzy Tribble', sub: 'Trading System', logo: 'FT' };
 const USER  = { name: 'Dhiraj', role: 'Administrator', initials: 'DH' };
 
 // key, label, icon, href
+// 2026-07-30: dropped the separate "Dashboard" entry that used to redirect to
+// the legacy dashboard.html — that page has its own self-contained tab
+// navigation (not real links), so clicking it from the new sidebar dropped
+// you into a dead end with no way back into this nav. "Overview" already
+// replaces it in the new design; the legacy page is still reachable directly
+// at "/" for anyone with an existing bookmark, just no longer linked from here.
 const NAV = [
   ['overview',     'Overview',        '⌂', '/overview'],
-  ['dashboard',    'Dashboard',       '▦', '/dashboard'],
   ['signals',      'Signals',         '⚡', '/signals'],
   ['positions',    'Positions',       '▤', '/positions'],
   ['scanners',     'Scanner Hub',     '◎', '/scanners'],

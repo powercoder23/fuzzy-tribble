@@ -15,7 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir fastapi uvicorn[standard]==0.24.0 pyyaml psutil
+RUN pip install --no-cache-dir fastapi uvicorn[standard]==0.24.0 pyyaml psutil pandas requests \
+        python-dotenv upstox-python-sdk
 
 COPY dashboard_app.py .
 COPY dashboard.html .
@@ -26,11 +27,29 @@ COPY iv_analytics.py .
 # in /api/market-snapshot — dashboard has no other project dependency.
 COPY breadth.py .
 COPY breadth_config.py .
+# /api/hedge-config reads these live so the Positions page combo cards never
+# drift from what paper_trader.apply_combo_tick actually triggers on.
+COPY hedge_config.py .
 # Settings page: alert-flag matrix, kill switch, and container control.
 COPY settings_store.py .
 COPY settings_routes.py .
 COPY docker_control.py .
 COPY settings.html .
+# Backtest engine (Black-Scholes premium reconstruction over historical
+# candles/IV). momentum_config.py supplies the ORB/VWAP thresholds so
+# backtests never drift from the live strategy; f_o_stocks_list.py resolves
+# the default "full F&O universe" symbol scope. upstox_adapter.py +
+# upstox_token_manager.py + config.py are needed only for the LIVE historical-
+# candle fetch when a backtest range isn't already cached/seeded — reads the
+# access token the iv-collector already refreshes into the shared data
+# volume, does its own broker login (no selenium/dhanhq pulled in here).
+COPY backtest_routes.py .
+COPY backtest/ ./backtest/
+COPY momentum_config.py .
+COPY f_o_stocks_list.py .
+COPY upstox_adapter.py .
+COPY upstox_token_manager.py .
+COPY config.py .
 # New frontend design system (shared css/js + per-page HTML). Served at /static
 # and /settings by dashboard_app. Without this the redesigned pages 404.
 COPY web/ ./web/

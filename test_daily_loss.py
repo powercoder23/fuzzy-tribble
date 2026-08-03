@@ -119,6 +119,125 @@ def test_submit_external_signal_returns_none_when_locked():
     assert booked is None
 
 
+# --- flatten-on-breach (extends daily-loss into a real circuit breaker) -----
+
+import os
+import tempfile
+
+import paper_trader
+
+
+def _cleanup(path):
+    """Best-effort tempfile removal. On Windows, a just-closed sqlite
+    connection (WAL mode leaves -wal/-shm sidecars) can keep the file
+    handle briefly locked even after the `with` block exits — that's a
+    Windows-only OS timing quirk, not a bug in the feature under test, so
+    cleanup failure here must never fail the test."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+class _FakeScanner:
+    """get_current_option_premium returns no usable quote -> close_position
+    falls back to the trade's own last_price, so tests control P&L exactly
+    by setting last_price directly instead of depending on quote plumbing."""
+    def get_current_option_premium(self, *a, **k):
+        return {"last": None}
+
+
+def _sig(symbol, entry, sl=1.0, t1=999.0, lot_size=500):
+    return {"symbol": symbol, "security_id": symbol, "exchange_segment": "NSE_FNO",
+            "side": "CE", "strike": 100.0, "expiry": "2026-07-30",
+            "entry": entry, "sl": sl, "t1": t1, "t2": t1,
+            "t1_book_fraction": 1.0, "lot_size": lot_size}
+
+
+def _open_marked_loss(book, symbol, entry, last_price, now):
+    """Open a real trade then mark it to `last_price` (simulating a big
+    unrealized move) via save_runtime, same path a real monitor tick uses."""
+    book.open_trade(_sig(symbol, entry), now=now)
+    today = now.date().isoformat()
+    trade = [t for t in book.open_trades(today) if t["symbol"] == symbol][0]
+    trade["last_price"] = last_price
+    book.save_runtime(trade, now)
+
+
+def _real_om(mode, flatten_on_breach, limit=1000.0):
+    """OrderManager over a REAL (tempfile) PaperTradeBook — needed because
+    the flatten path calls paper_trader.close_position(), which persists via
+    book.save_runtime() (the _FakeBook above doesn't implement that)."""
+    order_manager._resolve_mode = lambda k, f: mode
+    order_manager._resolve_limit = lambda k, f: limit
+    order_manager._resolve_bool = lambda k, f: flatten_on_breach
+    fd, p = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    book = paper_trader.PaperTradeBook(db_path=p)
+    om = OrderManager(book=book)
+    om._alert_daily_loss = lambda *a, **k: None
+    om._alert_flatten = lambda *a, **k: None
+    paper_trader.send_telegram = lambda *a, **k: True
+    return om, p
+
+
+def test_flatten_noop_when_flag_off():
+    now = datetime(2026, 7, 9, 10, 0, 0)
+    om, p = _real_om("hard", flatten_on_breach=False)
+    try:
+        _open_marked_loss(om.book, "AAA", entry=100, last_price=50, now=now)
+        closed = om._maybe_flatten_daily_loss(_FakeScanner(), now)
+        assert closed == []
+        assert len(om.book.open_trades(now.date().isoformat())) == 1
+    finally:
+        _cleanup(p)
+
+
+def test_flatten_noop_in_soft_mode_even_with_flag_on():
+    now = datetime(2026, 7, 9, 10, 0, 0)
+    om, p = _real_om("soft", flatten_on_breach=True)
+    try:
+        _open_marked_loss(om.book, "AAA", entry=100, last_price=50, now=now)
+        closed = om._maybe_flatten_daily_loss(_FakeScanner(), now)
+        assert closed == []
+        assert len(om.book.open_trades(now.date().isoformat())) == 1
+    finally:
+        _cleanup(p)
+
+
+def test_flatten_noop_when_not_actually_breached():
+    now = datetime(2026, 7, 9, 10, 0, 0)
+    om, p = _real_om("hard", flatten_on_breach=True, limit=999999.0)
+    try:
+        _open_marked_loss(om.book, "AAA", entry=100, last_price=95, now=now)
+        closed = om._maybe_flatten_daily_loss(_FakeScanner(), now)
+        assert closed == []
+        assert len(om.book.open_trades(now.date().isoformat())) == 1
+    finally:
+        _cleanup(p)
+
+
+def test_flatten_closes_every_open_position_once():
+    now = datetime(2026, 7, 9, 10, 0, 0)
+    om, p = _real_om("hard", flatten_on_breach=True, limit=1000.0)
+    try:
+        _open_marked_loss(om.book, "AAA", entry=100, last_price=50, now=now)
+        _open_marked_loss(om.book, "BBB", entry=100, last_price=60, now=now)
+        closed = om._maybe_flatten_daily_loss(_FakeScanner(), now)
+        assert len(closed) == 2
+        assert om.book.open_trades(now.date().isoformat()) == []
+        assert all(t["exit_reason"].startswith("Daily-loss breaker") for t in closed)
+
+        # Dedup: a second tick the same day must not re-flatten (nothing left
+        # open anyway, but this also guards a same-day re-entry scenario).
+        _open_marked_loss(om.book, "CCC", entry=100, last_price=50, now=now)
+        closed_again = om._maybe_flatten_daily_loss(_FakeScanner(), now)
+        assert closed_again == []
+        assert len(om.book.open_trades(now.date().isoformat())) == 1
+    finally:
+        _cleanup(p)
+
+
 if __name__ == "__main__":
     fns = [f for n, f in sorted(globals().items()) if n.startswith("test_")]
     failed = 0

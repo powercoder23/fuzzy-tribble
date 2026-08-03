@@ -52,8 +52,6 @@ def load_upstox_token() -> str:
     simultaneously only one runs the Selenium login; the rest wait and
     then reuse the token written by the winner.
     """
-    from upstox_login import get_upstox_access_token
-
     token_path = Path(TOKEN_FILE)
 
     # Fast path: valid token already on disk — no lock needed for a plain read.
@@ -86,6 +84,7 @@ def load_upstox_token() -> str:
                 pass
 
         logger.info("Generating new Upstox access token via Selenium.")
+        from upstox_login import get_upstox_access_token
         token = get_upstox_access_token()
         save_upstox_token(token)
         return token

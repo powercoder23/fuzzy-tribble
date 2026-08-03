@@ -103,8 +103,22 @@ PAPER_MODE = os.getenv("ENGINE_PAPER_MODE", "off").lower()   # off | paper
 PAPER_MAX_TRADES = _i("ENGINE_PAPER_MAX_TRADES", 5)          # per day, across cycles
 PAPER_GRADES = [g for g in os.getenv("ENGINE_PAPER_GRADES", "A+,A")
                 .replace(" ", "").split(",") if g]
-PAPER_SL_PCT = _f("ENGINE_PAPER_SL_PCT", 0.30)              # SL = entry x (1 - SL_PCT)
-PAPER_TARGET_R = _f("ENGINE_PAPER_TARGET_R", 2.0)           # target = entry x (1 + SL_PCT x R)
+PAPER_SL_PCT = _f("ENGINE_PAPER_SL_PCT", 0.30)              # SL = entry x (1 - SL_PCT), before the rupee cap below
+# Hard per-trade SL loss ceiling (rupees) — the percentage SL above still
+# applies, but never past this. Closes the hole where a large lot_size
+# turned a routine 30%-premium stop into a five-figure rupee loss (e.g.
+# LAURUSLABS lot=850 on 2026-08-03). Same ceiling for every trade regardless
+# of stock/lot size, as requested — see build_signal()'s min(pct, cap).
+PAPER_MAX_LOSS_RUPEES = _f("ENGINE_PAPER_MAX_LOSS_RUPEES", 700.0)
+# Target = entry + PAPER_TARGET_CAPTURE_PCT x the stock's OWN 1-day expected
+# ATM-premium move (from its real ATM IV, via expected_move.est_atm_premium_pct)
+# — replaces the old flat entry x 1.6 multiplier so different stocks get
+# different targets instead of one number for everyone.
+PAPER_TARGET_CAPTURE_PCT = _f("ENGINE_PAPER_TARGET_CAPTURE_PCT", 0.75)
+# Floor: target gain must be at least this many multiples of the SL's own
+# rupee-equivalent risk, so a very low-IV name can't produce a target too
+# close to entry to be worth the trade.
+PAPER_MIN_RR = _f("ENGINE_PAPER_MIN_RR", 1.0)
 PAPER_MIN_DTE = _i("ENGINE_PAPER_MIN_DTE", 1)               # skip contracts nearer than this
 PAPER_STRATEGY_TAG = os.getenv("ENGINE_PAPER_STRATEGY_TAG", "Convex")
 SCRIP_MASTER_DB = os.getenv("ENGINE_SCRIP_MASTER_DB",

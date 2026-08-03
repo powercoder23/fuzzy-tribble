@@ -77,3 +77,51 @@ export function pnlHistoryChart(canvas, daily, onBarClick) {
   store.set(canvas, chart);
   return chart;
 }
+
+/* Backtest equity curve — cumulative P&L per trade, in trade sequence.
+   `curve` is [{ts, equity}, ...] as returned by /api/backtest/runs/{id}. */
+export function equityCurveChart(canvas, curve) {
+  if (!canvas || !window.Chart) return null;
+  const prev = store.get(canvas);
+  if (prev) prev.destroy();
+  if (!curve || !curve.length) return null;
+  const positive = curve[curve.length - 1].equity >= 0;
+  const color = positive ? '#10b981' : '#ef4444';
+  const chart = new window.Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: {
+      labels: curve.map((_, i) => i + 1),
+      datasets: [{
+        label: 'Equity',
+        data: curve.map((c) => c.equity),
+        borderColor: color, borderWidth: 1.5, pointRadius: 0, tension: 0.15, fill: true,
+        backgroundColor: (ctx) => {
+          const { ctx: c, chartArea } = ctx.chart;
+          if (!chartArea) return 'transparent';
+          const g = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+          g.addColorStop(0, color + '33');
+          g.addColorStop(1, color + '00');
+          return g;
+        },
+      }],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#111725', borderColor: '#232c40', borderWidth: 1,
+          titleColor: '#8b98b0', bodyColor: '#e6edf7', bodyFont: { family: 'JetBrains Mono', size: 11 }, padding: 8,
+          callbacks: { title: (items) => `Trade #${items[0].label}`, label: (item) => `₹${item.raw.toLocaleString('en-IN')}` },
+        },
+      },
+      scales: {
+        x: { title: { display: true, text: 'Trade #', color: '#5b6678', font: { size: 9 } },
+             ticks: { color: '#5b6678', font: { family: 'JetBrains Mono', size: 9 }, maxTicksLimit: 12 }, grid: { color: '#1a2233' } },
+        y: { ticks: { color: '#8b98b0', font: { family: 'JetBrains Mono', size: 9 }, callback: (v) => '₹' + v.toLocaleString('en-IN') }, grid: { color: '#161d2e' } },
+      },
+    },
+  });
+  store.set(canvas, chart);
+  return chart;
+}

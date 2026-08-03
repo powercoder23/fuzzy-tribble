@@ -54,6 +54,7 @@ import iv_analytics
 import settings_store
 import docker_control
 from settings_routes import router as settings_router
+from backtest_routes import router as backtest_router
 
 # ── Config ────────────────────────────────────────────────────────────────── #
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -62,6 +63,7 @@ PT_DB    = DATA_DIR / "paper_trades.db"
 
 app = FastAPI(title="Fuzzy Tribble Dashboard", version="1.0")
 app.include_router(settings_router)
+app.include_router(backtest_router)
 
 # Shared frontend assets (new design system: css/ + js/ under web/static).
 WEB_DIR = Path(__file__).parent / "web"
@@ -955,6 +957,18 @@ def convex_journal(days: int = Query(30, ge=1, le=120)):
 # ── Serve frontend ────────────────────────────────────────────────────────── #
 @app.get("/", response_class=HTMLResponse)
 def index():
+    # 2026-07-30: "/" now serves the new design-system Overview page — the
+    # old monolithic dashboard.html moved to /dashboard_old (see below). Do
+    # not put old-dashboard content back here.
+    return _serve_page("overview")
+
+
+@app.get("/dashboard_old", response_class=HTMLResponse)
+def dashboard_old():
+    """The original monolithic dashboard — kept reachable for anyone who
+    still needs a feature not yet migrated to the new per-page design
+    (e.g. IV Graph, Universe, Convex Journal — see [[dashboard-page-routing]]
+    memory for what has and hasn't been ported)."""
     html_path = Path(__file__).parent / "dashboard.html"
     if html_path.exists():
         return html_path.read_text()
@@ -1010,11 +1024,12 @@ def market_page(): return _serve_page("market")
 def alerts_page(): return _serve_page("alerts")
 
 
-# "Dashboard" in the new sidebar nav means "the original all-in-one page" —
-# keep it reachable at its own URL rather than duplicating that page's content.
+# 2026-07-30: "/dashboard" now redirects to the new Overview (was the old
+# all-in-one page, which is the actual dead end being decommissioned here —
+# see the "/" route and /dashboard_old above).
 @app.get("/dashboard")
 def dashboard_alias():
-    return RedirectResponse(url="/")
+    return RedirectResponse(url="/overview")
 
 
 # Not wired up yet — same shell/theme, honest "coming later" card instead of
@@ -1036,7 +1051,7 @@ def system_health_page(): return _serve_page("placeholder")
 
 
 @app.get("/backtest", response_class=HTMLResponse)
-def backtest_page(): return _serve_page("placeholder")
+def backtest_page(): return _serve_page("backtest")
 
 
 @app.get("/data-explorer", response_class=HTMLResponse)

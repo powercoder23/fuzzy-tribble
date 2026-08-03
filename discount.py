@@ -17,10 +17,12 @@ import warnings
 from f_o_stocks_list import get_stock_futures
 import notifications
 from load_scrip_master_sqlite import update_scrip_master, get_security_id_symbol_map
+import scan_log
 from discount_config import (
     TRADE_PLAN,
     INTRADAY,
     MIN_DTE_DAYS,
+    MIN_IV_RANK,
     LIQUID_UNIVERSE_ONLY,
     LIQUID_UNIVERSE_SIZE,
     UPSTOX_MIN_REQ_INTERVAL_SEC,
@@ -28,11 +30,6 @@ from discount_config import (
 )
 warnings.filterwarnings('ignore')
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
 IV_HISTORY_FILE = Path("iv_history.csv")
@@ -1921,6 +1918,14 @@ class DiscountedPremiumScanner:
         except Exception:
             return None
 
+    def _record_scan_decision(self, symbol, side, strike, iv_rank, score,
+                               decision, reason=None, extra=None):
+        scan_log.record_decision(
+            strategy="discount", symbol=symbol, side=side, strike=strike,
+            iv_rank=iv_rank, score=score, decision=decision, reason=reason,
+            extra=extra,
+        )
+
     def log_option_rejection(self, strike_price, option_type, reason, **details):
         """Emit readable filter diagnostics for rejected options."""
         clean_details = {
@@ -2519,6 +2524,34 @@ class DiscountedPremiumScanner:
                     score=score,
                     score_breakdown=score_breakdown,
                 )
+                self._record_scan_decision(
+                    symbol=getattr(self, "_current_scan_symbol", None),
+                    side=option_label,
+                    strike=strike_price,
+                    iv_rank=iv_rank,
+                    score=score,
+                    decision="score_below_min",
+                    reason="score < 40",
+                )
+                continue
+
+            if has_iv_history and iv_rank is not None and iv_rank < MIN_IV_RANK:
+                self.log_option_rejection(
+                    strike_price,
+                    option_label,
+                    "Rejected due to iv_rank below minimum",
+                    iv_rank=round(iv_rank, 2),
+                    min_iv_rank=MIN_IV_RANK,
+                )
+                self._record_scan_decision(
+                    symbol=getattr(self, "_current_scan_symbol", None),
+                    side=option_label,
+                    strike=strike_price,
+                    iv_rank=iv_rank,
+                    score=score,
+                    decision="iv_rank_floor",
+                    reason=f"iv_rank {iv_rank:.1f} < MIN_IV_RANK {MIN_IV_RANK}",
+                )
                 continue
 
             hv_gap = weighted_hv - current_iv if weighted_hv else None
@@ -2696,7 +2729,8 @@ class DiscountedPremiumScanner:
         logger.info("%s", "=" * 60)
         logger.info("Scanning %s (ID: %s)", security_name, security_id)
         logger.info("%s", "=" * 60)
-        
+        self._current_scan_symbol = security_name
+
         # Get expiry list if not specified
         if expiry is None:
             expiries = self.get_expiry_list(security_id, security_segment)
@@ -3163,6 +3197,11 @@ class DiscountedPremiumScanner:
 # ==================== USAGE EXAMPLE ====================
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
     load_dotenv(dotenv_path=Path(".env"))
 
     # Initialize scanner with your Dhan credentials

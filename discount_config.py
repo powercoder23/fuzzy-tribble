@@ -79,6 +79,14 @@ NSE_HOLIDAYS = []
 # --- Scoring ------------------------------------------------------------
 MIN_SCORE = 55  # minimum composite score (0-100) to surface an opportunity
 
+# 2026-07-31: backtested across 214 closed paper trades (7/30+7/31) — score is
+# saturated at the 95.0 ceiling for ~86% of candidates and doesn't separate
+# winners from losers (win-trade avg 94.66 vs loss-trade avg 94.70), but
+# iv_rank does: unfiltered baseline was 40.7% win rate / -Rs21,458 net; iv_rank
+# >= 25 kept 31% of volume at 50.7% win rate / +Rs7,369 net, monotonic through
+# >=30 (+Rs5,375, 55 trades). Gates entries in discount.py's candidate loop.
+MIN_IV_RANK = 25
+
 # FIX 8: directional confirmation layer. Cheap IV alone should not generate a
 # high-confidence signal, so the base composite from score_option() is blended
 # with a 0-100 directional_score that rewards price-structure / trend / flow
@@ -136,8 +144,12 @@ INTRADAY = {
     # 0 = unlimited (testing mode); set PAPER_MAX_SIGNALS env var to override.
     "max_signals_per_day": int(os.getenv("PAPER_MAX_SIGNALS", "0")),
     "min_premium": 5.0,           # skip options trading below ₹5 (far-OTM junk)
-    # 0 = unlimited (testing mode); set PAPER_MAX_PER_SYMBOL env var to override.
-    "max_per_symbol_per_day": int(os.getenv("PAPER_MAX_PER_SYMBOL", "0")),
+    # 2026-07-31: default was 0 (unlimited), which let one underlying eat up
+    # to 8 slots/day via different strikes (e.g. HCLTECH 8x on 2026-07-31).
+    # count_symbol_today() already counts across ALL strikes/sides for a
+    # symbol, so this cap was correctly wired but toothless at 0. 1 = one
+    # trade per symbol per day; set PAPER_MAX_PER_SYMBOL env var to override.
+    "max_per_symbol_per_day": int(os.getenv("PAPER_MAX_PER_SYMBOL", "1")),
     "max_risk_rupees": 1500.0,    # skip a signal whose 1-lot risk
                                   # (entry-sl)*lot_size exceeds this budget, so a
                                   # big-lot cheap option can't quietly risk 5x a
@@ -155,14 +167,19 @@ INTRADAY = {
 # affected; this flag only ever gated the paper_trader hand-off.
 PAPER_TRADING_ENABLED = True
 
-# Discount's hedge leg sits closer to the primary strike than B&B/directional-
-# IV's shared default (hedge_config.HEDGE_STRIKES_OTM=3) — a deliberate
-# difference so discount's spreads aren't just a copy of the other strategies':
-# narrower spread -> smaller net debit and higher probability of reaching max
-# profit, at the cost of a lower profit cap. Gives the paper book a genuinely
+# 2026-07-31: the narrower-than-B&B/directional-IV width (2 vs 3 strikes OTM)
+# was the deliberate original intent (see prior comment, kept below) but in
+# practice ~48% of discount's hedge attempts today failed with "spread too
+# narrow" (credit > HEDGE_MAX_CREDIT_RATIO of primary) — a materially worse
+# failure rate than the other strategies sharing width=3. Widened to match
+# until there's a narrower-width variant that actually books reliably.
+#
+# Original rationale for width=2 (kept for context): a narrower spread gives
+# a smaller net debit and higher probability of reaching max profit, at the
+# cost of a lower profit cap — meant to give the paper book a genuinely
 # different risk/reward shape to compare against B&B/directional-IV's wider
 # spreads once there's enough sample size to judge.
-DISCOUNT_HEDGE_STRIKES_OTM = int(os.getenv("DISCOUNT_HEDGE_STRIKES_OTM", "2"))
+DISCOUNT_HEDGE_STRIKES_OTM = int(os.getenv("DISCOUNT_HEDGE_STRIKES_OTM", "3"))
 
 # --- Universe (DISCOUNT SCANNER ONLY) -----------------------------------
 # Trim the scan universe to the most liquid F&O names. Ranking uses the latest

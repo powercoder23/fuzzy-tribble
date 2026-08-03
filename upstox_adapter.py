@@ -460,6 +460,37 @@ class UpstoxDhanAdapter:
             logger.error("historical_daily_data ApiException: %s", exc)
             return {"status": "failure", "remarks": str(exc)}
 
+    def historical_intraday_data(self, security_id, exchange_segment,
+                                 instrument_type,  # noqa: ARG002
+                                 from_date, to_date,
+                                 interval=5, **_kwargs) -> dict:
+        """Fetch historical intraday OHLCV over an arbitrary date range.
+
+        Unlike intraday_minute_data() (Upstox's "today only" endpoint), this
+        calls the same ranged historical-candle endpoint historical_daily_data
+        uses, but with unit="minutes" — Upstox v3 supports minute-granularity
+        history for recent weeks/months (exact retention is Upstox's call, not
+        ours; empty results for very old dates are expected, not an error).
+        Returns the same Dhan-columnar shape as intraday_minute_data() so
+        callers (backtest.candle_fetcher) can treat both interchangeably.
+        """
+        inst_key = _underlying_key_from_security_id(security_id, exchange_segment)
+        if not inst_key:
+            logger.warning("historical_intraday_data: no instrument_key for security_id=%s", security_id)
+            return {"status": "failure", "remarks": "instrument_key not found"}
+        try:
+            resp = self._history_api.get_historical_candle_data1(
+                inst_key, "minutes", int(interval), to_date, from_date
+            )
+            candles = resp.data.candles if resp and resp.data else []
+            return {
+                "status": "success",
+                "data":   _candles_to_dhan_columnar(candles),
+            }
+        except ApiException as exc:
+            logger.error("historical_intraday_data ApiException: %s", exc)
+            return {"status": "failure", "remarks": str(exc)}
+
     # ------------------------------------------------------------------
     # Option chain
     # ------------------------------------------------------------------

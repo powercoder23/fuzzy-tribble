@@ -22,6 +22,7 @@ import uuid
 from datetime import datetime
 
 import paper_trader
+import scan_log
 import settings_store
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,14 @@ def _resolve_limit(key: str, fallback: float) -> float:
     """Settings-DB override for a numeric flag (UI toggle), else `fallback`."""
     try:
         return settings_store.flag_float(key)
+    except Exception:
+        return fallback
+
+
+def _resolve_bool(key: str, fallback: bool) -> bool:
+    """Settings-DB override for a boolean flag (UI toggle), else `fallback`."""
+    try:
+        return settings_store.flag_bool(key)
     except Exception:
         return fallback
 
@@ -83,6 +92,25 @@ def oi_contradicts(side, bias, strength, oi_chg_pct, pnl_pct, *,
     if pnl_pct is not None and pnl_pct > max_profit_pct:
         return False                      # let a clear winner run
     return True
+
+
+# --------------------------------------------------------------------------- #
+# Pure decision: does the latest Sonar read reverse against an open position
+# strongly enough to auto-exit it? Extracted from the inline check that used
+# to live only in _check_position_risks (warn-only) — same logic, now also
+# usable by _auto_exit_on_sonar_reversal (act-on-it). No DB / no API.
+# --------------------------------------------------------------------------- #
+def sonar_reversal_contradicts(side, sonar_signal):
+    """True when the Sonar signal reverses against an open position's side.
+
+    side         : the position side ("CE"/"CALL" or "PE"/"PUT").
+    sonar_signal : sonar's `signal` field (e.g. "BREAKDOWN", "REVERSAL_UP").
+    """
+    side = "CE" if str(side).upper() in ("CE", "CALL") else "PE"
+    bearish = {"BREAKDOWN", "REVERSAL_DOWN"}
+    bullish = {"BREAKOUT_UP", "REVERSAL_UP"}
+    return (side == "CE" and sonar_signal in bearish) or \
+           (side == "PE" and sonar_signal in bullish)
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +215,7 @@ class OrderManager:
         self._warned_date: str | None = None
         self._gate_alerted: set = set()    # (gate_name, date) — dedup gate-failure alerts
         self._loss_alerted_date: str | None = None  # dedup daily-loss lockout alert
+        self._flattened_date: str | None = None  # dedup daily-loss flatten-all
 
     def _alert_gate_failure(self, gate_name: str) -> None:
         """A gate that crashes fails OPEN — candidates pass unfiltered. That is
@@ -254,6 +283,70 @@ class OrderManager:
         except Exception:
             logger.exception("daily-loss alert could not be sent")
 
+    def _maybe_flatten_daily_loss(self, scanner, now=None) -> list:
+        """Force-close every open position, once, the first tick the daily-loss
+        floor is breached in hard mode with FLATTEN_ON_BREACH on.
+
+        _daily_loss_locked already stops NEW entries in hard mode, but leaves
+        existing positions open ("still managed normally") — this turns that
+        into a real circuit breaker. Off unless both the gate is hard AND the
+        flatten flag is explicitly on (daily_loss_config.FLATTEN_ON_BREACH).
+        Dedups via self._flattened_date so it fires once per day, not every
+        5-min tick. Fail-open (never flattens on an internal error, but fires
+        a loud gate-failure alert) — same convention as every other gate.
+        """
+        try:
+            import daily_loss_config as cfg
+            mode = _resolve_mode("DAILY_LOSS_GATE_MODE", cfg.MODE)
+            flatten_on_breach = _resolve_bool("DAILY_LOSS_FLATTEN_ON_BREACH", cfg.FLATTEN_ON_BREACH)
+            if mode != "hard" or not flatten_on_breach:
+                return []
+
+            locked, day_pnl = self._daily_loss_locked(self.book, now)
+            if not locked:
+                return []
+
+            today = (now or datetime.now()).date().isoformat()
+            if self._flattened_date == today:
+                return []
+            self._flattened_date = today
+
+            open_trades = self.book.open_trades(today)
+            if not open_trades:
+                return []
+
+            reason = f"Daily-loss breaker (day P&L Rs {day_pnl:,.0f})"
+            closed = []
+            for trade in open_trades:
+                t = paper_trader.close_position(
+                    self.book, scanner, trade, reason, now=now,
+                    bot_token=self.bot_token, chat_id=self.chat_id,
+                )
+                if t:
+                    closed.append(t)
+            logger.info("DAILY-LOSS FLATTEN — closed %d open position(s), day P&L Rs %.0f",
+                        len(closed), day_pnl)
+            self._alert_flatten(day_pnl, len(closed), now)
+            return closed
+        except Exception:
+            logger.exception("daily-loss flatten failed (non-fatal)")
+            self._alert_gate_failure("daily_loss_flatten")
+            return []
+
+    def _alert_flatten(self, pnl: float, n_closed: int, now=None) -> None:
+        """One Telegram alert the moment the flatten-all fires."""
+        try:
+            import notifications
+            notifications.notify(
+                f"\U0001F6D1 <b>DAILY-LOSS FLATTEN</b>\n"
+                f"Day P&L Rs {pnl:,.0f} breached the hard floor — force-closed "
+                f"{n_closed} open position(s) at market. No new entries for the "
+                f"rest of the session.",
+                bot_token=self.bot_token, chat_id=self.chat_id,
+            )
+        except Exception:
+            logger.exception("daily-loss flatten alert could not be sent")
+
     # ---- intake: a scanner hands booked signals to the manager ------------- #
     def submit_signals(self, opportunities, now=None, lot_size_fn=None,
                       hedge_chain_fetcher=None, hedge_n_strikes=None):
@@ -275,6 +368,7 @@ class OrderManager:
         opportunities = self._apply_breadth_gate(opportunities)
         opportunities = self._apply_entry_gate(opportunities)
         opportunities = self._apply_concentration_gate(opportunities, self.book)
+        opportunities = self._apply_exposure_gate(opportunities, self.book)
         opened = paper_trader.process_signals(
             self.book, opportunities, now=now, lot_size_fn=lot_size_fn,
             hedge_chain_fetcher=hedge_chain_fetcher, hedge_n_strikes=hedge_n_strikes,
@@ -313,6 +407,7 @@ class OrderManager:
         kept = self._apply_pre_market_gate([sig], self.book, enforce_position_cap=False)
         kept = self._apply_breadth_gate(kept)
         kept = self._apply_concentration_gate(kept, self.book)
+        kept = self._apply_exposure_gate(kept, self.book)
         if not kept:
             logger.info("OrderManager: external %s %s rejected by quality gate",
                         sig.get("symbol"), sig.get("side") or sig.get("type"))
@@ -478,6 +573,12 @@ class OrderManager:
                         r.get("symbol"), r.get("side") or r.get("type"),
                         result["reason"],
                     )
+                    scan_log.record_decision(
+                        strategy=r.get("strategy", paper_trader.VOLATILITY_STRATEGY),
+                        symbol=r.get("symbol"), side=r.get("side") or r.get("type"),
+                        strike=r.get("strike"), iv_rank=r.get("iv_rank"), score=r.get("score"),
+                        decision="pre_market_gate", reason=result["reason"],
+                    )
 
             dropped = len(rows) - len(kept)
             if dropped:
@@ -556,6 +657,12 @@ class OrderManager:
                 if block_reason and pmode == "hard":
                     logger.info("OrderManager: concentration gate blocked %s %s — %s",
                                 sym, side, block_reason)
+                    scan_log.record_decision(
+                        strategy=r.get("strategy", paper_trader.VOLATILITY_STRATEGY),
+                        symbol=sym, side=side, strike=r.get("strike"),
+                        iv_rank=r.get("iv_rank"), score=r.get("score"),
+                        decision="concentration_gate", reason=block_reason,
+                    )
                     continue
                 if block_reason:  # soft
                     logger.info("OrderManager: concentration gate (soft) would block "
@@ -573,6 +680,81 @@ class OrderManager:
         except Exception:
             logger.exception("concentration gate failed; passing candidates through")
             self._alert_gate_failure("concentration_gate")
+            return opportunities
+
+    def _apply_exposure_gate(self, opportunities, book=None):
+        """Portfolio-wide open-exposure cap (exposure_config.py).
+
+        Counts OPEN positions plus already-accepted candidates in this batch
+        against MAX_OPEN_POSITIONS (position count) and
+        MAX_OPEN_PREMIUM_RUPEES (total entry*lot_size deployed) — either cap,
+        if set, can block a candidate. Unlike the concentration gate this
+        doesn't distinguish direction/sector; it's a raw book-size backstop.
+
+        Modes (EXPOSURE_GATE_MODE): off -> unchanged, soft -> log only,
+        hard -> drop. Fail-open with a loud alert.
+        """
+        try:
+            import exposure_config as cfg
+            emode = _resolve_mode("EXPOSURE_GATE_MODE", cfg.MODE)
+            if emode == "off" or opportunities is None:
+                return opportunities
+            rows = (opportunities.to_dict("records")
+                    if hasattr(opportunities, "to_dict") else list(opportunities))
+            if not rows:
+                return opportunities
+
+            max_positions = _resolve_limit("EXPOSURE_MAX_OPEN_POSITIONS", cfg.MAX_OPEN_POSITIONS)
+            max_premium = _resolve_limit("EXPOSURE_MAX_OPEN_PREMIUM_RUPEES", cfg.MAX_OPEN_PREMIUM_RUPEES)
+            if not max_positions and not max_premium:
+                return opportunities
+
+            today = datetime.now().date().isoformat()
+            open_trades = book.open_trades(today) if book else []
+            open_count = len(open_trades)
+            open_premium = sum(
+                float(t.get("entry") or 0) * int(t.get("lot_size") or 1)
+                for t in open_trades
+            )
+
+            kept = []
+            for r in rows:
+                sym = str(r.get("symbol", "")).upper()
+                side = r.get("side") or r.get("type")
+                candidate_premium = float(r.get("entry") or 0) * int(r.get("lot_size") or 1)
+
+                block_reason = None
+                if max_positions and open_count >= max_positions:
+                    block_reason = f"open-position cap {open_count} >= {int(max_positions)}"
+                elif max_premium and (open_premium + candidate_premium) > max_premium:
+                    block_reason = (f"open-premium cap Rs{open_premium + candidate_premium:,.0f} "
+                                    f"> Rs{max_premium:,.0f}")
+
+                if block_reason and emode == "hard":
+                    logger.info("OrderManager: exposure gate blocked %s %s — %s",
+                                sym, side, block_reason)
+                    scan_log.record_decision(
+                        strategy=r.get("strategy", paper_trader.VOLATILITY_STRATEGY),
+                        symbol=sym, side=side, strike=r.get("strike"),
+                        iv_rank=r.get("iv_rank"), score=r.get("score"),
+                        decision="exposure_gate", reason=block_reason,
+                    )
+                    continue
+                if block_reason:  # soft
+                    logger.info("OrderManager: exposure gate (soft) would block "
+                                "%s %s — %s", sym, side, block_reason)
+                kept.append(r)
+                open_count += 1
+                open_premium += candidate_premium
+
+            dropped = len(rows) - len(kept)
+            if dropped:
+                logger.info("OrderManager: exposure gate dropped %d / %d candidate(s)",
+                            dropped, len(rows))
+            return kept
+        except Exception:
+            logger.exception("exposure gate failed; passing candidates through")
+            self._alert_gate_failure("exposure_gate")
             return opportunities
 
     def _apply_breadth_gate(self, opportunities):
@@ -660,15 +842,25 @@ class OrderManager:
         )
         if closed:
             logger.info("OrderManager: closed %d position(s) this tick", len(closed))
-        # Risk-driven auto-exit (OI contradiction) THEN warn on whatever survives.
+        # Daily-loss flatten (whole-book circuit breaker) FIRST — no point
+        # running per-position risk checks on positions about to be closed
+        # anyway. Then risk-driven auto-exits, THEN warn on whatever survives.
         if not square_off:
+            flattened = self._maybe_flatten_daily_loss(scanner, now)
+            if flattened:
+                closed = list(closed) + flattened
             today = (now or datetime.now()).date().isoformat()
             auto_closed = self._auto_exit_on_oi_contradiction(
                 self.book.open_trades(today), scanner, now
             )
             if auto_closed:
                 closed = list(closed) + auto_closed
-            # Warn on positions that are STILL open (re-query post auto-exit).
+            sonar_closed = self._auto_exit_on_sonar_reversal(
+                self.book.open_trades(today), scanner, now
+            )
+            if sonar_closed:
+                closed = list(closed) + sonar_closed
+            # Warn on positions that are STILL open (re-query post auto-exits).
             self._check_position_risks(self.book.open_trades(today))
         return closed
 
@@ -754,24 +946,119 @@ class OrderManager:
                     continue
 
                 reason = f"OI contradiction ({classification} {oi_chg_f:+.0f}% OI)"
-                partner = leg_partner.get(trade["id"])
-                for leg, is_partner in ((trade, False), (partner, True)) if partner else ((trade, False),):
-                    t = paper_trader.close_position(
-                        self.book, scanner, leg, reason, now=now,
-                        bot_token=self.bot_token, chat_id=self.chat_id,
-                    )
-                    if t:
-                        closed.append(t)
-                        already_closed_ids.add(leg["id"])
-                        logger.info(
-                            "AUTO-EXIT closed %s %s @ ₹%.2f — %s%s",
-                            leg.get("symbol"), leg.get("side"), t.get("last_price") or last, reason,
-                            " (combo partner, closed together)" if is_partner else "",
-                        )
+                closed.extend(self._close_trade_and_partner(
+                    trade, leg_partner, already_closed_ids, scanner, reason, now,
+                    log_prefix="AUTO-EXIT",
+                ))
 
         except Exception:
             logger.exception("_auto_exit_on_oi_contradiction failed (non-fatal)")
             self._alert_gate_failure("auto_exit_oi_contradiction")
+        return closed
+
+    def _close_trade_and_partner(self, trade, leg_partner, already_closed_ids,
+                                 scanner, reason, now, log_prefix) -> list:
+        """Close `trade` and, if it's one leg of a still-paired debit-spread
+        combo, its partner leg too (see paper_trader._combo_pairs) — keeps a
+        risk-driven auto-exit that only judges ONE leg's directional thesis
+        from splitting a hedge apart. Mutates `already_closed_ids`. Returns
+        the trade(s) actually closed (0, 1, or 2)."""
+        closed = []
+        partner = leg_partner.get(trade["id"])
+        legs = ((trade, False), (partner, True)) if partner else ((trade, False),)
+        for leg, is_partner in legs:
+            t = paper_trader.close_position(
+                self.book, scanner, leg, reason, now=now,
+                bot_token=self.bot_token, chat_id=self.chat_id,
+            )
+            if t:
+                closed.append(t)
+                already_closed_ids.add(leg["id"])
+                logger.info(
+                    "%s closed %s %s @ ₹%.2f — %s%s",
+                    log_prefix, leg.get("symbol"), leg.get("side"),
+                    t.get("last_price") or leg.get("entry") or 0, reason,
+                    " (combo partner, closed together)" if is_partner else "",
+                )
+        return closed
+
+    def _auto_exit_on_sonar_reversal(self, open_trades, scanner, now=None) -> list:
+        """Close any open position whose latest Sonar read reverses against
+        its side. Config-gated (sonar_exit_config, default off):
+          off  → no-op
+          soft → log the would-be exit, don't close
+          hard → market-exit the contradicting position now
+
+        Same combo-safety and fail-open shape as _auto_exit_on_oi_contradiction
+        (see that docstring) — kept as a structurally identical sibling rather
+        than merged, since the two read different signals (OI buildup vs.
+        Sonar support/resistance) and may be tuned to different modes
+        independently.
+
+        Reads only the latest sonar_laplace_scanner snapshot for the symbol
+        (same call _check_position_risks already makes) — zero broker calls.
+        Fail-open: any exception leaves positions untouched.
+        """
+        closed: list = []
+        if not open_trades:
+            return closed
+        try:
+            import sonar_exit_config as cfg
+            from sonar_laplace_scanner import get_latest_sonar
+
+            smode = _resolve_mode("SONAR_EXIT_MODE", cfg.MODE)
+            if smode == "off":
+                return closed
+
+            today = (now or datetime.now()).date().isoformat()
+            combo_pairs = paper_trader._combo_pairs(open_trades)
+            leg_partner = {}
+            for long_leg, short_leg in combo_pairs.values():
+                leg_partner[long_leg["id"]] = short_leg
+                leg_partner[short_leg["id"]] = long_leg
+            already_closed_ids: set = set()
+
+            for trade in open_trades:
+                if trade["id"] in already_closed_ids:
+                    continue
+                symbol = trade.get("symbol", "")
+                side   = "CE" if str(trade.get("side", "")).upper() in ("CE", "CALL") else "PE"
+                sec_id = str(trade.get("security_id") or "")
+                entry  = float(trade.get("entry") or 0)
+                _lp    = trade.get("last_price")
+                last   = float(_lp if _lp is not None else entry)
+                pnl_pct = ((last - entry) / entry * 100.0) if entry else 0.0
+
+                try:
+                    sonar = get_latest_sonar(sec_id) if sec_id else {}
+                except Exception:
+                    logger.debug("auto-exit Sonar read failed for %s", symbol)
+                    continue
+                if sonar.get("timestamp", "")[:10] != today:
+                    continue  # stale/no read from a prior session
+                s_signal = sonar.get("signal", "")
+
+                if not sonar_reversal_contradicts(side, s_signal):
+                    continue
+                if pnl_pct > cfg.MAX_PROFIT_PCT:
+                    continue  # let a clear winner run
+
+                if smode == "soft":
+                    logger.info(
+                        "AUTO-EXIT (soft) would close %s %s — Sonar %s (pnl %+.1f%%)",
+                        symbol, side, s_signal, pnl_pct,
+                    )
+                    continue
+
+                reason = f"Sonar reversal ({s_signal})"
+                closed.extend(self._close_trade_and_partner(
+                    trade, leg_partner, already_closed_ids, scanner, reason, now,
+                    log_prefix="AUTO-EXIT",
+                ))
+
+        except Exception:
+            logger.exception("_auto_exit_on_sonar_reversal failed (non-fatal)")
+            self._alert_gate_failure("auto_exit_sonar_reversal")
         return closed
 
     def _check_position_risks(self, open_trades: list) -> None:

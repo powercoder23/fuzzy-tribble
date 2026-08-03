@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fuzzy Tribble — Backtest</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/tokens.css">
+  <link rel="stylesheet" href="/static/css/base.css">
+  <link rel="stylesheet" href="/static/css/components.css">
+  <link rel="stylesheet" href="/static/css/shell.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar"></aside>
+    <div class="main">
+      <header class="topbar" id="topbar"></header>
+      <main class="page" id="page">
+
+        <div class="card" id="runFormCard">
+          <div class="card-head">
+            <div>
+              <div class="card-title">New Backtest</div>
+              <div class="card-sub">Simulated P&amp;L reconstructed via Black-Scholes from historical spot + IV — not a replay of real fills. See the "approx" badge on strategies with additional approximated inputs.</div>
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="fStrategy">Strategy</label>
+              <select id="fStrategy" class="inp"></select>
+            </div>
+            <div class="field">
+              <label for="fDuration">Duration</label>
+              <select id="fDuration" class="inp">
+                <option value="7">Last 7 days</option>
+                <option value="15">Last 15 days</option>
+                <option value="30" selected>Last 30 days</option>
+                <option value="60">Last 60 days</option>
+                <option value="90">Last 90 days</option>
+              </select>
+            </div>
+            <div class="field" style="min-width:220px">
+              <label for="fSymbols">Symbols (blank = full F&amp;O universe)</label>
+              <input id="fSymbols" class="inp" type="text" placeholder="e.g. RELIANCE, HDFCBANK, INFY">
+            </div>
+            <div class="field" style="min-width:120px">
+              <button id="btnRun" class="btn primary">Run Backtest</button>
+            </div>
+          </div>
+          <div class="bt-progress-wrap" id="progressWrap" style="display:none">
+            <div class="bt-progress-track"><div class="bt-progress-fill" id="progressFill" style="width:0%"></div></div>
+            <div class="bt-progress-label" id="progressLabel">Queued…</div>
+          </div>
+        </div>
+
+        <div class="stat-row" id="statRow" style="display:none"></div>
+
+        <div class="card" id="equityCard" style="display:none; margin-top:var(--s5)">
+          <div class="card-head"><div><div class="card-title">Equity Curve</div><div class="card-sub" id="equitySub"></div></div></div>
+          <div style="height:220px"><canvas id="equityChart"></canvas></div>
+        </div>
+
+        <div class="card" id="tradesCard" style="display:none; margin-top:var(--s5)"></div>
+
+        <div class="card" id="runsCard" style="margin-top:var(--s5)">
+          <div class="card-head"><div><div class="card-title">Past Runs</div><div class="card-sub">Click to reopen a previous result</div></div></div>
+          <div id="runsList"><div class="loading">Loading…</div></div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+  <nav class="bottom-nav" id="bottomNav"></nav>
+  <div class="scrim" id="scrim"></div>
+  <script type="module" src="/static/js/pages/backtest.js"></script>
+</body>
+</html>

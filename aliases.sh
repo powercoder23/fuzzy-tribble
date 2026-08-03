@@ -21,14 +21,14 @@ alias logs-momentum="docker logs -f --tail 200 momentum-strategy"
 alias logs-div="docker logs -f --tail 200 directional-iv-strategy"
 
 # ── All services at once (last 50 lines each, then follow) ───────────────────
-alias logs-all="docker compose -f $_PROJ/docker-compose.prod.yml logs -f --tail 50"
+alias logs-all="docker compose -f $_PROJ/docker-compose.yml logs -f --tail 50"
 
 # ── Convenience: restart a single service after git pull + rebuild ────────────
-alias rebuild-iv="docker compose -f $_PROJ/docker-compose.prod.yml up -d --build iv-collector"
-alias rebuild-discount="docker compose -f $_PROJ/docker-compose.prod.yml up -d --build discount"
-alias rebuild-bb="docker compose -f $_PROJ/docker-compose.prod.yml up -d --build break-bounce"
-alias rebuild-sonar="docker compose -f $_PROJ/docker-compose.prod.yml up -d --build sonar"
-alias rebuild-all="docker compose -f $_PROJ/docker-compose.prod.yml up -d --build"
+alias rebuild-iv="docker compose -f $_PROJ/docker-compose.yml up -d --build iv-collector"
+alias rebuild-discount="docker compose -f $_PROJ/docker-compose.yml up -d --build discount"
+alias rebuild-bb="docker compose -f $_PROJ/docker-compose.yml up -d --build break-bounce"
+alias rebuild-sonar="docker compose -f $_PROJ/docker-compose.yml up -d --build sonar"
+alias rebuild-all="docker compose -f $_PROJ/docker-compose.yml up -d --build"
 
 # ── Status at a glance ────────────────────────────────────────────────────────
-alias ps-trade="docker compose -f $_PROJ/docker-compose.prod.yml ps"
+alias ps-trade="docker compose -f $_PROJ/docker-compose.yml ps"

@@ -289,3 +289,35 @@ tr.combo-leg td { background: rgba(245,158,11,.04); }
   }
   table.data.stack tr:hover td { background: none; }
 }
+
+/* ── Form fields (Backtest run form) ─────────────────────────────────────── */
+.field-row { display: flex; flex-wrap: wrap; gap: var(--s4); align-items: flex-end; margin-bottom: var(--s4); }
+.field { display: flex; flex-direction: column; gap: var(--s1); min-width: 160px; }
+.field label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); font-weight: 600; }
+.field input.inp {
+  background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--r-sm); font-family: var(--sans); font-size: 12px; padding: 5px 8px;
+}
+.field textarea.inp { min-height: 60px; resize: vertical; }
+
+/* ── Backtest run progress ───────────────────────────────────────────────── */
+.bt-progress-wrap { display: flex; flex-direction: column; gap: var(--s2); margin-top: var(--s3); }
+.bt-progress-track { position: relative; height: 8px; border-radius: var(--r-pill); background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; }
+.bt-progress-fill { position: absolute; inset: 0 auto 0 0; background: var(--accent); border-radius: var(--r-pill); transition: width .3s ease; }
+.bt-progress-fill.error { background: var(--red); }
+.bt-progress-fill.done { background: var(--green); }
+.bt-progress-label { font-size: 11px; color: var(--dim); font-family: var(--mono); }
+
+/* ── Backtest run list ────────────────────────────────────────────────────── */
+.bt-run-row {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
+  padding: var(--s3) var(--s4); border-radius: var(--r-sm); border: 1px solid var(--border);
+  background: var(--surface-2); cursor: pointer; margin-bottom: var(--s2);
+}
+.bt-run-row:hover { background: var(--surface-3); }
+.bt-run-row.active { border-color: var(--accent); }
+.bt-run-meta { display: flex; flex-direction: column; gap: 2px; }
+.bt-run-title { font-size: 12.5px; font-weight: 600; }
+.bt-run-sub { font-size: 11px; color: var(--dim); font-family: var(--mono); }
+.bt-badge { font-size: 9px; letter-spacing: .04em; border: 1px solid var(--border); border-radius: var(--r-pill); padding: 2px 8px; text-transform: uppercase; }
+.bt-badge.approx { color: var(--amber); border-color: rgba(245,158,11,.35); background: var(--amber-fill); }

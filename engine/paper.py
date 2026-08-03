@@ -9,12 +9,20 @@ Zero broker calls, by design:
   * the ATM strike is read from the iv_history snapshot the collector writes;
   * expiry / lot / option-id come from the local scrip-master DB.
 
-Trades land in the SHARED paper_trades.db tagged cfg.PAPER_STRATEGY_TAG
-("Convex") through paper_trader.book_signal — the same universal guards (entry
-cutoff, per symbol+strike+side dedup, min-premium floor, hard rupee-risk cap)
-as every other strategy, but WITHOUT V1's pre-market / breadth / concentration
-gates, so the engine's own conviction is what gets measured. The existing
-discount-container monitor then marks and exits these rows with real quotes.
+Trades land in the SHARED paper_trades.db tagged
+"{cfg.PAPER_STRATEGY_TAG}-{trigger_kind}" (e.g. "Convex-ORB",
+"Convex-SONAR_BAND") through paper_trader.book_signal — the same universal
+guards (entry cutoff, per symbol+strike+side dedup, min-premium floor,
+hard rupee-risk cap) as every other strategy, but WITHOUT V1's pre-market
+/ breadth / concentration gates, so the engine's own conviction is what
+gets measured. The existing discount-container monitor then marks and
+exits these rows with real quotes.
+
+SL/target are NOT the shared max_risk_rupees cap (skip_risk_cap=True below
+— this book measures raw conviction, sizing is separate, E5-1): SL is the
+percentage-of-premium distance capped at PAPER_MAX_LOSS_RUPEES regardless
+of lot_size; target is scaled to the stock's own 1-day expected ATM-premium
+move (real ATM IV), not a flat multiplier. See engine/config.py.
 
 Gated by ENGINE_PAPER_MODE (off | paper). off is a hard no-op — nothing is
 written. Books only the configured grades (default A+/A), highest score first,
@@ -138,30 +146,58 @@ def build_signal(decision, db_path: str, now: datetime | None = None) -> dict | 
     if entry <= 0:
         return None
 
-    sl = round(entry * (1 - cfg.PAPER_SL_PCT), 2)
-    target = round(entry * (1 + cfg.PAPER_SL_PCT * cfg.PAPER_TARGET_R), 2)
+    # SL: the existing percentage-of-premium distance, capped so the rupee
+    # loss at stop-out never exceeds PAPER_MAX_LOSS_RUPEES regardless of
+    # lot_size (see engine/config.py for why — large-lot names used to turn
+    # a routine 30% stop into a five-figure loss).
+    sl_points_pct = entry * cfg.PAPER_SL_PCT
+    sl_points_cap = cfg.PAPER_MAX_LOSS_RUPEES / lot_size
+    sl_points = min(sl_points_pct, sl_points_cap)
+    sl = round(max(entry - sl_points, 0.01), 2)
+
+    # Target: this stock's OWN 1-day expected ATM-premium move (real ATM
+    # IV, not a flat multiplier) — reuses the same Brenner-Subrahmanyam
+    # helper already used for entry pricing, just at a 1-day horizon
+    # instead of the full DTE, since the trade's actual holding horizon is
+    # intraday (EOD square-off), not to expiry.
+    today_prem_pct = expected_move.est_atm_premium_pct(iv, days=1)
+    today_prem_move = spot * (today_prem_pct or 0.0) / 100.0
+    target_gain = max(cfg.PAPER_TARGET_CAPTURE_PCT * today_prem_move,
+                      sl_points * cfg.PAPER_MIN_RR)
+    target = round(entry + target_gain, 2)
 
     trig = decision.trigger
+    trigger_kind = getattr(trig, "kind", None)
+    # Sub-strategy tag so the dashboard/EOD summary/ad-hoc queries can tell
+    # e.g. ORB-triggered convex trades apart from SONAR_BAND-triggered ones,
+    # instead of everything landing under one flat "Convex" tag.
+    sub_strategy = f"{cfg.PAPER_STRATEGY_TAG}-{trigger_kind}" if trigger_kind else cfg.PAPER_STRATEGY_TAG
+
     attribution = {
         "engine": True,
         "grade": decision.grade,
         "score": round(decision.score, 2),
         "formula_ver": decision.formula_ver,
         "direction": decision.direction,
-        "trigger_kind": getattr(trig, "kind", None),
+        "trigger_kind": trigger_kind,
         "trigger_quality": getattr(trig, "quality", None),
         "entry_estimated": True,
         "est_premium_pct": prem_pct,
         "spot_at_signal": spot,
         "atm_iv": iv,
+        "sl_cap_rupees": cfg.PAPER_MAX_LOSS_RUPEES,
+        "target_basis_pct": today_prem_pct,
         "breakdown": decision.breakdown,
         "why": decision.why,
     }
 
     return {
         "symbol": underlying,
-        "security_id": _option_sid(underlying, opt_type, expiry_iso, strike) or sid,
-        "underlying_security_id": sid,
+        "security_id": sid,  # underlying id — the paper-trade monitor re-quotes
+                              # via get_current_option_premium(security_id, ...),
+                              # which fetches the option CHAIN for this id and
+                              # then looks up strike/side inside it.
+        "option_security_id": _option_sid(underlying, opt_type, expiry_iso, strike),
         "exchange_segment": "NSE_FNO",
         "side": side,
         "strike": float(strike),
@@ -174,7 +210,7 @@ def build_signal(decision, db_path: str, now: datetime | None = None) -> dict | 
         "score": round(decision.score, 2),
         "iv": iv,
         "dte": dte,
-        "strategy": cfg.PAPER_STRATEGY_TAG,
+        "strategy": sub_strategy,
         "skip_risk_cap": True,   # measurement book: affordability (E5-1) is separate
         "factors_json": json.dumps(attribution),
     }
@@ -197,8 +233,12 @@ def book_emitted(result: dict, db_path: str, now: datetime | None = None,
 
     book = book or PaperTradeBook()
     today_iso = now.date().isoformat()
+    # Prefix match, not exact: individual trades are now tagged with a
+    # trigger-kind suffix (Convex-ORB, Convex-SONAR_BAND, ...), so an exact
+    # match against PAPER_STRATEGY_TAG would never count anything and the
+    # daily cap would silently become a no-op.
     already = sum(1 for t in book.all_trades(today_iso)
-                  if t.get("strategy") == cfg.PAPER_STRATEGY_TAG)
+                  if str(t.get("strategy", "")).startswith(cfg.PAPER_STRATEGY_TAG))
     cap_left = cfg.PAPER_MAX_TRADES - already
     if cap_left <= 0:
         return {"mode": cfg.PAPER_MODE, "booked": [], "skipped": 0, "cap_left": 0}

@@ -19,12 +19,18 @@ from datetime import datetime, timedelta
 
 import schedule
 
+from config import Config
 import vol_expansion_config as CFG
 from vol_expansion_strategy import VolExpansionStrategy
 
+Config.ensure_dirs()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.FileHandler(Config.LOGS_DIR / "vol_expansion.log"),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger("vol_expansion_runner")
 

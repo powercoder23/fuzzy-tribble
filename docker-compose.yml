@@ -149,7 +149,7 @@ services:
 
   # ── Option-buyer scanners (alert-only, zero broker/NSE calls) ─────────────
   # No `profiles:` -> these start automatically with the normal daily command:
-  #   docker-compose -f docker-compose.prod.yml up -d
+  #   docker-compose up -d
   # All read the shared ./data/iv_history.db written by iv-collector. To turn
   # one OFF, add `profiles: [<name>]` back to that service.
 

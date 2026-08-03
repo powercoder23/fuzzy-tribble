@@ -33,3 +33,14 @@ LIMIT_RUPEES = float(os.getenv("DAILY_LOSS_LIMIT_RUPEES", "5000"))
 # positions, so a large open drawdown also locks out new entries — not just
 # realized losses. When False, only closed-trade realized P&L counts.
 INCLUDE_OPEN = os.getenv("DAILY_LOSS_INCLUDE_OPEN", "true").strip().lower() == "true"
+
+# ── Flatten on breach ────────────────────────────────────────────────────── #
+# In hard mode, the lockout above only blocks NEW entries — existing open
+# positions "are still managed normally" (i.e. left to their own SL/target/
+# EOD square-off), which can keep bleeding for hours after the floor is hit.
+# When True (and MODE=="hard"), OrderManager.track() force-closes every open
+# position, once, the first tick the floor is breached — a real circuit
+# breaker, not just a new-entry pause. Off by default: this is a strictly
+# more aggressive behaviour change on top of an already-off-by-default gate,
+# so it needs an explicit opt-in on top of MODE=hard.
+FLATTEN_ON_BREACH = os.getenv("DAILY_LOSS_FLATTEN_ON_BREACH", "false").strip().lower() == "true"

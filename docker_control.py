@@ -1,7 +1,7 @@
 """
 docker_control.py — container lifecycle control for the Settings page.
 
-Parses docker-compose.prod.yml directly for the service list (iv-collector,
+Parses docker-compose.yml directly for the service list (iv-collector,
 break-bounce, discount, convex-engine, dashboard, ...) rather than
 hardcoding — add/remove a service in compose and the Settings page follows.
 
@@ -23,7 +23,7 @@ import subprocess
 from pathlib import Path
 from typing import Literal
 
-COMPOSE_FILE = Path("/compose/docker-compose.prod.yml")
+COMPOSE_FILE = Path("/compose/docker-compose.yml")
 COMPOSE_PROJECT_DIR = COMPOSE_FILE.parent
 
 Action = Literal["start", "stop", "restart", "rebuild"]
