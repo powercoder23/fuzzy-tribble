@@ -124,6 +124,7 @@ def _finalize(trade, reason):
     """
     trade["status"] = "closed"
     trade["exit_reason"] = reason
+    _unsubscribe_live_quote(trade.get("id"))
     gross = trade["booked_points"]
     entry = trade["entry"]
     raw_lot = trade.get("lot_size")
@@ -467,7 +468,9 @@ class PaperTradeBook:
                     rt["peak_price"],
                 ),
             )
-            return cur.lastrowid
+            trade_id = cur.lastrowid
+        _subscribe_live_quote(trade_id, signal)
+        return trade_id
 
     def open_trades(self, date):
         with self._conn() as conn:
@@ -768,6 +771,19 @@ def collect_factor_snapshot(row) -> str:
         snap["breadth_market_pct"] = getattr(bs, "market_pct", None)
     except Exception:
         snap["breadth_market_pct"] = None
+    # Market context — six independent description axes (trend / volatility /
+    # liquidity / participation / positioning / breadth).
+    #
+    # OBSERVATIONAL ONLY. This is persisted so that, after enough paper
+    # trades, we can measure whether market context predicts outcomes BEFORE
+    # it is ever allowed to influence one. It does not veto this entry, and
+    # nothing downstream reads it. get() is fail-open and returns an inert
+    # neutral snapshot when the subsystem is off or not yet deployed.
+    try:
+        import market_context
+        snap["market_context"] = market_context.get().as_dict()
+    except Exception:
+        snap["market_context"] = None
     try:
         return json.dumps(snap, default=str)
     except Exception:
@@ -1133,8 +1149,72 @@ def _combo_pairs(open_trades):
     return pairs
 
 
+def _option_key_for(trade_or_signal):
+    """Resolve the Upstox instrument_key for a trade/signal's option contract,
+    for market_context live-quote subscription. None on any failure — this
+    must never block booking or exits, it's purely an acceleration path."""
+    try:
+        import upstox_adapter
+        symbol = trade_or_signal.get("symbol")
+        expiry = trade_or_signal.get("expiry")
+        strike = trade_or_signal.get("strike")
+        side = str(trade_or_signal.get("side") or "").upper()
+        opt_type = "CE" if side in ("CE", "CALL") else "PE"
+        if not (symbol and expiry and strike):
+            return None
+        return upstox_adapter.option_instrument_key(symbol, expiry, float(strike), opt_type)
+    except Exception:
+        return None
+
+
+def _subscribe_live_quote(trade_id, signal) -> None:
+    """Ask market_context to stream this position's option live (see
+    _option_key_for / _requote's fast path). Best-effort: a failure here just
+    means this trade falls back to REST monitoring, same as before this
+    feature existed."""
+    if not trade_id:
+        return
+    key = _option_key_for(signal)
+    if not key:
+        return
+    try:
+        import market_context
+        market_context.request_quote(key, owner=f"trade:{trade_id}")
+    except Exception:
+        pass
+
+
+def _unsubscribe_live_quote(trade_id) -> None:
+    """Release the live-quote request opened in _subscribe_live_quote, once
+    a position closes. Best-effort, never raises."""
+    if not trade_id:
+        return
+    try:
+        import market_context
+        market_context.release_quote(owner=f"trade:{trade_id}")
+    except Exception:
+        pass
+
+
 def _requote(scanner, trade):
-    """Fetch the latest LTP for one trade. Returns None if unavailable."""
+    """Fetch the latest LTP for one trade. Returns None if unavailable.
+
+    Fast path first: market_context.get_quote() reads a live-streamed price
+    (see market_context/service.py's mc_live_quotes, populated for every
+    dynamically-subscribed open position — request_quote() is called from
+    open_trade()/here on open, release_quote() on close). Falls back to the
+    existing REST call exactly as before when unavailable, stale, or the
+    subsystem is off — zero behavior change for anything not subscribed.
+    """
+    key = _option_key_for(trade)
+    if key:
+        try:
+            import market_context
+            q = market_context.get_quote(key)
+            if q and q.get("ltp"):
+                return q["ltp"]
+        except Exception:
+            pass
     try:
         quote = scanner.get_current_option_premium(
             trade["security_id"], trade["exchange_segment"],

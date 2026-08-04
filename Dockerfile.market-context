@@ -1,0 +1,31 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Same base as Dockerfile.directional. This service DOES need the broker SDK
+# (upstox-python-sdk supplies MarketDataStreamerV3) and it goes through the
+# shared entrypoint.sh, which runs init_upstox_token.py — that path can fall
+# back to the selenium login flow, so chromium is required for parity with
+# every other token-bearing service.
+#
+# Deliberately NOT built on Dockerfile.scanner: that image is the lean,
+# zero-broker-SDK base for read-only DB scanners. market-context is the only
+# service besides iv-collector that holds a live broker connection.
+RUN apt-get update && apt-get install -y git tzdata chromium chromium-driver \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+RUN mkdir -p /app/data/tokens /app/logs && \
+    chmod -R 777 /app/data /app/logs
+
+COPY . /app
+RUN chmod +x /app/entrypoint.sh
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python", "-m", "market_context.service"]

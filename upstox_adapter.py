@@ -176,6 +176,14 @@ def _underlying_key_from_security_id(security_id: str, exchange_segment: str) ->
         return None
 
 
+def option_instrument_key(underlying_symbol: str, expiry_date: str,
+                          strike: float, option_type: str) -> str | None:
+    """Public wrapper — see _option_instrument_key. Used cross-module (e.g.
+    paper_trader.py, to resolve the Upstox key for market_context's live
+    quote subscription of an open position)."""
+    return _option_instrument_key(underlying_symbol, expiry_date, strike, option_type)
+
+
 def _option_instrument_key(underlying_symbol: str, expiry_date: str,
                             strike: float, option_type: str) -> str | None:
     """

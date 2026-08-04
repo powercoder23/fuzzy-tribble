@@ -12,34 +12,45 @@ used for data; it is reserved only for possible future live order placement.
 
 ## Service layout (docker-compose.yml — current reality, verified 2026-07-30)
 
-Only `momentum` is profile-gated (`profiles: [momentum]`) — everything else,
-including `discount`, `directional-iv`, and `iv-seller`, starts automatically
-with the normal `docker-compose up` (no profile needed). A comment in the
-compose file above the always-on scanner block says as much: "No `profiles:`
--> these start automatically with the normal daily command."
+**MOMENTUM-ONLY MODE (since 2026-08-04).** The gating was inverted: `momentum`
+is now the only strategy without a `profiles:` key, and every other strategy
+and scanner is profile-gated OFF. A plain `docker-compose up -d` brings up
+exactly four services — `iv-collector`, `momentum`, `market-context`,
+`dashboard`. Each gated service uses its own name as the profile, so bringing
+one back for a session is `docker-compose --profile <name> up -d <name>`;
+re-enabling it permanently means deleting its `profiles:` line.
 
 | #  | Service         | Container               | Entry                            | Default up? | Trades? |
 |----|-----------------|-------------------------|----------------------------------|-------------|---------|
 | 1  | iv-collector    | iv-collector            | `collectors.iv_collector_service`| yes         | No (data only) |
-| 2  | momentum        | momentum-strategy       | `momentum_runner.py`             | no (`profiles: [momentum]`, discontinued) | Yes |
-| 3  | discount        | discount-strategy       | `main.py`                        | yes         | Paper — **but `discount_config.PAPER_TRADING_ENABLED = False`** (hardcoded kill switch since 2026-07-29), so it currently scans/alerts only and never books |
-| 4  | break-bounce    | break-bounce-strategy   | `break_bounce_runner.py`         | yes         | Paper (+ debit-spread hedge leg, see below) |
-| 5  | directional-iv  | directional-iv-strategy | `directional_iv_runner.py`       | yes (no profile gate) | Paper (+ hedge leg); gated by a tight `IV_FILTER` (ATM IV ≤45, IV rank ≤65, delta 0.18–0.40, `MIN_SCORE`=65) so it often finds nothing to book |
-| 6  | iv-rank         | iv-rank-scanner         | `iv_rank_runner.py`              | yes         | No (alerts) |
-| 7  | oi-buildup      | oi-buildup-scanner      | `oi_buildup_runner.py`           | yes         | No (alerts; feeds auto-exit) |
-| 8  | gap-scan        | gap-scanner             | `gap_scanner_runner.py`          | yes         | No (alerts) |
-| 9  | delivery-surge  | delivery-surge-scanner  | `delivery_surge_runner.py`       | yes         | No (alerts) |
-| 10 | smart-money     | smart-money-scanner     | `smart_money_runner.py`          | yes         | No (alerts) |
-| 11 | composite       | composite-scanner       | `composite_runner.py`            | yes         | No (feeds entry gate) |
-| 12 | sonar           | sonar-scanner           | `sonar_laplace_runner.py`        | yes         | No (feeds entry veto + risk warnings) |
-| 13 | vol-expansion   | vol-expansion-strategy  | `vol_expansion_runner.py`        | yes         | Paper; gated by `BUY_ZONE_ONLY=true` + liquidity floor (`LIQ_MIN_OI`/`LIQ_MIN_VOLUME`) — a tight combination that can leave every scan (09:45/11:00/13:00) empty |
-| 14 | iv-seller       | iv-seller-strategy      | `iv_seller_runner.py`            | yes (no profile gate) | Paper dry-run (short legs); gated by `SELL_ZONE_MIN`=65 (needs genuinely rich IV) |
-| 15 | convex-engine   | convex-engine           | `engine_runner.py`               | yes         | No — P0 observe-only journal (decisions logged, no order path yet) |
+| 2  | momentum        | momentum-strategy       | `momentum_runner.py`             | **yes** (only strategy on) | Alerts + CSV journal; live order only when `AUTO_EXECUTE=true`. **Does NOT write `paper_trades.db`** — see note below |
+| 3  | discount        | discount-strategy       | `main.py`                        | no (`profiles: [discount]`) | Paper — also `discount_config.PAPER_TRADING_ENABLED = False` (hardcoded kill switch since 2026-07-29) |
+| 4  | break-bounce    | break-bounce-strategy   | `break_bounce_runner.py`         | no (`profiles: [break-bounce]`) | Paper (+ debit-spread hedge leg, see below) |
+| 5  | directional-iv  | directional-iv-strategy | `directional_iv_runner.py`       | no (`profiles: [directional-iv]`) | Paper (+ hedge leg); gated by a tight `IV_FILTER` (ATM IV ≤45, IV rank ≤65, delta 0.18–0.40, `MIN_SCORE`=65) |
+| 6  | iv-rank         | iv-rank-scanner         | `iv_rank_runner.py`              | no (`profiles: [iv-rank]`) | No (alerts) |
+| 7  | oi-buildup      | oi-buildup-scanner      | `oi_buildup_runner.py`           | no (`profiles: [oi-buildup]`) | No (alerts; feeds auto-exit) |
+| 8  | gap-scan        | gap-scanner             | `gap_scanner_runner.py`          | no (`profiles: [gap-scan]`) | No (alerts) |
+| 9  | delivery-surge  | delivery-surge-scanner  | `delivery_surge_runner.py`       | no (`profiles: [delivery-surge]`) | No (alerts) |
+| 10 | smart-money     | smart-money-scanner     | `smart_money_runner.py`          | no (`profiles: [smart-money]`) | No (alerts) |
+| 11 | composite       | composite-scanner       | `composite_runner.py`            | no (`profiles: [composite]`) | No (feeds entry gate) |
+| 12 | sonar           | sonar-scanner           | `sonar_laplace_runner.py`        | no (`profiles: [sonar]`) | No (feeds entry veto + risk warnings) |
+| 13 | vol-expansion   | vol-expansion-strategy  | `vol_expansion_runner.py`        | no (`profiles: [vol-expansion]`) | Paper; gated by `BUY_ZONE_ONLY=true` + liquidity floor (`LIQ_MIN_OI`/`LIQ_MIN_VOLUME`) |
+| 14 | iv-seller       | iv-seller-strategy      | `iv_seller_runner.py`            | no (`profiles: [iv-seller]`) | Paper dry-run (short legs); gated by `SELL_ZONE_MIN`=65 |
+| 15 | convex-engine   | convex-engine           | `engine_runner.py`               | no (`profiles: [convex-engine]`) | No — P0 observe-only journal (decisions logged, no order path yet) |
+| 16 | market-context  | market-context          | `market_context.service`         | yes         | No (observational only, Phase 1) |
 
-API callers: `iv-collector` sweeps option chains continuously; the `discount`
-service also fetches chains + candles during its 15-min scans, and `sonar`
-fetches 5-min candles. All other scanners are zero-API (read `iv_history.db`
-only).
+**Momentum does not use the shared paper book.** Unlike every other strategy,
+`momentum_strategy.py` never calls `OrderManager.submit_external_signal`. A
+signal writes a row to `data/momentum_trades.csv` (`MomentumTradeJournal`) and
+fires a Telegram alert; `_place_order` runs only under `AUTO_EXECUTE=true`.
+So momentum signals will never appear in `paper_trades.db` or on the
+dashboard's paper-trade pages — verify it via `data/momentum_trades.csv` and
+`logs/momentum.log`.
+
+API callers: `iv-collector` sweeps option chains continuously, and `momentum`
+fetches daily candles at premarket plus intraday candles + option chains
+during its 09:30–11:30 scans. The other strategies/scanners that also hit the
+API (`discount`, `sonar`) are currently gated off.
 
 **Sole-writer contract:** only `iv-collector` writes `iv_history` rows
 (`iv_store.save_snapshot`); scanner services write their own `*_history`
@@ -117,6 +128,7 @@ strategies: ORB + VWAP + Break-and-Bounce + Volatility-Expansion.
 ## Operational notes
 
 - All strategies require `iv-collector` to be running first (the docker-compose `depends_on` enforces this).
-- `discount` service is paused by default (`profiles: ["discount"]`); start it explicitly with `docker-compose --profile discount up`.
+- Every strategy/scanner except `momentum` is paused by default; start one explicitly with `docker-compose --profile <service-name> up -d <service-name>`.
+- Adding a `profiles:` key does **not** stop an already-running container. After changing the gating, run `docker-compose down` (or `docker stop`/`docker rm` the specific containers) before `docker-compose up -d`, otherwise the old containers keep running with `restart: unless-stopped`.
 - `AUTO_EXECUTE=true` env var is required for live order placement; otherwise alerts are sent without orders.
 - All times are IST (`Asia/Kolkata`); container TZ is set explicitly.

@@ -24,12 +24,20 @@ async function init() {
 
 async function loadAll() {
   try {
+    // /api/paper-trades with NO date/days param defaults to TODAY server-side
+    // (see dashboard_app.py's paper_trades()) — this is a Positions page, it
+    // must show today's live book by default, same as dashboard_old's
+    // Overview "Recent Paper Trades" widget (loadOvTrades). The previous
+    // `?days=365` call pulled the entire trailing-year book (hundreds of
+    // trades, including ones from days ago still stuck open) and rendered it
+    // as if it were "today" — the trades table and the Overall P&L bar were
+    // both effectively meaningless as a "current positions" view.
     const [today, hist] = await Promise.all([
-      api('/api/paper-trades?days=365'),
+      api('/api/paper-trades'),
       api('/api/paper-trades/history?days=30'),
     ]);
     renderStatRow(hist.summary);
-    renderTrades(today.trades || []);
+    renderTrades(today.trades || [], "Today's");
     renderPnlChart(hist.daily);
   } catch (e) {
     $('tradesCard').innerHTML = `<div class="empty">Could not load trades: ${esc(e.message)}</div>`;
@@ -60,7 +68,7 @@ async function showDayTrades(date) {
   try {
     const data = await api(`/api/paper-trades?date=${encodeURIComponent(date)}`);
     toast(`${date}: ${data.count || 0} trade(s) — see table below`, 'ok');
-    renderTrades(data.trades || [], true);
+    renderTrades(data.trades || [], date);
   } catch (e) { toast(String(e.message || e).slice(0, 140), 'err'); }
 }
 
@@ -74,7 +82,7 @@ function fmtStrike(v) {
   return String(Number(v));
 }
 
-function renderTrades(trades, dayView = false) {
+function renderTrades(trades, label = "Today's") {
   const openT = (trades || []).filter((t) => t.status === 'open');
   const closedT = (trades || []).filter((t) => t.status !== 'open');
   let overall = 0, haveAny = false;
@@ -83,7 +91,7 @@ function renderTrades(trades, dayView = false) {
     if (rupees !== null && rupees !== undefined) { overall += rupees; haveAny = true; }
   });
   const overallBar = `<div class="total-bar">
-    <span class="tb-label">${dayView ? 'Day P&amp;L' : 'Overall P&amp;L'} <span class="dim">(${(trades || []).length} position${(trades || []).length === 1 ? '' : 's'})</span></span>
+    <span class="tb-label">${esc(label)} P&amp;L <span class="dim">(${(trades || []).length} position${(trades || []).length === 1 ? '' : 's'})</span></span>
     <span class="tb-value ${overall >= 0 ? 'pos' : 'neg'}">${haveAny ? fmtPnl(overall) : '—'}</span>
   </div>`;
   const block = (label, arr) => arr.length

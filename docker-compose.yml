@@ -18,11 +18,15 @@ services:
       - ./logs:/app/logs
     command: python -m collectors.iv_collector_service
 
-  # ── Service 2: Momentum Strategy (DISCONTINUED) ──────────────────────────
-  # Excluded from default `docker-compose up` via profile.
-  # To run manually: docker-compose --profile momentum up momentum
+  # ── Service 2: Momentum Strategy (ORB + VWAP) ─────────────────────────────
+  # RE-ACTIVATED 2026-08-04: this is now the ONLY strategy that runs by
+  # default. Every other strategy/scanner below is profile-gated OFF.
+  #
+  # NOTE: momentum does NOT book into the shared paper book (paper_trades.db).
+  # It writes data/momentum_trades.csv + Telegram alerts, and only places an
+  # order when AUTO_EXECUTE=true. So its signals will NOT appear on the
+  # dashboard's paper-trade pages — check the CSV and logs/momentum.log.
   momentum:
-    profiles: [momentum]
     build:
       context: .
       dockerfile: Dockerfile.momentum
@@ -44,6 +48,7 @@ services:
   # Reads IV history from the shared ./data volume (written by iv-collector).
   # Runs the discount scanner only — it does NOT collect IV itself.
   discount:
+    profiles: [discount]
     build:
       context: .
       dockerfile: Dockerfile.discount
@@ -66,6 +71,7 @@ services:
   # Step 2: Wait for 15-min close above/below the level (9:15–11:45 window).
   # Step 3: After breakout, enter on Hammer/Engulfing at the retest on 5-min.
   break-bounce:
+    profiles: [break-bounce]
     build:
       context: .
       dockerfile: Dockerfile.break-bounce
@@ -87,6 +93,7 @@ services:
   # Trades the dashboard's buy-zone expansion signal. MODE via VOL_EXP_MODE
   # (off|alert|paper, default paper). Paper only — never places real orders.
   vol-expansion:
+    profiles: [vol-expansion]
     build:
       context: .
       dockerfile: Dockerfile.break-bounce
@@ -109,6 +116,7 @@ services:
   # OrderManager.submit_with_hedge. Monitoring is handled by the discount
   # container's 5-min monitor cycle.
   directional-iv:
+    profiles: [directional-iv]
     build:
       context: .
       dockerfile: Dockerfile.directional
@@ -130,6 +138,7 @@ services:
   # Paper dryrun activated: books short combos into paper_trades.db via
   # OrderManager.submit_external_signal. No live orders (AUTO_EXECUTE not set).
   iv-seller:
+    profiles: [iv-seller]
     build:
       context: .
       dockerfile: Dockerfile.directional
@@ -148,13 +157,14 @@ services:
     command: python iv_seller_runner.py
 
   # ── Option-buyer scanners (alert-only, zero broker/NSE calls) ─────────────
-  # No `profiles:` -> these start automatically with the normal daily command:
-  #   docker-compose up -d
-  # All read the shared ./data/iv_history.db written by iv-collector. To turn
-  # one OFF, add `profiles: [<name>]` back to that service.
+  # PROFILE-GATED OFF 2026-08-04 (momentum-only mode). These do NOT start with
+  # the normal `docker-compose up -d`. To bring one back, either drop its
+  # `profiles:` line or run:  docker-compose --profile <name> up -d <name>
+  # All read the shared ./data/iv_history.db written by iv-collector.
 
   # IV Rank — cheap-IV "buy zone" screener.
   iv-rank:
+    profiles: [iv-rank]
     build:
       context: .
       dockerfile: Dockerfile.iv-rank
@@ -174,6 +184,7 @@ services:
 
   # OI Buildup — Long/Short buildup, covering, unwinding across F&O.
   oi-buildup:
+    profiles: [oi-buildup]
     build:
       context: .
       dockerfile: Dockerfile.scanner
@@ -193,6 +204,7 @@ services:
 
   # Extreme Opening — gap% + open beyond prior high/low.
   gap-scan:
+    profiles: [gap-scan]
     build:
       context: .
       dockerfile: Dockerfile.scanner
@@ -212,6 +224,7 @@ services:
 
   # Delivery-% Surge — conviction-backed moves from bhav delivery data.
   delivery-surge:
+    profiles: [delivery-surge]
     build:
       context: .
       dockerfile: Dockerfile.scanner
@@ -231,6 +244,7 @@ services:
 
   # Smart-Money — net bulk/block institutional flow -> CE/PE BTST bias.
   smart-money:
+    profiles: [smart-money]
     build:
       context: .
       dockerfile: Dockerfile.scanner
@@ -251,6 +265,7 @@ services:
   # Sonar-Laplace — Ehlers SuperSmoother trend/reversal/breakout signals.
   # Reads 5-min candles via DataProvider (broker fetch per name). Intraday.
   sonar:
+    profiles: [sonar]
     build:
       context: .
       # Full image: sonar reads candles via DataProvider -> DiscountedPremiumScanner
@@ -274,6 +289,7 @@ services:
   # Composite — morning confluence + multi-scanner signal aggregator.
   # Fuses gap, OI buildup, IV rank into A+ morning option-buy picks.
   composite:
+    profiles: [composite]
     build:
       context: .
       dockerfile: Dockerfile.scanner
@@ -297,6 +313,7 @@ services:
   # zero orders. Writes engine_decisions/engine_regime + one Telegram digest
   # per cycle. Lean scanner image is sufficient. See V2_BLUEPRINT.md.
   convex-engine:
+    profiles: [convex-engine]
     build:
       context: .
       dockerfile: Dockerfile.scanner
@@ -314,6 +331,46 @@ services:
     depends_on:
       - iv-collector
     command: python engine_runner.py
+
+  # ── Service 17: Market Context ────────────────────────────────────────────
+  # Shared market description for every strategy. Owns the ONLY WebSocket
+  # connection in the platform and is the SOLE WRITER of the mc_* tables in
+  # data/market_context.db (separate file from iv_history.db on purpose —
+  # that DB is ~315 MB and written continuously by iv-collector).
+  #
+  # Consumers never open a socket and never call a broker: they read
+  # market_context.get(), which is a single cached SQLite read.
+  #
+  # PHASE 1 — OBSERVATIONAL ONLY. This service does not veto entries, change
+  # exits, stop-losses, targets or sizing. It collects and persists so that
+  # the effect of market context on expectancy can be MEASURED before it is
+  # ever allowed to influence a decision. See MARKET_CONTEXT_PLAN.md Rev 2.
+  market-context:
+    build:
+      context: .
+      dockerfile: Dockerfile.market-context
+    container_name: market-context
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Kolkata
+      APP_TIMEZONE: Asia/Kolkata
+      # off | observe. "soft"/"hard" are reserved and NOT implemented — a
+      # mis-set value degrades to observe rather than influencing trades.
+      MC_MODE: observe
+      # auto | standard | plus. "auto" probes the connection allowance at
+      # startup and scales the universe: standard -> NIFTY/BANKNIFTY/VIX +
+      # ~59 liquid stocks; plus -> the full monitored universe.
+      MC_PLAN_TIER: auto
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      # Needs the liquid-universe ranking (OI x volume) that iv-collector's
+      # snapshots provide, to pick the tier-3/4 constituents each morning.
+      - iv-collector
+    command: python -m market_context.service
 
   # ── Dashboard ─────────────────────────────────────────────────────────────
   # Web dashboard — IV graph, paper trade P&L, universe overview.
