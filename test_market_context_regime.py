@@ -88,14 +88,6 @@ def test_super_smoother_tracks_and_damps():
     assert sm_var < raw_var
 
 
-def test_super_smoother_matches_engine_regime_implementation():
-    """It is the same filter the Convex engine already uses; the copy here
-    exists so engine/regime.py can eventually import ONE implementation."""
-    from engine.regime import _super_smoother
-    series = [100 + math.sin(i / 3.0) * 5 for i in range(40)]
-    assert est.super_smoother(series, 10) == pytest.approx(_super_smoother(series, 10))
-
-
 def test_yang_zhang_rises_with_volatility():
     calm = [(100, 100.2, 99.8, 100.0)] * 30
     wild = [(100, 105.0, 95.0, 101.0), (101, 108.0, 96.0, 98.0),

@@ -30,6 +30,7 @@ import sqlite3
 from datetime import datetime
 
 import notifications
+import paper_policy
 import scan_log
 
 try:
@@ -434,7 +435,22 @@ class PaperTradeBook:
         return int(row["n"]) if row else 0
 
     def open_trade(self, signal, now=None):
-        """Insert a new paper trade from a signal dict. Returns the row id."""
+        """Insert a new paper trade from a signal dict. Returns the row id, or
+        None if paper_policy refuses the strategy.
+
+        This is the single INSERT into paper_trades, so it is the LAST line of
+        defence for the allowlist — callers check first (so they can skip the
+        alert and the scan_log 'booked' row), but a caller that forgets must
+        still not be able to write. See paper_policy for why the switch is
+        here rather than in each strategy.
+        """
+        strategy = signal.get("strategy", VOLATILITY_STRATEGY)
+        if not paper_policy.allows(strategy):
+            logger.warning(
+                "paper policy: refused INSERT for [%s] %s %s %s — allowed: %s",
+                strategy, signal.get("symbol"), signal.get("strike"),
+                signal.get("side"), paper_policy.describe())
+            return None
         now = now or datetime.now()
         date = now.date().isoformat()
         rt = new_trade_runtime(
@@ -888,6 +904,19 @@ def process_signals(book, opportunities, now=None, bot_token=None, chat_id=None,
         if symbol is None or strike is None or side is None:
             continue
 
+        # Before the Sonar read and the hedge chain fetch — a strategy that
+        # cannot book should not spend broker calls reaching that conclusion.
+        _strategy = row.get("strategy", VOLATILITY_STRATEGY)
+        if not paper_policy.allows(_strategy):
+            logger.info("[%s] not on the paper allowlist (%s) — skipping %s",
+                        _strategy, paper_policy.describe(), symbol)
+            scan_log.record_decision(
+                strategy=_strategy, symbol=symbol, side=side, strike=strike,
+                iv_rank=row.get("iv_rank"), score=row.get("score"),
+                decision="paper_policy", reason=f"allowed: {paper_policy.describe()}",
+            )
+            continue
+
         # Sonar gate — veto only; the side (and its price plan) never changes.
         if _sonar_available:
             sec_id = str(row.get("security_id") or "")
@@ -1042,6 +1071,20 @@ def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
     now = now or datetime.now()
     date = now.date().isoformat()
 
+    # Checked before anything else so a disallowed strategy costs nothing and,
+    # critically, never fires the "PAPER TRADE TAKEN" alert below.
+    _strategy = signal.get("strategy", VOLATILITY_STRATEGY)
+    if not paper_policy.allows(_strategy):
+        logger.info("book_signal: [%s] not on the paper allowlist (%s) — skip %s",
+                    _strategy, paper_policy.describe(), signal.get("symbol"))
+        scan_log.record_decision(
+            strategy=_strategy, symbol=signal.get("symbol"),
+            side=signal.get("side"), strike=signal.get("strike"),
+            iv_rank=signal.get("iv_rank"), score=signal.get("score"),
+            decision="paper_policy", reason=f"allowed: {paper_policy.describe()}",
+        )
+        return None
+
     if _hhmm(now) >= INTRADAY["no_entry_after"]:
         logger.info("book_signal: past no_entry_after (%s) — skip %s",
                     INTRADAY["no_entry_after"], signal.get("symbol"))
@@ -1092,7 +1135,17 @@ def book_signal(book, signal, now=None, bot_token=None, chat_id=None):
     # records signal quality (% edge per grade), where 1-lot rupee affordability
     # (epic E5-1) is orthogonal — honest-economics fields still apply, so
     # realized_pct stays realistic.
-    max_risk = 0.0 if signal.get("skip_risk_cap") else _max_risk_rupees()
+    #
+    # Per-signal ceiling override, same idiom as `min_premium` above: a strategy
+    # that owns its own sizing model declares the budget it actually sized to.
+    # Momentum sizes lots from RISK_CONFIG["max_risk_pct"] x CAPITAL (₹4,000 by
+    # default) — held to the ₹1,500 shared default it would book almost nothing,
+    # and its CSV journal would disagree with the book about what it traded.
+    # Anything that does NOT declare one keeps the shared default untouched.
+    _risk_ov = signal.get("max_risk_rupees")
+    max_risk = (0.0 if signal.get("skip_risk_cap")
+                else float(_risk_ov) if _risk_ov is not None
+                else _max_risk_rupees())
     if max_risk:
         risk = _risk_rupees(signal)
         if risk > max_risk:

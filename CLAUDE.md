@@ -12,6 +12,11 @@ used for data; it is reserved only for possible future live order placement.
 
 ## Service layout (docker-compose.yml — current reality, verified 2026-07-30)
 
+**Removed 2026-08-05:** the vol-expansion, directional-IV and convex-engine
+strategies were deleted outright (files, services, tests). `engine/` survives
+as a candles-only helper — sonar writes `candles_5m` through `engine.candles`,
+which `momentum_alpha` reads. Recover any of it from git history if needed.
+
 **MOMENTUM-ONLY MODE (since 2026-08-04).** The gating was inverted: `momentum`
 is now the only strategy without a `profiles:` key, and every other strategy
 and scanner is profile-gated OFF. A plain `docker-compose up -d` brings up
@@ -23,29 +28,74 @@ re-enabling it permanently means deleting its `profiles:` line.
 | #  | Service         | Container               | Entry                            | Default up? | Trades? |
 |----|-----------------|-------------------------|----------------------------------|-------------|---------|
 | 1  | iv-collector    | iv-collector            | `collectors.iv_collector_service`| yes         | No (data only) |
-| 2  | momentum        | momentum-strategy       | `momentum_runner.py`             | **yes** (only strategy on) | Alerts + CSV journal; live order only when `AUTO_EXECUTE=true`. **Does NOT write `paper_trades.db`** — see note below |
-| 3  | discount        | discount-strategy       | `main.py`                        | no (`profiles: [discount]`) | Paper — also `discount_config.PAPER_TRADING_ENABLED = False` (hardcoded kill switch since 2026-07-29) |
+| 2  | momentum        | momentum-strategy       | `momentum_runner.py`             | **yes** (only strategy on) | Alerts + CSV journal + **shared paper book** (since 2026-08-05, `MOMENTUM_PAPER_MODE`); live order only when `AUTO_EXECUTE=true` — see note below |
+| 3  | discount        | discount-strategy       | `main.py`                        | no (`profiles: [discount]`) | Blocked — `discount_config.PAPER_TRADING_ENABLED = False` (kill switch off 2026-07-29, back ON 2026-07-30, off again 2026-08-05) |
 | 4  | break-bounce    | break-bounce-strategy   | `break_bounce_runner.py`         | no (`profiles: [break-bounce]`) | Paper (+ debit-spread hedge leg, see below) |
-| 5  | directional-iv  | directional-iv-strategy | `directional_iv_runner.py`       | no (`profiles: [directional-iv]`) | Paper (+ hedge leg); gated by a tight `IV_FILTER` (ATM IV ≤45, IV rank ≤65, delta 0.18–0.40, `MIN_SCORE`=65) |
-| 6  | iv-rank         | iv-rank-scanner         | `iv_rank_runner.py`              | no (`profiles: [iv-rank]`) | No (alerts) |
-| 7  | oi-buildup      | oi-buildup-scanner      | `oi_buildup_runner.py`           | no (`profiles: [oi-buildup]`) | No (alerts; feeds auto-exit) |
-| 8  | gap-scan        | gap-scanner             | `gap_scanner_runner.py`          | no (`profiles: [gap-scan]`) | No (alerts) |
-| 9  | delivery-surge  | delivery-surge-scanner  | `delivery_surge_runner.py`       | no (`profiles: [delivery-surge]`) | No (alerts) |
-| 10 | smart-money     | smart-money-scanner     | `smart_money_runner.py`          | no (`profiles: [smart-money]`) | No (alerts) |
-| 11 | composite       | composite-scanner       | `composite_runner.py`            | no (`profiles: [composite]`) | No (feeds entry gate) |
-| 12 | sonar           | sonar-scanner           | `sonar_laplace_runner.py`        | no (`profiles: [sonar]`) | No (feeds entry veto + risk warnings) |
-| 13 | vol-expansion   | vol-expansion-strategy  | `vol_expansion_runner.py`        | no (`profiles: [vol-expansion]`) | Paper; gated by `BUY_ZONE_ONLY=true` + liquidity floor (`LIQ_MIN_OI`/`LIQ_MIN_VOLUME`) |
-| 14 | iv-seller       | iv-seller-strategy      | `iv_seller_runner.py`            | no (`profiles: [iv-seller]`) | Paper dry-run (short legs); gated by `SELL_ZONE_MIN`=65 |
-| 15 | convex-engine   | convex-engine           | `engine_runner.py`               | no (`profiles: [convex-engine]`) | No — P0 observe-only journal (decisions logged, no order path yet) |
-| 16 | market-context  | market-context          | `market_context.service`         | yes         | No (observational only, Phase 1) |
+| 5  | iv-rank         | iv-rank-scanner         | `iv_rank_runner.py`              | no (`profiles: [iv-rank]`) | No (alerts) |
+| 6  | oi-buildup      | oi-buildup-scanner      | `oi_buildup_runner.py`           | no (`profiles: [oi-buildup]`) | No (alerts; feeds auto-exit) |
+| 7  | gap-scan        | gap-scanner             | `gap_scanner_runner.py`          | no (`profiles: [gap-scan]`) | No (alerts) |
+| 8  | delivery-surge  | delivery-surge-scanner  | `delivery_surge_runner.py`       | no (`profiles: [delivery-surge]`) | No (alerts) |
+| 9  | smart-money     | smart-money-scanner     | `smart_money_runner.py`          | no (`profiles: [smart-money]`) | No (alerts) |
+| 10 | composite       | composite-scanner       | `composite_runner.py`            | no (`profiles: [composite]`) | No (feeds entry gate) |
+| 11 | sonar           | sonar-scanner           | `sonar_laplace_runner.py`        | no (`profiles: [sonar]`) | No (feeds entry veto + risk warnings) |
+| 12 | iv-seller       | iv-seller-strategy      | `iv_seller_runner.py`            | no (`profiles: [iv-seller]`) | Blocked by `paper_policy` only — has **no paper flag of its own** |
+| 13 | market-context  | market-context          | `market_context.service`         | yes         | No (observational only, Phase 1) |
 
-**Momentum does not use the shared paper book.** Unlike every other strategy,
-`momentum_strategy.py` never calls `OrderManager.submit_external_signal`. A
-signal writes a row to `data/momentum_trades.csv` (`MomentumTradeJournal`) and
-fires a Telegram alert; `_place_order` runs only under `AUTO_EXECUTE=true`.
-So momentum signals will never appear in `paper_trades.db` or on the
-dashboard's paper-trade pages — verify it via `data/momentum_trades.csv` and
-`logs/momentum.log`.
+**Paper trading is momentum-only, enforced at the INSERT (2026-08-05).**
+`paper_policy.py` holds `PAPER_STRATEGY_ALLOWLIST` (default `Momentum`,
+case-insensitive prefixes; `*` allows all; empty allows none — it fails
+closed). It is checked in `PaperTradeBook.open_trade`, the single INSERT into
+`paper_trades`, plus early in `book_signal` and `process_signals` so a refused
+signal costs no broker calls and fires no "PAPER TRADE TAKEN" alert.
+
+This exists because `profiles:` did not work as a kill switch: on 2026-08-05,
+with every strategy nominally gated off, vol-expansion (46), convex-engine (4,
+−₹11,617) and break-and-bounce (1) still booked 51 trades from containers that
+had never been stopped. Break & Bounce, directional-IV and IV-seller have no
+paper flag of their own, so there was also nothing per-strategy to switch off.
+Per-strategy flags are still set where they exist, but the allowlist is the
+guarantee. Tests: [test_paper_policy.py](test_paper_policy.py) (20).
+
+**Momentum writes to BOTH books (since 2026-08-05).** It was the only strategy
+that never called `OrderManager.submit_external_signal`, so it was invisible on
+the dashboard and absent from every shared analytic. Now:
+
+- `data/momentum_trades.csv` (`MomentumTradeJournal`) — unchanged schema, still
+  written **first and unconditionally**, so momentum's own record never depends
+  on the shared book accepting the signal;
+- `paper_trades.db` via `submit_external_signal`, tagged
+  `Momentum-<TRIGGER>` (`Momentum-ORB`, `Momentum-VWAP_RECLAIM` — the Convex
+  tag idiom, so the two momentum strategies stay separable in EOD analytics);
+- Telegram alert, and `_place_order` only under `AUTO_EXECUTE=true` — untouched.
+
+Gated by `PAPER["mode"]` (`MOMENTUM_PAPER_MODE`, default `paper`; `off`
+restores the exact pre-2026-08-05 behaviour). Booking is wrapped so a failure
+in the shared book cannot break the CSV journal or the alert.
+
+Two consequences worth knowing:
+
+- **`submit_external_signal` applies the SHARED gates** (pre-market IVR/IV-HV/
+  OTM%/PCR, breadth, concentration, exposure, daily-loss lockout) on top of
+  momentum's own selection, so it can legitimately refuse a signal that the CSV
+  journal records. A divergence between the two is expected, not a bug — the
+  refusal reason is logged and written to `scan_log`.
+- **Momentum declares its own risk budget.** It sizes lots to
+  `RISK_CONFIG["max_risk_pct"] × CAPITAL` (₹4,000), but the shared book's
+  default 1-lot cap is ₹1,500 — it would have rejected nearly every momentum
+  signal. The signal therefore carries `max_risk_rupees`, a per-signal override
+  in `book_signal` (same idiom as B&B's `min_premium`). This is not a
+  loosening: `calculate_lots` needs `premium × sl_pct × lot_size ≤ max_risk()`
+  for `lots ≥ 1`, and the book caps `(entry − sl) × lot_size` against the same
+  number, so the two gates are the *same inequality* — anything the override
+  admits, momentum had already sized; anything it rejects, momentum would have
+  refused as unaffordable. Pinned by a parametrized invariant test.
+
+**Momentum now runs the shared lifecycle too.** Booking without monitoring
+would strand every position, since scans stop at 11:30 but trades live to
+square-off. `momentum_runner.py` schedules `run_monitor` every
+`MOMENTUM_MONITOR_INTERVAL_MIN` from 09:35 to 15:10, `run_square_off` at 15:15
+and `run_paper_eod` at 15:20 — all skipped when `MOMENTUM_PAPER_MODE=off`.
+Tests: [test_momentum_paper.py](test_momentum_paper.py) (21).
 
 API callers: `iv-collector` sweeps option chains continuously, and `momentum`
 fetches daily candles at premarket plus intraday candles + option chains
@@ -63,8 +113,8 @@ busy_timeout) — see ARCHITECTURE_REVIEW_P0.md §0 for why.
 
 This section covers the `*_strategy.py` modules besides `discount.py`.
 Splitting momentum into ORB and VWAP (both live in
-`momentum_strategy.py:MomentumScanner`) yields four distinct trading
-strategies: ORB + VWAP + Break-and-Bounce + Volatility-Expansion.
+`momentum_strategy.py:MomentumScanner`) yields three distinct trading
+strategies: ORB + VWAP + Break-and-Bounce.
 
 ### Strategy: Momentum — Opening Range Breakout (ORB)
 
@@ -77,6 +127,41 @@ strategies: ORB + VWAP + Break-and-Bounce + Volatility-Expansion.
 - **Strike:** ATM + `STRIKE["intraday_otm_offset"]` strike-gaps in the trade direction.
 - **Ranking:** `MomentumSignalRanker` scores aligned signals (+40 STRONG / +20 WEAK regime, +30 direction-aligned, +10 if trigger=ORB, +5 if vol ratio ≥ 2). Only top `max_trades_per_day` are taken.
 - **Schedule:** premarket 09:00 (regime + affordability scan), intraday scan every 5 min between 09:30–11:30, EOD summary at 15:15.
+
+### Momentum alpha engine ([momentum_alpha.py](momentum_alpha.py), added 2026-08-05)
+
+Signal-quality layer for ORB/VWAP. Zero broker calls — every factor comes from
+data already on disk. Risk, sizing, journal, Telegram and execution are
+untouched.
+
+- **Selection precedes signal.** `DailyUniverseRanker` ranks all ~210 F&O names
+  by 20-day return percentile (`rs_pct`) plus ATR% and ATR expansion, from
+  `delivery_daily`. Premarket keeps the top `RS["shortlist"]` by *distance from
+  the median* — leaders are CE candidates, laggards PE candidates, mid-pack
+  names have no edge either way. Previously candidates were taken in dict order.
+- **`RelativeVolume`** — cumulative volume vs the same clock time on prior
+  sessions (`candles_5m`), replacing the time-of-day-biased "previous 5 candles"
+  baseline.
+- **`IntradayRelativeStrength`** — stock vs NIFTY since the open. NIFTY 5-min
+  closes are in `candles_5m` under `security_id='13'` (the `symbol` column is
+  mislabeled there — key on the id).
+- **`breakout_quality` / `vwap_quality`** — continuous 0–1 structure scores
+  (coil contraction, volume expansion, close location, follow-through; VWAP
+  slope, acceptance, signed separation) replacing binary pass/fail.
+- **`MomentumConvictionScorer`** — weighted 0–100 confidence from
+  `WEIGHTS`, normalised over *available* factors so a missing input dilutes
+  rather than scoring zero. Trades require `CONFIDENCE["min_score"]`.
+  `observe_only=True` scores and journals without blocking anything.
+- Breadth/sector gates reuse `breadth.py`; OI reuses `oi_buildup_scanner`.
+
+**Sonar must stay running** — it is the sole writer of `candles_5m`, which the
+RVOL, intraday-RS and quality factors read.
+
+Set any weight in `WEIGHTS` to 0 to journal a factor without letting it
+influence trades — the observe-then-enable protocol that produced engine
+formula v2.1. The factor trace for every trade is written to the existing
+`notes` column of `momentum_trades.csv`, so the journal schema is unchanged.
+Tests: [test_momentum_alpha.py](test_momentum_alpha.py) (22, no broker needed).
 
 ### Strategy: Momentum — VWAP Reclaim / Break
 
@@ -103,17 +188,6 @@ strategies: ORB + VWAP + Break-and-Bounce + Volatility-Expansion.
 - **Risk:** option SL at `entry × (1 - BB_RISK["sl_pct"])`, target = entry + (sl_amount × `BB_RISK["target_ratio"]`) — i.e. **fixed 2.5×** per the docstring (versus momentum's two-target T1/T2 split).
 - **Strike:** ATM + `BB_STRIKE["otm_offset"]` strike-gaps (separate config from momentum).
 - **Lifecycle:** one trade per stock per day (`state["trade_placed"]`). Setup is voided once breakout window expires without a breakout. EOD reset at 15:15.
-
-### Strategy: Volatility-Expansion (IV buy-zone)
-
-- **Files:** [vol_expansion_strategy.py](vol_expansion_strategy.py), runner [vol_expansion_runner.py](vol_expansion_runner.py), config [vol_expansion_config.py](vol_expansion_config.py).
-- **Signal source:** the dashboard's "II · Volatility Expansion — 4-day IV slope" leaderboard (`iv_analytics.buy_zone_leaderboard`) — names whose daily ATM IV is **climbing** (slope ≥ `MIN_SLOPE`) while **still cheap** on 52-wk history (IVP in the buy zone), ranked by `slope × (1 - IVP/100)`. Vega signal, not directional by nature.
-- **Direction:** since the signal itself is direction-agnostic, the strategy picks CE/PE from the underlying's recent daily spot trend (`underlying_bias`, `TREND_LOOKBACK` days, `MIN_MOVE_PCT` threshold). `REQUIRE_TREND=true` skips names with no clear lean rather than forcing a directional bet on a pure-vega setup.
-- **Universe / gates:** `BUY_ZONE_ONLY` restricts to buy-zone names (else trades top-expanding by slope regardless of price, i.e. includes rich chases); `MAX_SCAN` candidates considered; liquidity floor (`LIQ_MIN_OI`, `LIQ_MIN_VOLUME`, `LIQ_MAX_SPREAD`); `MIN_PREMIUM`, `MIN_DTE`.
-- **Sizing & risk:** single long-premium leg, ATM ± `STRIKE_OTM_OFFSET`. SL at `entry × (1 - SL_PCT)` (30% default). T1/T2 at `T1_MULT`/`T2_MULT` on premium, `T1_BOOK_FRACTION` booked at T1.
-- **Booking:** goes through `OrderManager.submit_external_signal` into the **shared paper book** — same monitor/fill-alerts/auto-exit/EOD/analytics pipeline as discount and Break-and-Bounce. `MODE` (`off`/`alert`/`paper`, env `VOL_EXP_MODE`, default `paper`) gates whether candidates are scanned-only-and-alerted or actually booked; paper only, no real orders regardless of mode.
-- **Schedule:** scans at `SCAN_TIMES` (default 09:45, 11:00, 13:00 — the daily-IV signal changes slowly, so a few scans are enough to catch freshly-qualifying names), entry cutoff `ENTRY_CUTOFF` (13:30), monitor every `MONITOR_INTERVAL_MIN` min until `MONITOR_UNTIL`, square-off at `SQUARE_OFF`, EOD summary at `EOD_SUMMARY_AT` (15:20/15:25).
-- **Cap:** `MAX_TRADES_PER_DAY` (default 3).
 
 ---
 

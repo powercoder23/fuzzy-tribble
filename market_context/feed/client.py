@@ -17,6 +17,25 @@ is deliberately DISABLED here:
      looks, in the data, like a period of perfectly stable market context.
   3. It cannot trigger the REST resync that rebuilds day-cumulative state.
 
+SUBSCRIBE FROM `open`, NEVER AFTER `connect()`
+----------------------------------------------
+`MarketDataStreamerV3.connect()` only starts the feeder — the handshake
+finishes on a websocket-client thread and is signalled by
+`handle_open` -> `subscribe_to_initial_keys()` -> `emit("open")`. Sending
+before that lands raises `WebSocketConnectionClosedException("socket is
+already closed")`, which means "there is no live socket", not "the socket
+closed". Worse, the SDK's `subscribe()` sends BEFORE recording the keys in
+`self.subscriptions`, so a group that fails this way never enters the SDK's
+replay set either. All subscribing therefore happens in `_on_open`, and
+`_connect_once` reports success only once that has run.
+
+A CONNECT ONLY COUNTS IF THE SOCKET LASTS
+-----------------------------------------
+A socket that opens and dies immediately is a FAILED connect. Crediting it
+resets the retry counter, which makes exponential backoff unreachable: a
+sustained rejection (expired token, plan connection limit) then reconnects at
+the base delay forever. `WS_MIN_UPTIME_SEC` is the floor for calling it real.
+
 STALENESS BEATS PING/PONG
 -------------------------
 A dead feed almost always presents as a live TCP connection that has stopped
@@ -100,6 +119,9 @@ class UpstoxFeedClient:
         self._gap_id: int | None = None
         self._gap_started: datetime | None = None
         self._force_reconnect = threading.Event()
+        #: Set by _on_open once the handshake has completed and the desired
+        #: state has been replayed. connect() returns long before this.
+        self._socket_open = threading.Event()
         #: instrument_key -> mode currently carried by the socket.
         self._subscribed: dict[str, str] = {}
 
@@ -137,12 +159,24 @@ class UpstoxFeedClient:
             try:
                 self.state = STATE_CONNECTING
                 if self._connect_once():
-                    attempt = 0
+                    connected_at = time.monotonic()
                     self._close_gap(resync=True)
                     self.state = STATE_STREAMING
                     # Block until the watchdog or an error asks for a reconnect.
                     self._force_reconnect.wait()
                     self._force_reconnect.clear()
+                    # Only a socket that LASTED counts as a successful connect.
+                    # One that opens and dies immediately used to reset the
+                    # backoff here, so a sustained rejection reconnected ~1/sec
+                    # forever without ever escalating (2026-08-04 11:17).
+                    uptime = time.monotonic() - connected_at
+                    if uptime >= cfg.WS_MIN_UPTIME_SEC:
+                        attempt = 0
+                    else:
+                        logger.warning(
+                            "market_context feed: socket lasted only %.1fs (<%.0fs) "
+                            "— counting it as a failed connect so backoff escalates",
+                            uptime, cfg.WS_MIN_UPTIME_SEC)
             except Exception:
                 logger.exception("market_context feed: connect cycle failed")
 
@@ -261,8 +295,8 @@ class UpstoxFeedClient:
             configuration.access_token = token
             api_client = upstox_client.ApiClient(configuration)
 
-            # Instantiate with the first mode's keys, then add the rest via
-            # subscribe(). The SDK requires an initial mode at construction.
+            # Instantiate with the first mode's keys; the rest are added from
+            # the `open` callback. The SDK requires an initial mode here.
             first_mode, first_keys = next(iter(keys_by_mode.items()))
             streamer = upstox_client.MarketDataStreamerV3(
                 api_client, list(first_keys), first_mode)
@@ -273,28 +307,36 @@ class UpstoxFeedClient:
             except Exception:
                 logger.debug("auto_reconnect toggle unavailable on this SDK build")
 
+            streamer.on("open", lambda *_: self._on_open(keys_by_mode))
             streamer.on("message", self._on_message)
             streamer.on("error", self._on_error)
             streamer.on("close", self._on_close)
 
             self._streamer = streamer
-            self._subscribed = {k: first_mode for k in first_keys}
+            self._subscribed = {}
+            self._socket_open.clear()
             streamer.connect()
 
-            # Declarative desired state: replay EVERY mode group on every
-            # connect, never an incremental diff.
-            for mode, keys in keys_by_mode.items():
-                if mode == first_mode:
-                    continue
-                try:
-                    streamer.subscribe(list(keys), mode)
-                    self._subscribed.update({k: mode for k in keys})
-                except Exception:
-                    logger.exception("market_context feed: subscribe(%s, %d keys) failed",
-                                     mode, len(keys))
+            # connect() only STARTS the feeder — the handshake completes on a
+            # websocket-client thread. Sending before it lands raises
+            # WebSocketConnectionClosedException("socket is already closed"),
+            # which is the SDK's confusing way of saying "never opened". So the
+            # subscribes happen in _on_open; all we do here is wait for it.
+            if not self._socket_open.wait(cfg.WS_CONNECT_TIMEOUT_SEC):
+                logger.error("market_context feed: socket did not open within %.0fs "
+                             "— treating as a failed connect",
+                             cfg.WS_CONNECT_TIMEOUT_SEC)
+                return False
 
+            # Report what the socket ACTUALLY carries, not what was desired —
+            # a failed subscribe used to be followed by a "connected" line
+            # listing the very keys that had just been rejected.
+            counts: dict[str, int] = {}
+            for mode in self._subscribed.values():
+                counts[mode] = counts.get(mode, 0) + 1
             logger.info("market_context feed: connected — %s",
-                        ", ".join(f"{m}:{len(k)}" for m, k in keys_by_mode.items()))
+                        ", ".join(f"{m}:{n}" for m, n in sorted(counts.items()))
+                        or "nothing subscribed")
             return True
         except Exception:
             logger.exception("market_context feed: connect failed")
@@ -304,6 +346,7 @@ class UpstoxFeedClient:
     def _disconnect_streamer(self) -> None:
         streamer, self._streamer = self._streamer, None
         self._subscribed = {}
+        self._socket_open.clear()
         if streamer is None:
             return
         try:
@@ -312,6 +355,39 @@ class UpstoxFeedClient:
             logger.debug("market_context feed: disconnect raised (ignored)", exc_info=True)
 
     # ---- callbacks -------------------------------------------------------- #
+    def _on_open(self, keys_by_mode: dict) -> None:
+        """Replay the FULL desired state — runs on the websocket thread.
+
+        Declarative: every mode group is re-sent on every connect, never an
+        incremental diff, so dynamic requests from other containers survive a
+        reconnect. The SDK has already replayed the construction-time mode by
+        the time this fires (handle_open -> subscribe_to_initial_keys ->
+        emit("open")), so only the remaining modes are sent here.
+
+        Must never raise: this runs inside websocket-client's on_open, and an
+        exception there tears down the socket we just established.
+        """
+        streamer = self._streamer
+        if streamer is None:
+            return
+        first_mode = next(iter(keys_by_mode), None)
+        subscribed = {k: first_mode for k in keys_by_mode.get(first_mode, ())}
+        for mode, keys in keys_by_mode.items():
+            if mode == first_mode:
+                continue
+            try:
+                streamer.subscribe(list(keys), mode)
+                subscribed.update({k: mode for k in keys})
+            except Exception:
+                # Left out of _subscribed on purpose: reconcile() then sees the
+                # keys as missing and re-sends them on the next service tick.
+                logger.exception("market_context feed: subscribe(%s, %d keys) failed",
+                                 mode, len(keys))
+        self._subscribed = subscribed
+        # The socket is open even if a subscribe failed — reconcile repairs
+        # subscriptions, but only while the state machine says STREAMING.
+        self._socket_open.set()
+
     def _on_message(self, message) -> None:
         try:
             ticks = normaliser.normalise_message(message)

@@ -165,7 +165,9 @@ INTRADAY = {
 # is a capped debit spread, not a naked long, addressing the loss profile that
 # triggered the original kill switch. Scanning + Telegram alerts were never
 # affected; this flag only ever gated the paper_trader hand-off.
-PAPER_TRADING_ENABLED = True
+# 2026-08-05: off again — momentum-only mode. Scanning + Telegram alerts are
+# unaffected, as always; this flag only gates the paper_trader hand-off.
+PAPER_TRADING_ENABLED = False
 
 # 2026-07-31: the narrower-than-B&B/directional-IV width (2 vs 3 strikes OTM)
 # was the deliberate original intent (see prior comment, kept below) but in

@@ -184,6 +184,17 @@ RECONNECT_MAX_SEC = _f("MC_RECONNECT_MAX_SEC", 30.0)
 RECONNECT_MULTIPLIER = _f("MC_RECONNECT_MULTIPLIER", 2.0)
 RECONNECT_JITTER_PCT = _f("MC_RECONNECT_JITTER_PCT", 0.25)
 
+#: MarketDataStreamerV3.connect() only starts the feeder — the WS handshake
+#: finishes on another thread. How long to wait for the `open` event before
+#: calling the attempt failed.
+WS_CONNECT_TIMEOUT_SEC = _f("MC_WS_CONNECT_TIMEOUT_SEC", 15.0)
+
+#: A socket that opens and dies immediately is a FAILED connect, not a
+#: successful one that happened to end. Crediting it resets the backoff, so a
+#: sustained rejection (expired token, plan connection limit) turns into a
+#: ~1/sec reconnect storm that never escalates. Observed 2026-08-04 11:17.
+WS_MIN_UPTIME_SEC = _f("MC_WS_MIN_UPTIME_SEC", 30.0)
+
 #: Staleness beats ping/pong: a dead feed usually presents as a live TCP
 #: connection that stopped delivering. Judged on tier-1 instruments only —
 #: they always tick during market hours; a quiet mid-cap is data, not an outage.

@@ -11,20 +11,28 @@ Calls Dhan API only for:
 Schedule:
   09:00        run_premarket  (VIX check, affordability filter, regime scan)
   09:30–11:30  run_intraday_scan every 5 min
-  15:15        daily summary Telegram
+  09:35–15:10  run_monitor every MOMENTUM_MONITOR_INTERVAL_MIN (shared book)
+  15:15        run_square_off + daily summary Telegram
+  15:20        run_paper_eod (shared-book realized P&L)
+
+Scanning stops at 11:30 but positions live until square-off, so the monitor
+runs on its own cadence long after the last scan. Without it a booked trade
+would never fill, stop out or hit a target. Skipped entirely when
+MOMENTUM_PAPER_MODE=off.
 """
 
 import logging
 import os
 import time
-from datetime import datetime, time as dt_time
+from datetime import datetime, timedelta, time as dt_time
 
 import pytz
 import schedule
 
 from collectors import iv_store
 from config import Config
-from momentum_strategy import MomentumStrategyRunner
+from momentum_config import PAPER
+from momentum_strategy import MomentumStrategyRunner, interval_times
 
 IST = pytz.timezone("Asia/Kolkata")
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Kolkata")
@@ -68,6 +76,26 @@ def main():
         logger.info("Momentum: intraday scan")
         runner.run_intraday_scan()
 
+    def _monitor():
+        try:
+            runner.run_monitor()
+        except Exception:
+            logger.exception("Momentum monitor failed")
+
+    def _square_off():
+        logger.info("Momentum: square-off")
+        try:
+            runner.run_square_off()
+        except Exception:
+            logger.exception("Momentum square-off failed")
+
+    def _paper_eod():
+        logger.info("Momentum: paper-book EOD")
+        try:
+            runner.run_paper_eod()
+        except Exception:
+            logger.exception("Momentum paper EOD failed")
+
     def _daily_summary():
         logger.info("Momentum: daily summary")
         try:
@@ -78,14 +106,28 @@ def main():
         except Exception:
             logger.exception("Daily summary failed")
 
+    paper_on = PAPER["mode"] == "paper"
+    monitor_times = interval_times(
+        PAPER["monitor_from"], PAPER["monitor_until"],
+        PAPER["monitor_interval_min"]) if paper_on else []
+
     schedule.clear()
     for day in WEEKDAYS:
         getattr(schedule.every(), day).at("09:00").do(_premarket)
-        getattr(schedule.every(), day).at("15:15").do(_daily_summary)
         for t in INTRADAY_TIMES:
             getattr(schedule.every(), day).at(t).do(_intraday)
+        for t in monitor_times:
+            getattr(schedule.every(), day).at(t).do(_monitor)
+        if paper_on:
+            # Square-off BEFORE the EOD summary, or the summary reports
+            # positions that are about to be closed as still open.
+            getattr(schedule.every(), day).at(PAPER["square_off"]).do(_square_off)
+            getattr(schedule.every(), day).at(PAPER["eod_summary_at"]).do(_paper_eod)
+        getattr(schedule.every(), day).at("15:15").do(_daily_summary)
 
-    logger.info("Momentum strategy scheduler started")
+    logger.info("Momentum strategy scheduler started | paper=%s | monitor %s..%s every %dm (%d slots)",
+                PAPER["mode"], PAPER["monitor_from"], PAPER["monitor_until"],
+                PAPER["monitor_interval_min"], len(monitor_times))
     if schedule.jobs:
         next_run = min(j.next_run for j in schedule.jobs if j.next_run)
         logger.info("Next run: %s", next_run.strftime("%Y-%m-%d %H:%M:%S"))

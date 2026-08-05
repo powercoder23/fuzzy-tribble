@@ -1,3 +1,17 @@
+# PAPER TRADING IS MOMENTUM-ONLY (2026-08-05).
+#
+# The `profiles:` keys below decide what `docker-compose up` STARTS. They are
+# not a kill switch: a container already running under `restart: unless-stopped`
+# keeps trading until it is explicitly stopped, which is how vol-expansion,
+# convex-engine and break-and-bounce took 51 paper trades on 2026-08-05 while
+# nominally gated off. After changing gating, run `docker-compose down` first.
+#
+# The actual guarantee is paper_policy.py, enforced at the single INSERT into
+# paper_trades: PAPER_STRATEGY_ALLOWLIST (default "Momentum") refuses any other
+# strategy regardless of which container is alive. To let a strategy book again,
+# set PAPER_STRATEGY_ALLOWLIST in .env — e.g. `Momentum,Break & Bounce`, or `*`
+# for the pre-2026-08-05 free-for-all — and turn its own mode flag back on.
+
 services:
 
   # ── Service 1: IV Collector ────────────────────────────────────────────────
@@ -88,51 +102,6 @@ services:
     depends_on:
       - iv-collector
     command: python break_bounce_runner.py
-
-  # ── Service: Volatility-Expansion paper strategy (4-day IV slope) ────────
-  # Trades the dashboard's buy-zone expansion signal. MODE via VOL_EXP_MODE
-  # (off|alert|paper, default paper). Paper only — never places real orders.
-  vol-expansion:
-    profiles: [vol-expansion]
-    build:
-      context: .
-      dockerfile: Dockerfile.break-bounce
-    container_name: vol-expansion-strategy
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python vol_expansion_runner.py
-
-  # ── Service 5: Directional IV Strategy ───────────────────────────────────
-  # Re-enabled: now paper-trades top candidates as debit spreads via
-  # OrderManager.submit_with_hedge. Monitoring is handled by the discount
-  # container's 5-min monitor cycle.
-  directional-iv:
-    profiles: [directional-iv]
-    build:
-      context: .
-      dockerfile: Dockerfile.directional
-    container_name: directional-iv-strategy
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python directional_iv_runner.py
 
   # ── IV Seller Strategy (short strangle/straddle on rich IV) ─────────────
   # Paper dryrun activated: books short combos into paper_trades.db via
@@ -264,8 +233,12 @@ services:
 
   # Sonar-Laplace — Ehlers SuperSmoother trend/reversal/breakout signals.
   # Reads 5-min candles via DataProvider (broker fetch per name). Intraday.
+  # NOTE: sonar is NOT gated off, by design. It is the SOLE WRITER of the
+  # candles_5m table in iv_history.db (see engine/candles.py) — the 5-min
+  # history that the momentum alpha engine reads for time-of-day RVOL,
+  # intraday relative strength vs NIFTY, and trigger quality. Gating it off
+  # silently freezes that table and blinds those features.
   sonar:
-    profiles: [sonar]
     build:
       context: .
       # Full image: sonar reads candles via DataProvider -> DiscountedPremiumScanner
@@ -306,31 +279,6 @@ services:
     depends_on:
       - iv-collector
     command: python composite_runner.py
-
-  # ── Convex Engine (V2 P0 — observe-only) ─────────────────────────────────
-  # One Conviction Engine: regime -> factors -> trigger -> gates -> Decisions.
-  # Zero broker calls (reads iv_history.db written by the scanners above) and
-  # zero orders. Writes engine_decisions/engine_regime + one Telegram digest
-  # per cycle. Lean scanner image is sufficient. See V2_BLUEPRINT.md.
-  convex-engine:
-    profiles: [convex-engine]
-    build:
-      context: .
-      dockerfile: Dockerfile.scanner
-    container_name: convex-engine
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-      ENGINE_PAPER_MODE: paper
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python engine_runner.py
 
   # ── Service 17: Market Context ────────────────────────────────────────────
   # Shared market description for every strategy. Owns the ONLY WebSocket

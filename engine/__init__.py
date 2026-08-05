@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Convex V2 — Conviction Engine (P0 strangler scaffold).
+"""Shared 5-min candle store (`candles_5m` in iv_history.db).
 
-One decision funnel: Regime -> Factors -> Trigger -> Gates -> Conviction ->
-Decision. See V2_BLUEPRINT.md. This package reads the existing *_history
-tables written by V1 services; it makes ZERO broker calls.
+Sole writer is the sonar service; momentum_alpha and the dashboard read it.
+What remained of the retired Convex engine package.
 """

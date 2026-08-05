@@ -24,7 +24,6 @@ from config import Config
 from discount import DiscountedPremiumScanner, unwrap_dhan_payload
 import discount_config
 from discount_config import INTRADAY, PAPER_TRADING_ENABLED
-from directional_iv_runner import run_directional_scan
 import paper_trader
 from order_manager import OrderManager
 from trade_suggester import TradeSuggester
@@ -240,14 +239,6 @@ class StrategySchedulerApp:
             breadth.send_sector_heatmap()
         except Exception:
             logger.exception("Sector heatmap failed (non-fatal)")
-
-    def run_directional_iv_scan(self):
-        """Run the directional IV scan once (kept available, not scheduled)."""
-        try:
-            return run_directional_scan()
-        except Exception:
-            logger.exception("Directional IV strategy failed")
-            return None
 
     # --- scheduling ---------------------------------------------------------
     def setup_schedule(self):

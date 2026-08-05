@@ -18,6 +18,7 @@ from discount import (
     unwrap_dhan_payload,
     get_trading_days_to_expiry,
 )
+import momentum_alpha
 import notifications
 from config import Config
 from load_scrip_master_sqlite import get_security_id_symbol_map
@@ -25,10 +26,34 @@ from collectors import iv_store
 from momentum_config import (
     CAPITAL, RISK_CONFIG, REGIME, ORB, LIQUIDITY, STRIKE,
     SCRIP_MASTER_DB, IV_HISTORY_DB, TRADE_LOG_PATH, LOT_SIZE_FALLBACK,
+    RS, ATR, RVOL, CONFIDENCE, PAPER,
 )
 
 IST = pytz.timezone("Asia/Kolkata")
 logger = logging.getLogger(__name__)
+
+
+def interval_times(start: str, end: str, minutes: int) -> list:
+    """["09:35", "09:40", ...] inclusive of `end`.
+
+    Lives here rather than in momentum_runner so it is importable (and
+    testable) without the `schedule` dependency, which only the container has.
+    Returns [] for a degenerate window or interval, so a bad env value
+    schedules nothing rather than looping forever.
+    """
+    try:
+        cur = datetime.strptime(start, "%H:%M")
+        stop = datetime.strptime(end, "%H:%M")
+    except (ValueError, TypeError):
+        logger.error("Bad monitor window %s..%s — monitor not scheduled", start, end)
+        return []
+    if minutes <= 0 or cur > stop:
+        return []
+    out = []
+    while cur <= stop:
+        out.append(cur.strftime("%H:%M"))
+        cur += timedelta(minutes=minutes)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -424,10 +449,39 @@ class MomentumScanner:
     def __init__(self, scanner: DiscountedPremiumScanner):
         self.scanner = scanner
         self.dhan    = scanner.dhan
+        # Per-cycle candle cache. check_orb_signal and check_vwap_signal used to
+        # fetch the SAME symbol/interval/day independently — 2 broker calls per
+        # symbol per cycle, ~1,500 redundant intraday calls a day. The runner
+        # clears this once per scan cycle.
+        self._candle_cache: dict = {}
+        self._cache_day: str     = ""
+
+    def clear_cache(self) -> None:
+        """Drop cached candles. Called by the runner at the top of each cycle."""
+        self._candle_cache.clear()
+        self._cache_day = date.today().isoformat()
 
     def get_intraday_candles(self, security_id, exchange_segment,
                              interval_minutes: int = 15) -> pd.DataFrame:
-        """Fetch intraday candles from Dhan at the requested interval."""
+        """Fetch intraday candles from Dhan at the requested interval.
+
+        Cached per (security_id, interval) for the current cycle — repeated
+        calls inside one scan return the same frame without a second API hit.
+        """
+        today = date.today().isoformat()
+        if self._cache_day != today:          # date rolled over mid-process
+            self.clear_cache()
+        cache_key = (str(security_id), int(interval_minutes))
+        if cache_key in self._candle_cache:
+            return self._candle_cache[cache_key]
+        df = self._fetch_intraday_candles(
+            security_id, exchange_segment, interval_minutes)
+        self._candle_cache[cache_key] = df
+        return df
+
+    def _fetch_intraday_candles(self, security_id, exchange_segment,
+                                interval_minutes: int = 15) -> pd.DataFrame:
+        """Uncached broker fetch — the original get_intraday_candles body."""
         empty = pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume", "vwap"])
         today = date.today().isoformat()
         candle_segment = "IDX_I" if exchange_segment == "IDX_I" else "NSE_EQ"
@@ -539,6 +593,14 @@ class MomentumScanner:
                 return self._no_signal(symbol, security_id,
                                        f"no_breakout(ratio={vol_ratio:.2f})")
 
+            # Breakout STRUCTURE, not just "price crossed": a tight coil
+            # resolving on expanding volume with a strong close scores high; a
+            # wide drifting bar that merely tags the level scores near zero.
+            level   = orb["high"] if signal == "CE" else orb["low"]
+            bars    = df.to_dict("records")
+            quality = momentum_alpha.breakout_quality(
+                bars, len(bars) - 2, level, signal)
+
             return {
                 "signal":       signal,
                 "trigger":      "ORB",
@@ -549,6 +611,7 @@ class MomentumScanner:
                 "orb_low":      round(orb["low"], 2),
                 "volume_ratio": round(vol_ratio, 2),
                 "vwap":         round(float(last["vwap"]), 2),
+                "quality":      quality,
                 "timestamp":    datetime.now(IST).isoformat(),
                 "reason":       "orb_breakout",
             }
@@ -584,6 +647,15 @@ class MomentumScanner:
                 return self._no_signal(symbol, security_id,
                                        f"no_vwap_signal(ratio={vol_ratio:.2f})")
 
+            # A bare crossover is close to a coin flip in chop. Demand that the
+            # VWAP itself slopes the right way, that price has HELD the side for
+            # more than one bar, and that it is not sitting on the line.
+            completed = df.iloc[:-1]
+            quality   = momentum_alpha.vwap_quality(
+                completed.to_dict("records"),
+                completed["vwap"].tolist(),
+                signal)
+
             return {
                 "signal":       signal,
                 "trigger":      "VWAP",
@@ -594,6 +666,7 @@ class MomentumScanner:
                 "orb_low":      0.0,
                 "volume_ratio": round(vol_ratio, 2),
                 "vwap":         round(float(last["vwap"]), 2),
+                "quality":      quality,
                 "timestamp":    datetime.now(IST).isoformat(),
                 "reason":       reason,
             }
@@ -665,9 +738,32 @@ class AffordabilityFilter:
 # ---------------------------------------------------------------------------
 
 class MomentumSignalRanker:
+    """Ranks aligned signals. Weighted-confidence scoring when a context map is
+    supplied, otherwise the original fixed ladder (kept so the class stays
+    backward-compatible for callers and tests that pass two arguments)."""
 
-    def rank(self, signals: list, regime_map: dict) -> list:
-        """Score, filter misaligned signals, return top N sorted by composite_score."""
+    def __init__(self, scorer=None):
+        self.scorer = scorer or momentum_alpha.MomentumConvictionScorer()
+
+    @staticmethod
+    def _legacy_score(signal: dict, regime: dict) -> int:
+        score = 0
+        score += 40 if regime.get("strength") == "STRONG" else 20
+        score += 30  # direction aligned (already confirmed by the caller)
+        score += 10 if signal.get("trigger") == "ORB" else 0
+        score += 5  if signal.get("volume_ratio", 0) >= 2.0 else 0
+        return score
+
+    def rank(self, signals: list, regime_map: dict,
+             context_map: dict = None, top_n: int = None) -> list:
+        """Score, drop misaligned/low-confidence signals, return the best first.
+
+        `context_map` is {security_id: factor_ctx}. When present each signal is
+        scored 0-100 by MomentumConvictionScorer and anything below
+        CONFIDENCE['min_score'] is dropped. `top_n` defaults to the daily trade
+        cap, but callers may widen it — selection depth and the risk limit are
+        no longer forced to be the same number.
+        """
         results = []
         for signal in signals:
             side   = signal.get("signal")
@@ -679,17 +775,30 @@ class MomentumSignalRanker:
             if side == "PE" and regime.get("suggested_side") != "PE":
                 continue
 
-            score = 0
-            score += 40 if regime.get("strength") == "STRONG" else 20
-            score += 30  # direction aligned (already confirmed above)
-            score += 10 if signal.get("trigger") == "ORB" else 0
-            score += 5  if signal.get("volume_ratio", 0) >= 2.0 else 0
+            if context_map is None:
+                signal["composite_score"] = self._legacy_score(signal, regime)
+                results.append(signal)
+                continue
 
-            signal["composite_score"] = score
+            ctx = dict(context_map.get(sec_id) or {})
+            ctx.setdefault("regime_strength", regime.get("strength"))
+            ctx.setdefault("breakout_quality", signal.get("quality"))
+
+            res = self.scorer.score(ctx, side)
+            ok, reason = self.scorer.passes(res)
+            signal["composite_score"] = res["confidence"]
+            signal["confidence"]      = res["confidence"]
+            signal["factor_note"]     = momentum_alpha.format_factor_note(res, ctx)
+            if not ok:
+                logger.info("Signal dropped %s %s: %s | %s",
+                            signal.get("symbol"), side, reason,
+                            signal["factor_note"])
+                continue
             results.append(signal)
 
         results.sort(key=lambda s: s["composite_score"], reverse=True)
-        return results[:RISK_CONFIG["max_trades_per_day"]]
+        limit = RISK_CONFIG["max_trades_per_day"] if top_n is None else top_n
+        return results[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -910,9 +1019,94 @@ class MomentumStrategyRunner:
         self._affordable_universe: dict = {}
         self._regime_cache: dict        = {}
         self._eq_id_map: dict           = {}   # {fno_sec_id: eq_sec_id}
+        # Alpha engine — all DB-only, no broker calls.
+        self._ranker_daily = momentum_alpha.DailyUniverseRanker()
+        self._rvol         = momentum_alpha.RelativeVolume()
+        self._intraday_rs  = momentum_alpha.IntradayRelativeStrength()
+        self._rank_map: dict = {}   # {SYMBOL: {rs_pct, atr_pct, atr_expansion}}
+        self._order_manager = None  # lazy — see _get_order_manager
 
     def _build_scanner(self) -> DiscountedPremiumScanner:
         return DiscountedPremiumScanner()
+
+    # ---- shared paper book ------------------------------------------------- #
+    def _get_order_manager(self):
+        """Lazy OrderManager over the shared paper book.
+
+        Built here rather than in __init__ so importing this module (tests,
+        the backtester, the dashboard) never opens paper_trades.db.
+        """
+        if self._order_manager is None:
+            import order_manager
+            self._ensure_components()
+            self._order_manager = order_manager.OrderManager(
+                bot_token=self._scanner.telegram_bot_token,
+                chat_id=self._scanner.telegram_chat_id,
+            )
+        return self._order_manager
+
+    def _build_paper_signal(self, sig, symbol, sec_id, segment, side, expiry,
+                            strike_data, spot, premium, sl, tgts, lot_size) -> dict:
+        """Shape a momentum signal for OrderManager.submit_external_signal.
+
+        `security_id` is the UNDERLYING id (not the option's) — that is what the
+        shared monitor re-looks-up the option chain with, matching what
+        vol-expansion and B&B pass.
+        """
+        trigger = str(sig.get("trigger") or "").strip().upper()
+        return {
+            "symbol":             symbol,
+            "security_id":        sec_id,
+            "exchange_segment":   segment,
+            "side":               side,
+            "strike":             strike_data.get("strike"),
+            "expiry":             expiry,
+            "spot":               spot,
+            "entry":              round(float(premium), 2),
+            "sl":                 round(float(sl), 2),
+            "t1":                 round(float(tgts["t1"]), 2),
+            "t2":                 round(float(tgts["t2"]), 2),
+            "t1_book_fraction":   RISK_CONFIG.get("t1_book_fraction", 0.5),
+            "lot_size":           lot_size,
+            "iv":                 strike_data.get("iv"),
+            "bid":                strike_data.get("bid"),
+            "ask":                strike_data.get("ask"),
+            "oi":                 strike_data.get("oi"),
+            "volume":             strike_data.get("volume"),
+            "option_security_id": strike_data.get("option_security_id"),
+            "score":              sig.get("composite_score"),
+            "min_premium":        PAPER["min_premium"],
+            # Momentum owns its sizing model — declare the budget it sized to,
+            # or the shared ₹1,500 default would reject nearly every signal and
+            # the CSV journal would disagree with the book. See book_signal.
+            "max_risk_rupees":    self.risk_manager.max_risk(),
+            "strategy":           (f"{PAPER['strategy_tag']}-{trigger}" if trigger
+                                   else PAPER["strategy_tag"]),
+        }
+
+    def run_monitor(self, now=None) -> None:
+        """Re-price and exit-manage open momentum positions in the shared book.
+
+        Momentum stops SCANNING at 11:30 but its positions live until square-off,
+        so this runs on its own cadence well past the last scan. Without it a
+        booked trade would never fill, stop out, or hit a target.
+        """
+        if PAPER["mode"] != "paper":
+            return
+        self._ensure_components()
+        self._get_order_manager().track(self._scanner, now=now or datetime.now())
+
+    def run_square_off(self, now=None) -> None:
+        if PAPER["mode"] != "paper":
+            return
+        self._ensure_components()
+        self._get_order_manager().square_off_all(self._scanner, now=now or datetime.now())
+
+    def run_paper_eod(self, now=None) -> None:
+        if PAPER["mode"] != "paper":
+            return
+        self._ensure_components()
+        self._get_order_manager().eod(self._scanner, now=now or datetime.now())
 
     def _ensure_components(self) -> None:
         """Lazy initialisation. Safe to call multiple times."""
@@ -1070,6 +1264,77 @@ class MomentumStrategyRunner:
             notify=getattr(self._notifier, "send", None),
         )
 
+    def _apply_universe_ranking(self, affordable: dict) -> dict:
+        """Order the affordable universe by relative strength, best first.
+
+        Names are kept if they can lead EITHER side (a bottom-decile name is a
+        valid PE candidate), so this re-orders and trims rather than imposing a
+        direction here — direction is the trigger's job. Fail-open: if
+        delivery_daily is unavailable the original universe passes through
+        untouched.
+        """
+        try:
+            ranked = self._ranker_daily.rank()
+            self._rank_map = ranked
+            if len(ranked) < int(RS["min_universe"]):
+                logger.warning("Universe ranking skipped — only %d ranked names",
+                               len(ranked))
+                return affordable
+
+            scored, unranked = [], []
+            for sec_id, symbol in affordable.items():
+                m = ranked.get(str(symbol).strip().upper())
+                if not m or m.get("rs_pct") is None:
+                    unranked.append((sec_id, symbol))
+                    continue
+                atr_pct = m.get("atr_pct")
+                expansion = m.get("atr_expansion")
+                if atr_pct is not None and atr_pct < float(ATR["min_atr_pct"]):
+                    continue                      # dead name — no range to pay for
+                if expansion is not None and expansion < float(ATR["min_expansion"]):
+                    continue                      # volatility contracting
+                # Distance from the middle: leaders AND laggards are tradeable,
+                # mid-pack names are the ones with no edge in either direction.
+                scored.append((abs(m["rs_pct"] - 50.0), sec_id, symbol))
+
+            scored.sort(reverse=True)
+            shortlist = int(RS["shortlist"])
+            out = {sec_id: symbol for _, sec_id, symbol in scored[:shortlist]}
+            for sec_id, symbol in unranked:       # never starve on missing data
+                if len(out) >= shortlist:
+                    break
+                out[sec_id] = symbol
+
+            logger.info("Universe ranking: %d affordable -> %d shortlisted "
+                        "(%d ranked, %d unranked kept)",
+                        len(affordable), len(out), len(scored), len(unranked))
+            return out or affordable
+        except Exception:
+            logger.exception("_apply_universe_ranking failed — using unranked universe")
+            return affordable
+
+    def _build_context(self, sec_id, symbol, eq_sec_id, side) -> dict:
+        """Assemble the factor context for one candidate. All DB reads."""
+        ctx = {}
+        try:
+            m = self._rank_map.get(str(symbol).strip().upper()) or {}
+            ctx["rs_pct"] = m.get("rs_pct")
+            ctx["atr_pct"] = m.get("atr_pct")
+            ctx["atr_expansion"] = m.get("atr_expansion")
+
+            now_hhmm = datetime.now(IST).strftime("%H:%M")
+            ctx["rvol"] = self._rvol.rvol(eq_sec_id, now_hhmm)
+            ctx["intraday_rs"] = self._intraday_rs.rs(eq_sec_id)
+
+            ctx.update(momentum_alpha.breadth_context(symbol))
+
+            oi = momentum_alpha.oi_context(sec_id)
+            ctx["oi_bias"] = oi.get("bias")
+            ctx["oi_strength"] = oi.get("strength")
+        except Exception:
+            logger.debug("_build_context partial for %s", symbol, exc_info=True)
+        return ctx
+
     def run_premarket(self) -> dict:
         """Called at 9:00 AM."""
         try:
@@ -1084,8 +1349,15 @@ class MomentumStrategyRunner:
 
             affordable = self._affordability.get_affordable_universe(
                 self._scanner.fno_stocks)
-            self._affordable_universe = affordable
             self._eq_id_map = self._resolve_eq_ids(self._scanner.fno_stocks)
+
+            # Cross-sectional pass: rank the whole universe by N-day relative
+            # strength and movement capacity BEFORE any per-name work. This is
+            # the selection step the strategy previously lacked — candidates
+            # used to be taken in dict order, so the 40th-strongest name was as
+            # likely to be traded as the strongest.
+            affordable = self._apply_universe_ranking(affordable)
+            self._affordable_universe = affordable
 
             candidates = dict(list(affordable.items())[:60])
             for sec_id, symbol in candidates.items():
@@ -1143,7 +1415,11 @@ class MomentumStrategyRunner:
 
             candidates = sorted(self._affordable_universe.items(), key=sort_key)[:30]
 
-            raw_signals = []
+            # One candle fetch per symbol per cycle serves both triggers.
+            self._mom_scanner.clear_cache()
+
+            raw_signals  = []
+            context_map  = {}
             for sec_id, symbol in candidates:
                 regime = self._regime_cache.get(sec_id, {})
                 if not regime.get("tradeable"):
@@ -1152,17 +1428,54 @@ class MomentumStrategyRunner:
                 eq_sec_id = self._eq_id_map.get(sec_id, sec_id)
                 orb_sig   = self._mom_scanner.check_orb_signal(eq_sec_id, segment, symbol)
                 vwap_sig  = self._mom_scanner.check_vwap_signal(eq_sec_id, segment, symbol)
-                for sig in [orb_sig, vwap_sig]:
-                    if sig["signal"] != "NONE":
-                        sig["security_id"] = sec_id  # restore fno_sec_id for regime/chain lookup
-                        raw_signals.append(sig)
+
+                # One signal per underlying. Both triggers firing used to queue
+                # two signals for the same name, which could open two positions
+                # in one underlying and defeat max_open_positions as a
+                # diversification limit. Keep the better-quality trigger; ORB
+                # breaks the tie because it carries a level, VWAP does not.
+                fired = [s for s in (orb_sig, vwap_sig) if s["signal"] != "NONE"]
+                if not fired:
+                    time.sleep(0.3)
+                    continue
+                if len(fired) > 1 and fired[0]["signal"] != fired[1]["signal"]:
+                    logger.info("Conflicting triggers %s (ORB=%s VWAP=%s) — skipped",
+                                symbol, orb_sig["signal"], vwap_sig["signal"])
+                    time.sleep(0.3)
+                    continue
+                best = max(fired, key=lambda s: (s.get("quality", 0.0),
+                                                 s.get("trigger") == "ORB"))
+                best["security_id"] = sec_id   # restore fno id for chain lookup
+
+                side = best["signal"]
+                ctx  = self._build_context(sec_id, symbol, eq_sec_id, side)
+
+                rvol = ctx.get("rvol")
+                if rvol is not None and rvol < float(RVOL["min_rvol"]):
+                    logger.info("RVOL veto %s: %.2f < %.2f",
+                                symbol, rvol, float(RVOL["min_rvol"]))
+                    time.sleep(0.3)
+                    continue
+
+                blocked, reason = momentum_alpha.breadth_blocks(side, ctx)
+                if blocked:
+                    logger.info("Breadth veto %s %s: %s", symbol, side, reason)
+                    time.sleep(0.3)
+                    continue
+
+                context_map[sec_id] = ctx
+                raw_signals.append(best)
                 time.sleep(0.3)
 
             if not raw_signals:
                 logger.info("run_intraday_scan: no signals this cycle")
                 return []
 
-            ranked = self._ranker.rank(raw_signals, self._regime_cache)
+            ranked = self._ranker.rank(raw_signals, self._regime_cache, context_map)
+            if not ranked:
+                logger.info("run_intraday_scan: %d signal(s) below confidence floor %.0f",
+                            len(raw_signals), float(CONFIDENCE["min_score"]))
+                return []
 
             sent_signals = []
             for sig in ranked:
@@ -1249,10 +1562,39 @@ class MomentumStrategyRunner:
                     "trigger":         sig.get("trigger", ""),
                     "volume_ratio":    sig.get("volume_ratio", 0.0),
                     "composite_score": sig.get("composite_score", 0),
-                    "notes":           "",
+                    # Factor trace goes in the existing free-text column so the
+                    # journal schema (and every reader of momentum_trades.csv)
+                    # stays unchanged while every trade records its full "why".
+                    "notes":           sig.get("factor_note", ""),
                 }
 
                 self._journal.log_entry(trade)
+
+                # Shared paper book. The CSV journal above is written either
+                # way, so momentum's own record is never contingent on the
+                # book accepting the signal — submit_external_signal applies
+                # the SHARED quality gates (pre-market, breadth, concentration,
+                # exposure, daily-loss lockout) on top of momentum's own
+                # selection and can legitimately refuse.
+                if PAPER["mode"] == "paper":
+                    try:
+                        paper_sig = self._build_paper_signal(
+                            sig, symbol, sec_id, segment, side, expiry,
+                            strike_data, spot, premium, sl, tgts, lot_size)
+                        booked = self._get_order_manager().submit_external_signal(
+                            paper_sig, now=datetime.now())
+                        if booked:
+                            logger.info("Momentum booked to paper book: %s %s K%s [%s]",
+                                        symbol, side, strike_data.get("strike"),
+                                        paper_sig["strategy"])
+                        else:
+                            logger.info("Momentum paper booking refused for %s %s "
+                                        "(shared gate/guard) — CSV journal still written",
+                                        symbol, side)
+                    except Exception:
+                        # Never let the shared book break momentum's own path:
+                        # the alert and the CSV journal must still happen.
+                        logger.exception("Momentum paper booking failed for %s", symbol)
 
                 risk_data = {
                     "qty":      lots * lot_size,
