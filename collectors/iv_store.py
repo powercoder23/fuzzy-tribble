@@ -75,6 +75,50 @@ CREATE INDEX IF NOT EXISTS idx_skew_symbol_time
 ON skew_snapshots(symbol, timestamp)
 """
 
+# IV term structure — ATM IV + per-strike skew for every expiry OTHER than the
+# one already tracked in iv_history/skew_snapshots. Collected only 3x/day
+# (09:50, 12:00, 15:00) since it is not needed at intraday frequency. A
+# separate table (not an `expiry` column bolted onto iv_history) because
+# iv_history's UNIQUE(security_id, timestamp, data_type) and every downstream
+# reader (IV percentile/rank, momentum affordability, dashboard) assume one
+# row per stock per timestamp — mixing expiries in would corrupt them.
+# Written ONLY by iv_collector_service — sole-writer contract.
+_CREATE_TERM_STRUCTURE = """
+CREATE TABLE IF NOT EXISTS iv_term_structure (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    security_id        TEXT     NOT NULL,
+    symbol             TEXT,
+    expiry             TEXT     NOT NULL,
+    timestamp          DATETIME NOT NULL,
+    spot_price         REAL,
+    atm_strike         REAL,
+    atm_iv             REAL,
+    atm_call_iv        REAL,
+    atm_put_iv         REAL,
+    atm_call_oi        REAL,
+    atm_put_oi         REAL,
+    total_call_oi      REAL,
+    total_put_oi       REAL,
+    total_call_volume  REAL,
+    total_put_volume   REAL,
+    max_oi_strike_call REAL,
+    max_oi_strike_put  REAL,
+    strikes_json       TEXT,
+    fetched_at         TEXT,
+    UNIQUE(security_id, timestamp, expiry)
+)
+"""
+
+_CREATE_TERM_STRUCTURE_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_term_structure_security_time
+ON iv_term_structure(security_id, timestamp)
+"""
+
+_CREATE_TERM_STRUCTURE_EXPIRY_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_term_structure_security_expiry
+ON iv_term_structure(security_id, expiry)
+"""
+
 _OPTIONAL_COLUMNS = {
     "atm_call_oi":         "REAL",
     "atm_put_oi":          "REAL",
@@ -115,6 +159,9 @@ def init_db() -> None:
     cur.execute(_CREATE_INDEX)
     cur.execute(_CREATE_SKEW)
     cur.execute(_CREATE_SKEW_INDEX)
+    cur.execute(_CREATE_TERM_STRUCTURE)
+    cur.execute(_CREATE_TERM_STRUCTURE_INDEX)
+    cur.execute(_CREATE_TERM_STRUCTURE_EXPIRY_INDEX)
     _ensure_optional_columns(cur)
     conn.commit()
     conn.close()
@@ -257,6 +304,79 @@ def save_skew_snapshot(
             pass
 
 
+def save_term_structure_snapshot(
+    *,
+    security_id: str,
+    symbol: str,
+    expiry: str,
+    timestamp: datetime,
+    spot_price: float = None,
+    atm_strike: float = None,
+    atm_iv: float = None,
+    atm_call_iv: float = None,
+    atm_put_iv: float = None,
+    atm_call_oi: float = None,
+    atm_put_oi: float = None,
+    total_call_oi: float = None,
+    total_put_oi: float = None,
+    total_call_volume: float = None,
+    total_put_volume: float = None,
+    max_oi_strike_call: float = None,
+    max_oi_strike_put: float = None,
+    strikes: list = None,
+    fetched_at: datetime = None,
+) -> bool:
+    """
+    Insert one non-current-expiry IV snapshot (ATM IV + per-strike skew) into
+    iv_term_structure. Silently skips duplicates (same security_id +
+    timestamp + expiry already exists). Written ONLY by iv_collector_service.
+    """
+    if atm_iv is None or atm_iv < 1 or atm_iv > 200:
+        logger.warning("iv_store: rejected term-structure snapshot | security_id=%s expiry=%s atm_iv=%s",
+                       security_id, expiry, atm_iv)
+        return False
+
+    ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+    fetched_str = (fetched_at or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+    conn = None
+    try:
+        conn = connect()
+        cur = conn.execute("""
+            INSERT INTO iv_term_structure (
+                security_id, symbol, expiry, timestamp,
+                spot_price, atm_strike,
+                atm_iv, atm_call_iv, atm_put_iv,
+                atm_call_oi, atm_put_oi,
+                total_call_oi, total_put_oi,
+                total_call_volume, total_put_volume,
+                max_oi_strike_call, max_oi_strike_put,
+                strikes_json, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(security_id, timestamp, expiry) DO NOTHING
+        """, (
+            str(security_id), symbol, expiry, ts_str,
+            spot_price, atm_strike,
+            atm_iv, atm_call_iv, atm_put_iv,
+            atm_call_oi, atm_put_oi,
+            total_call_oi, total_put_oi,
+            total_call_volume, total_put_volume,
+            max_oi_strike_call, max_oi_strike_put,
+            json.dumps(strikes) if strikes else None, fetched_str,
+        ))
+        inserted = cur.rowcount > 0
+        conn.commit()
+        return inserted
+    except Exception:
+        logger.exception("iv_store.save_term_structure_snapshot failed | security_id=%s expiry=%s ts=%s",
+                         security_id, expiry, ts_str)
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def prune_skew_snapshots(days: int = 7) -> int:
     """Delete skew snapshots older than `days`. Skew is an intraday/near-term
     visual — long history lives in iv_history, not here. Returns rows deleted."""
@@ -390,6 +510,30 @@ def get_iv_history(security_id: str, days: int = 252) -> list[float]:
         return df["atm_iv"].tail(days).tolist()
     except Exception:
         logger.exception("iv_store.get_iv_history failed | security_id=%s", security_id)
+        return []
+
+
+def get_spot_history(security_id: str, days: int = 252) -> list[float]:
+    """Return a list of daily spot prices (oldest → newest), same dedup rule as get_iv_history."""
+    try:
+        conn = connect()
+        df = pd.read_sql("""
+            SELECT spot_price FROM iv_history
+            WHERE  security_id = ?
+              AND  data_type   = 'daily'
+              AND  spot_price  > 0
+              AND  id = (
+                     SELECT MAX(i2.id) FROM iv_history i2
+                     WHERE  i2.security_id = iv_history.security_id
+                       AND  i2.data_type   = 'daily'
+                       AND  DATE(i2.timestamp) = DATE(iv_history.timestamp)
+                   )
+            ORDER  BY timestamp ASC
+        """, conn, params=(str(security_id),))
+        conn.close()
+        return df["spot_price"].tail(days).tolist()
+    except Exception:
+        logger.exception("iv_store.get_spot_history failed | security_id=%s", security_id)
         return []
 
 

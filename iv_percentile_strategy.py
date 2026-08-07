@@ -59,8 +59,7 @@ class IVPercentileStrategy:
         if len(hist) < IV_PERCENTILE_CONFIG["MIN_HISTORY_DAYS"]:
             return 50.0
 
-        ivs = [row.get("atm_iv", 0) for row in hist if row.get("atm_iv")]
-        ivs = [x for x in ivs if x and x > 0]
+        ivs = [x for x in hist if x and x > 0]
 
         if len(ivs) < IV_PERCENTILE_CONFIG["MIN_HISTORY_DAYS"]:
             return 50.0
@@ -76,8 +75,7 @@ class IVPercentileStrategy:
         if len(hist) < IV_PERCENTILE_CONFIG["MIN_HISTORY_DAYS"]:
             return 0.0
 
-        ivs = [row.get("atm_iv", 0) for row in hist if row.get("atm_iv")]
-        ivs = [x for x in ivs if x and x > 0]
+        ivs = [x for x in hist if x and x > 0]
 
         if len(ivs) < IV_PERCENTILE_CONFIG["MIN_HISTORY_DAYS"]:
             return 0.0
@@ -91,9 +89,8 @@ class IVPercentileStrategy:
 
     def get_spot_trend(self, security_id: str, spot: float) -> str:
         """Determine spot trend from last 5 days."""
-        hist = iv_store.get_iv_history(security_id, days=10)
-        spots = [row.get("spot_price", 0) for row in hist if row.get("spot_price")]
-        spots = [x for x in spots if x and x > 0]
+        hist = iv_store.get_spot_history(security_id, days=10)
+        spots = [x for x in hist if x and x > 0]
 
         if len(spots) < 3:
             return "neutral"

@@ -62,9 +62,11 @@ WARMUP_END     = dt_time(9, 50)
 INTRADAY_END   = dt_time(15, 30)
 EOD_TIME       = dt_time(8, 45)
 
-WARMUP_SLEEP   = 1.5   # seconds between stocks during 9:15-9:50
-INTRADAY_SLEEP = 2.0   # seconds between stocks during intraday pass
-EOD_SLEEP      = 0.5   # seconds between stocks during EOD watchlist build
+WARMUP_SLEEP         = 1.5   # seconds between stocks during 9:15-9:50
+INTRADAY_SLEEP       = 2.0   # seconds between stocks during intraday pass
+EOD_SLEEP            = 0.5   # seconds between stocks during EOD watchlist build
+TERM_STRUCTURE_SLEEP = 2.0   # seconds between chain fetches in the 3x/day other-expiries pass
+TERM_STRUCTURE_TIMES = ["09:50", "12:00", "15:00"]
 
 
 class IVCollector:
@@ -74,6 +76,7 @@ class IVCollector:
     def __init__(self):
         self._scanner: DiscountedPremiumScanner = None
         self._expiry_cache: dict = {}
+        self._all_expiries_cache: dict = {}  # segment/security key → full expiry list
         # EOD tracking — reset each calendar day
         self._pass_log: list[dict]  = []   # [{kind, time, saved, total}]
         self._fail_counts: Counter  = Counter()  # symbol → total fail count today
@@ -123,7 +126,67 @@ class IVCollector:
             self._expiry_cache["_nse_fno"] = chosen
         return chosen
 
+    def _get_all_expiries(self, scanner: DiscountedPremiumScanner,
+                          security_id, symbol: str, segment: str) -> list[str]:
+        """Full expiry list for the term-structure pass. NSE_FNO stocks share
+        one monthly calendar (cached once); IDX_I (NIFTY/BANKNIFTY) each have
+        their own weekly calendar and are cached per security_id."""
+        cache_key = "_nse_fno_all" if segment == "NSE_FNO" else f"_all_{security_id}"
+        if cache_key in self._all_expiries_cache:
+            return self._all_expiries_cache[cache_key]
+
+        expiries = scanner.get_expiry_list(security_id, segment) or []
+        self._all_expiries_cache[cache_key] = expiries
+        return expiries
+
     # ── single stock IV fetch + save ──────────────────────────────────────────
+
+    def _fetch_chain_metrics(self, scanner: DiscountedPremiumScanner,
+                             security_id, symbol: str, segment: str, expiry: str,
+                             max_retries: int = 2) -> dict | None:
+        """
+        Fetch one option chain and extract ATM IV + chain metrics + skew
+        strikes. Shared by the primary (current-expiry) and term-structure
+        (other-expiries) passes so retry/backoff logic lives in one place.
+        Returns None on failure after retries.
+        """
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                chain_resp = scanner.get_option_chain(security_id, segment, expiry)
+                if not isinstance(chain_resp, dict) or chain_resp.get("status") != "success":
+                    raise ValueError("bad chain response")
+
+                chain_data   = unwrap_dhan_payload(chain_resp.get("data") or {})
+                spot_price   = chain_data.get("last_price")
+                option_chain = chain_data.get("oc")
+
+                if spot_price is None or not isinstance(option_chain, dict) or not option_chain:
+                    raise ValueError("empty chain payload")
+
+                atm_ctx       = scanner.extract_atm_reference_ivs(option_chain, spot_price)
+                chain_metrics = scanner.extract_chain_metrics(option_chain)
+
+                if atm_ctx.get("atm_iv") is None:
+                    raise ValueError("missing ATM IV")
+
+                skew_strikes = self._extract_skew(option_chain, atm_ctx.get("atm_strike"))
+
+                return {
+                    "spot_price":    spot_price,
+                    "atm_ctx":       atm_ctx,
+                    "chain_metrics": chain_metrics,
+                    "skew_strikes":  skew_strikes,
+                }
+
+            except Exception as exc:
+                last_err = exc
+                if attempt < max_retries - 1:
+                    backoff = 5.0 if "too many requests" in str(exc).lower() else 1.5
+                    time.sleep(backoff)
+
+        logger.warning("_fetch_chain_metrics gave up | %s | expiry=%s | %s", symbol, expiry, last_err)
+        return None
 
     def _collect_one(self, scanner: DiscountedPremiumScanner,
                      security_id, symbol: str,
@@ -131,8 +194,8 @@ class IVCollector:
                      snapshot_dt: datetime = None,
                      max_retries: int = 2) -> bool:
         """
-        Fetch option chain for one stock, extract ATM IV, save via iv_store.
-        Returns True on success, False on failure (caller decides whether to retry).
+        Fetch option chain for one stock's CURRENT expiry, extract ATM IV,
+        save via iv_store. Returns True on success, False on failure.
         """
         if snapshot_dt is None:
             snapshot_dt = datetime.now()
@@ -148,86 +211,104 @@ class IVCollector:
             logger.debug("No expiry for %s — skipping", symbol)
             return False
 
-        last_err = None
-        for attempt in range(max_retries):
-            try:
-                chain_resp = scanner.get_option_chain(security_id, segment, expiry)
-                if not isinstance(chain_resp, dict) or chain_resp.get("status") != "success":
-                    raise ValueError("bad chain response")
+        result = self._fetch_chain_metrics(scanner, security_id, symbol, segment, expiry, max_retries)
+        if result is None:
+            return False
 
-                chain_data   = unwrap_dhan_payload(chain_resp.get("data") or {})
-                spot_price   = chain_data.get("last_price")
-                option_chain = chain_data.get("oc")
+        spot_price    = result["spot_price"]
+        atm_ctx       = result["atm_ctx"]
+        chain_metrics = result["chain_metrics"]
+        skew_strikes  = result["skew_strikes"]
 
-                if spot_price is None or not isinstance(option_chain, dict) or not option_chain:
-                    raise ValueError("empty chain payload")
+        # iv_rank invariant: intraday snapshots NEVER carry an iv_rank.
+        # iv_rank is meaningful only for daily (EOD) snapshots and is
+        # derived at read time from the daily atm_iv history — it is not
+        # persisted on the intraday row. save_snapshot deliberately has no
+        # iv_rank parameter, so intraday rows store iv_rank = None.
+        saved = iv_store.save_snapshot(
+            security_id         = str(security_id),
+            symbol              = symbol,
+            timestamp           = snapshot_dt,
+            spot_price          = spot_price,
+            atm_strike          = atm_ctx.get("atm_strike"),
+            atm_iv              = atm_ctx.get("atm_iv"),
+            atm_call_iv         = atm_ctx.get("atm_call_iv"),
+            atm_put_iv          = atm_ctx.get("atm_put_iv"),
+            atm_call_oi         = atm_ctx.get("atm_call_oi"),
+            atm_put_oi          = atm_ctx.get("atm_put_oi"),
+            total_call_oi       = chain_metrics.get("total_call_oi"),
+            total_put_oi        = chain_metrics.get("total_put_oi"),
+            total_call_volume   = chain_metrics.get("total_call_volume"),
+            total_put_volume    = chain_metrics.get("total_put_volume"),
+            max_oi_strike_call  = chain_metrics.get("max_oi_strike_call"),
+            max_oi_strike_put   = chain_metrics.get("max_oi_strike_put"),
+            data_type           = data_type,
+        )
 
-                atm_ctx     = scanner.extract_atm_reference_ivs(option_chain, spot_price)
-                chain_metrics = scanner.extract_chain_metrics(option_chain)
-
-                if atm_ctx.get("atm_iv") is None:
-                    raise ValueError("missing ATM IV")
-
-                # iv_rank invariant: intraday snapshots NEVER carry an iv_rank.
-                # iv_rank is meaningful only for daily (EOD) snapshots and is
-                # derived at read time from the daily atm_iv history — it is not
-                # persisted on the intraday row. save_snapshot deliberately has no
-                # iv_rank parameter, so intraday rows store iv_rank = None.
-                saved = iv_store.save_snapshot(
-                    security_id         = str(security_id),
-                    symbol              = symbol,
-                    timestamp           = snapshot_dt,
-                    spot_price          = spot_price,
-                    atm_strike          = atm_ctx.get("atm_strike"),
-                    atm_iv              = atm_ctx.get("atm_iv"),
-                    atm_call_iv         = atm_ctx.get("atm_call_iv"),
-                    atm_put_iv          = atm_ctx.get("atm_put_iv"),
-                    atm_call_oi         = atm_ctx.get("atm_call_oi"),
-                    atm_put_oi          = atm_ctx.get("atm_put_oi"),
-                    total_call_oi       = chain_metrics.get("total_call_oi"),
-                    total_put_oi        = chain_metrics.get("total_put_oi"),
-                    total_call_volume   = chain_metrics.get("total_call_volume"),
-                    total_put_volume    = chain_metrics.get("total_put_volume"),
-                    max_oi_strike_call  = chain_metrics.get("max_oi_strike_call"),
-                    max_oi_strike_put   = chain_metrics.get("max_oi_strike_put"),
-                    data_type           = data_type,
+        # Per-strike skew snapshot (±SKEW_WING strikes around ATM) so
+        # the dashboard can draw a volatility-skew curve without any
+        # broker call of its own. Best-effort — never fails the pass.
+        try:
+            if skew_strikes:
+                iv_store.save_skew_snapshot(
+                    security_id = str(security_id),
+                    symbol      = symbol,
+                    timestamp   = snapshot_dt,
+                    expiry      = expiry,
+                    spot_price  = spot_price,
+                    atm_strike  = atm_ctx.get("atm_strike"),
+                    strikes     = skew_strikes,
                 )
+        except Exception:
+            logger.debug("skew snapshot failed | %s", symbol, exc_info=True)
 
-                # Per-strike skew snapshot (±SKEW_WING strikes around ATM) so
-                # the dashboard can draw a volatility-skew curve without any
-                # broker call of its own. Best-effort — never fails the pass.
-                try:
-                    skew_strikes = self._extract_skew(option_chain, atm_ctx.get("atm_strike"))
-                    if skew_strikes:
-                        iv_store.save_skew_snapshot(
-                            security_id = str(security_id),
-                            symbol      = symbol,
-                            timestamp   = snapshot_dt,
-                            expiry      = expiry,
-                            spot_price  = spot_price,
-                            atm_strike  = atm_ctx.get("atm_strike"),
-                            strikes     = skew_strikes,
-                        )
-                except Exception:
-                    logger.debug("skew snapshot failed | %s", symbol, exc_info=True)
+        # NOTE: the 'daily' row is NO LONGER written here. Writing it on
+        # the first intraday fetch (09:15-09:50) built an IV history of
+        # OPENING prints, biasing IV Rank/Percentile (review §2.1a).
+        # The daily row is now promoted from the LAST intraday snapshot
+        # at EOD — see iv_store.promote_daily_from_last_intraday().
 
-                # NOTE: the 'daily' row is NO LONGER written here. Writing it on
-                # the first intraday fetch (09:15-09:50) built an IV history of
-                # OPENING prints, biasing IV Rank/Percentile (review §2.1a).
-                # The daily row is now promoted from the LAST intraday snapshot
-                # at EOD — see iv_store.promote_daily_from_last_intraday().
+        logger.debug("IV saved | %s | iv=%.1f | saved=%s", symbol, atm_ctx["atm_iv"], saved)
+        return True
 
-                logger.debug("IV saved | %s | iv=%.1f | saved=%s", symbol, atm_ctx["atm_iv"], saved)
-                return True
+    def _collect_term_structure_one(self, scanner: DiscountedPremiumScanner,
+                                    security_id, symbol: str, segment: str, expiry: str,
+                                    snapshot_dt: datetime, max_retries: int = 1) -> bool:
+        """
+        Fetch option chain for one stock's NON-current expiry, save ATM IV +
+        skew into iv_term_structure. Single attempt by default — this pass
+        covers many (stock, expiry) pairs 3x/day, so a transient miss on one
+        expiry is cheap to skip rather than retry.
+        """
+        result = self._fetch_chain_metrics(scanner, security_id, symbol, segment, expiry, max_retries)
+        if result is None:
+            return False
 
-            except Exception as exc:
-                last_err = exc
-                if attempt < max_retries - 1:
-                    backoff = 5.0 if "too many requests" in str(exc).lower() else 1.5
-                    time.sleep(backoff)
+        spot_price    = result["spot_price"]
+        atm_ctx       = result["atm_ctx"]
+        chain_metrics = result["chain_metrics"]
+        skew_strikes  = result["skew_strikes"]
 
-        logger.warning("_collect_one gave up | %s | %s", symbol, last_err)
-        return False
+        return iv_store.save_term_structure_snapshot(
+            security_id         = str(security_id),
+            symbol              = symbol,
+            expiry              = expiry,
+            timestamp           = snapshot_dt,
+            spot_price          = spot_price,
+            atm_strike          = atm_ctx.get("atm_strike"),
+            atm_iv              = atm_ctx.get("atm_iv"),
+            atm_call_iv         = atm_ctx.get("atm_call_iv"),
+            atm_put_iv          = atm_ctx.get("atm_put_iv"),
+            atm_call_oi         = atm_ctx.get("atm_call_oi"),
+            atm_put_oi          = atm_ctx.get("atm_put_oi"),
+            total_call_oi       = chain_metrics.get("total_call_oi"),
+            total_put_oi        = chain_metrics.get("total_put_oi"),
+            total_call_volume   = chain_metrics.get("total_call_volume"),
+            total_put_volume    = chain_metrics.get("total_put_volume"),
+            max_oi_strike_call  = chain_metrics.get("max_oi_strike_call"),
+            max_oi_strike_put   = chain_metrics.get("max_oi_strike_put"),
+            strikes             = skew_strikes,
+        )
 
     @staticmethod
     def _extract_skew(option_chain: dict, atm_strike) -> list[dict]:
@@ -346,6 +427,47 @@ class IVCollector:
             "total": len(all_syms),
         })
         logger.info("Intraday IV pass done | saved=%d / %d", saved, len(all_syms))
+        return saved
+
+    def run_term_structure_pass(self) -> int:
+        """
+        09:50 / 12:00 / 15:00 only: sweep every FNO stock across every expiry
+        OTHER than the one already tracked at 15-min frequency in iv_history.
+        Feeds IV term-structure (iv_term_structure) without adding load to
+        the primary intraday sweep. NIFTY/BANKNIFTY weeklies included.
+        """
+        scanner  = self._refresh_scanner()
+        all_syms = list(scanner.fno_stocks.items())
+        if not all_syms:
+            return 0
+
+        snapshot_dt = _floor_to_five_minutes()
+        saved     = 0
+        attempted = 0
+        logger.info("Term-structure pass starting | symbols=%d | ts=%s",
+                    len(all_syms), snapshot_dt.strftime("%H:%M"))
+
+        for security_id, symbol in all_syms:
+            segment = "IDX_I" if symbol in {"NIFTY", "BANKNIFTY"} else "NSE_FNO"
+            current_expiry = self._resolve_expiry(scanner, security_id, symbol)
+            all_expiries   = self._get_all_expiries(scanner, security_id, symbol, segment)
+            other_expiries = [e for e in all_expiries if e != current_expiry]
+
+            for expiry in other_expiries:
+                attempted += 1
+                ok = self._collect_term_structure_one(
+                    scanner, security_id, symbol, segment, expiry, snapshot_dt)
+                if ok:
+                    saved += 1
+                time.sleep(TERM_STRUCTURE_SLEEP)
+
+        self._pass_log.append({
+            "kind":  "TermStructure",
+            "time":  snapshot_dt.strftime("%H:%M"),
+            "saved": saved,
+            "total": attempted,
+        })
+        logger.info("Term-structure pass done | saved=%d / %d", saved, attempted)
         return saved
 
     # ── telegram ──────────────────────────────────────────────────────────────
@@ -501,6 +623,9 @@ class IVCollector:
         schedule.every().day.at("19:00").do(_bhav.run)
         schedule.every().day.at("20:30").do(_bhav.run)
         schedule.every().day.at("22:00").do(_bhav.run)
+        # IV term structure — other-than-current expiries, 3x/day only.
+        for t in TERM_STRUCTURE_TIMES:
+            schedule.every().day.at(t).do(self.run_term_structure_pass)
 
         # Catch up any collector jobs whose schedule already passed today
         now_t = datetime.now(IST).time()
@@ -528,6 +653,7 @@ class IVCollector:
                 # overnight would make every chain fetch target an expired
                 # contract until restart (review §2.3).
                 self._expiry_cache = {}
+                self._all_expiries_cache = {}
                 _last_reset_date  = now.date()
 
             if now.weekday() >= 5:
@@ -581,6 +707,8 @@ def main():
                         help="Run one warmup pass ignoring time window and exit")
     parser.add_argument("--intraday-once", action="store_true",
                         help="Run one intraday pass and exit")
+    parser.add_argument("--term-structure-once", action="store_true",
+                        help="Run one other-expiries term-structure pass and exit")
     args = parser.parse_args()
 
     iv_store.init_db()
@@ -591,6 +719,9 @@ def main():
         return
     if args.intraday_once:
         collector.run_intraday_pass()
+        return
+    if args.term_structure_once:
+        collector.run_term_structure_pass()
         return
 
     collector.run()
