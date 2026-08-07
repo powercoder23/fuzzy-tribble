@@ -21,7 +21,7 @@ deployment without touching code.
 import os
 
 # ── Mode ─────────────────────────────────────────────────────────────────── #
-MODE = os.getenv("AUTO_EXIT_OI_MODE", "hard").strip().lower()
+MODE = os.getenv("AUTO_EXIT_OI_MODE", "off").strip().lower()
 
 # ── Trigger thresholds ───────────────────────────────────────────────────── #
 # Minimum aggregate-OI change (%) on the contradicting buildup before we act.

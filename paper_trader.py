@@ -491,7 +491,7 @@ class PaperTradeBook:
     def open_trades(self, date):
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM paper_trades WHERE date=? AND status='open'", (date,)
+                "SELECT * FROM paper_trades WHERE status = 'open' AND date <= ?", (date,)
             ).fetchall()
         return [dict(r) for r in rows]
 

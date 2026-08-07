@@ -54,7 +54,6 @@ import iv_analytics
 import settings_store
 import docker_control
 from settings_routes import router as settings_router
-from backtest_routes import router as backtest_router
 
 # ── Config ────────────────────────────────────────────────────────────────── #
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -63,7 +62,6 @@ PT_DB    = DATA_DIR / "paper_trades.db"
 
 app = FastAPI(title="Fuzzy Tribble Dashboard", version="1.0")
 app.include_router(settings_router)
-app.include_router(backtest_router)
 
 # Shared frontend assets (new design system: css/ + js/ under web/static).
 WEB_DIR = Path(__file__).parent / "web"

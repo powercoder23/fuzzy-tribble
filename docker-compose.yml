@@ -1,21 +1,31 @@
-# PAPER TRADING IS MOMENTUM-ONLY (2026-08-05).
+# LEAN MODE (2026-08-06): every trading strategy except iv-percentile was
+# removed outright (files, services, tests) — discount, break-bounce,
+# momentum, iv-seller, iv-rank, oi-buildup, gap-scan, delivery-surge,
+# smart-money, sonar, composite. `docker-compose up -d` now brings up exactly
+# four services: iv-collector, iv-percentile, market-context, dashboard.
+# Recover any of the removed strategies from git history if needed.
 #
-# The `profiles:` keys below decide what `docker-compose up` STARTS. They are
-# not a kill switch: a container already running under `restart: unless-stopped`
-# keeps trading until it is explicitly stopped, which is how vol-expansion,
-# convex-engine and break-and-bounce took 51 paper trades on 2026-08-05 while
-# nominally gated off. After changing gating, run `docker-compose down` first.
+# discount.py itself survives (not a compose service any more) because
+# iv_percentile_strategy.py depends on DiscountedPremiumScanner /
+# unwrap_dhan_payload for option-chain fetch, ATM detection and execution
+# pricing — it is shared broker/pricing infrastructure, not just the
+# discount strategy's own logic. Its strategy-tuning config, discount_config.py,
+# was still deleted; paper_trader.py falls back to built-in defaults when it's
+# absent (see the try/except around that import).
 #
-# The actual guarantee is paper_policy.py, enforced at the single INSERT into
-# paper_trades: PAPER_STRATEGY_ALLOWLIST (default "Momentum") refuses any other
-# strategy regardless of which container is alive. To let a strategy book again,
-# set PAPER_STRATEGY_ALLOWLIST in .env — e.g. `Momentum,Break & Bounce`, or `*`
-# for the pre-2026-08-05 free-for-all — and turn its own mode flag back on.
+# The paper-book admission guarantee is paper_policy.py, enforced at the
+# single INSERT into paper_trades: PAPER_STRATEGY_ALLOWLIST (default "IV_",
+# matching iv-percentile's IV_SELL_STRANGLE / IV_BUY_CE / IV_BUY_PE tags)
+# refuses any other strategy regardless of which container is alive. `docker-
+# compose down` (or stop/rm the specific container) before changing gating —
+# `restart: unless-stopped` keeps an already-running container trading even
+# after its profile/definition changes.
 
 services:
 
-  # ── Service 1: IV Collector ────────────────────────────────────────────────
-  # Must start first. Feeds IV data to both strategy services.
+  # ── IV Collector ────────────────────────────────────────────────────────
+  # Must start first. Sole writer of iv_history rows — every strategy reads
+  # IV data through it.
   iv-collector:
     build:
       context: .
@@ -32,267 +42,32 @@ services:
       - ./logs:/app/logs
     command: python -m collectors.iv_collector_service
 
-  # ── Service 2: Momentum Strategy (ORB + VWAP) ─────────────────────────────
-  # RE-ACTIVATED 2026-08-04: this is now the ONLY strategy that runs by
-  # default. Every other strategy/scanner below is profile-gated OFF.
-  #
-  # NOTE: momentum does NOT book into the shared paper book (paper_trades.db).
-  # It writes data/momentum_trades.csv + Telegram alerts, and only places an
-  # order when AUTO_EXECUTE=true. So its signals will NOT appear on the
-  # dashboard's paper-trade pages — check the CSV and logs/momentum.log.
-  momentum:
-    build:
-      context: .
-      dockerfile: Dockerfile.momentum
-    container_name: momentum-strategy
-    restart: unless-stopped
+  # ── IV Percentile Strategy ─────────────────────────────────────────────
+  # 60-day IV history mean-reversion: IV >= 85th pct -> sell strangle,
+  # IV <= 15th pct -> buy option. Books into the shared paper book via
+  # OrderManager.submit_external_signal, tagged IV_SELL_STRANGLE / IV_BUY_CE
+  # / IV_BUY_PE. Configuration lives in iv_percentile_strategy.py itself
+  # (IV_PERCENTILE_CONFIG), not env vars.
+  iv-percentile:
+    build: .
+    container_name: iv-percentile-strategy
+    command: python -m iv_percentile_runner
+    depends_on: [iv-collector, dashboard]
     env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python momentum_runner.py
-
-  # ── Service 3: Discount/Premium Strategy ──────────────────────────────────
-  # Reads IV history from the shared ./data volume (written by iv-collector).
-  # Runs the discount scanner only — it does NOT collect IV itself.
-  discount:
-    profiles: [discount]
-    build:
-      context: .
-      dockerfile: Dockerfile.discount
-    container_name: discount-strategy
+    volumes: [./data:/app/data, ./logs:/app/logs]
+    environment: [TZ=Asia/Kolkata]
     restart: unless-stopped
-    env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python main.py
 
-  # ── Service 4: Break and Bounce Strategy ──────────────────────────────────
-  # Step 1: Mark yesterday's daily candle high/low as key levels.
-  # Step 2: Wait for 15-min close above/below the level (9:15–11:45 window).
-  # Step 3: After breakout, enter on Hammer/Engulfing at the retest on 5-min.
-  break-bounce:
-    profiles: [break-bounce]
-    build:
-      context: .
-      dockerfile: Dockerfile.break-bounce
-    container_name: break-bounce-strategy
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python break_bounce_runner.py
-
-  # ── IV Seller Strategy (short strangle/straddle on rich IV) ─────────────
-  # Paper dryrun activated: books short combos into paper_trades.db via
-  # OrderManager.submit_external_signal. No live orders (AUTO_EXECUTE not set).
-  iv-seller:
-    profiles: [iv-seller]
-    build:
-      context: .
-      dockerfile: Dockerfile.directional
-    container_name: iv-seller-strategy
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python iv_seller_runner.py
-
-  # ── Option-buyer scanners (alert-only, zero broker/NSE calls) ─────────────
-  # PROFILE-GATED OFF 2026-08-04 (momentum-only mode). These do NOT start with
-  # the normal `docker-compose up -d`. To bring one back, either drop its
-  # `profiles:` line or run:  docker-compose --profile <name> up -d <name>
-  # All read the shared ./data/iv_history.db written by iv-collector.
-
-  # IV Rank — cheap-IV "buy zone" screener.
-  iv-rank:
-    profiles: [iv-rank]
-    build:
-      context: .
-      dockerfile: Dockerfile.iv-rank
-    container_name: iv-rank-scanner
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python iv_rank_runner.py
-
-  # OI Buildup — Long/Short buildup, covering, unwinding across F&O.
-  oi-buildup:
-    profiles: [oi-buildup]
-    build:
-      context: .
-      dockerfile: Dockerfile.scanner
-    container_name: oi-buildup-scanner
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python oi_buildup_runner.py
-
-  # Extreme Opening — gap% + open beyond prior high/low.
-  gap-scan:
-    profiles: [gap-scan]
-    build:
-      context: .
-      dockerfile: Dockerfile.scanner
-    container_name: gap-scanner
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python gap_scanner_runner.py
-
-  # Delivery-% Surge — conviction-backed moves from bhav delivery data.
-  delivery-surge:
-    profiles: [delivery-surge]
-    build:
-      context: .
-      dockerfile: Dockerfile.scanner
-    container_name: delivery-surge-scanner
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python delivery_surge_runner.py
-
-  # Smart-Money — net bulk/block institutional flow -> CE/PE BTST bias.
-  smart-money:
-    profiles: [smart-money]
-    build:
-      context: .
-      dockerfile: Dockerfile.scanner
-    container_name: smart-money-scanner
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python smart_money_runner.py
-
-  # Sonar-Laplace — Ehlers SuperSmoother trend/reversal/breakout signals.
-  # Reads 5-min candles via DataProvider (broker fetch per name). Intraday.
-  # NOTE: sonar is NOT gated off, by design. It is the SOLE WRITER of the
-  # candles_5m table in iv_history.db (see engine/candles.py) — the 5-min
-  # history that the momentum alpha engine reads for time-of-day RVOL,
-  # intraday relative strength vs NIFTY, and trigger quality. Gating it off
-  # silently freezes that table and blinds those features.
-  sonar:
-    build:
-      context: .
-      # Full image: sonar reads candles via DataProvider -> DiscountedPremiumScanner
-      # -> upstox_adapter, so it needs the broker SDK + scipy (not in the lean
-      # scanner image). See discount.py / upstox_adapter.py imports.
-      dockerfile: Dockerfile
-    container_name: sonar-scanner
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python sonar_laplace_runner.py
-
-  # Composite — morning confluence + multi-scanner signal aggregator.
-  # Fuses gap, OI buildup, IV rank into A+ morning option-buy picks.
-  composite:
-    profiles: [composite]
-    build:
-      context: .
-      dockerfile: Dockerfile.scanner
-    container_name: composite-scanner
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      TZ: Asia/Kolkata
-      APP_TIMEZONE: Asia/Kolkata
-    volumes:
-      - .:/app
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - iv-collector
-    command: python composite_runner.py
-
-  # ── Service 17: Market Context ────────────────────────────────────────────
-  # Shared market description for every strategy. Owns the ONLY WebSocket
-  # connection in the platform and is the SOLE WRITER of the mc_* tables in
+  # ── Market Context ────────────────────────────────────────────────────
+  # Shared market description. Owns the ONLY WebSocket connection in the
+  # platform and is the SOLE WRITER of the mc_* tables in
   # data/market_context.db (separate file from iv_history.db on purpose —
   # that DB is ~315 MB and written continuously by iv-collector).
   #
-  # Consumers never open a socket and never call a broker: they read
-  # market_context.get(), which is a single cached SQLite read.
-  #
-  # PHASE 1 — OBSERVATIONAL ONLY. This service does not veto entries, change
-  # exits, stop-losses, targets or sizing. It collects and persists so that
-  # the effect of market context on expectancy can be MEASURED before it is
-  # ever allowed to influence a decision. See MARKET_CONTEXT_PLAN.md Rev 2.
+  # PHASE 1 — OBSERVATIONAL ONLY. Does not veto entries, change exits,
+  # stop-losses, targets or sizing. Collects and persists so the effect of
+  # market context on expectancy can be MEASURED before it is ever allowed
+  # to influence a decision. See MARKET_CONTEXT_PLAN.md Rev 2.
   market-context:
     build:
       context: .
@@ -340,4 +115,3 @@ services:
       - .:/compose:ro
     env_file:
       - .env
-
